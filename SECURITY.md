@@ -83,8 +83,8 @@ not oversights. A *new* way to defeat one of them is still very welcome:
   on every CI run via `tests/qemu-boot/cold_launcher.c`; three fixes were
   considered and rejected. Full writeup in the comment above
   `handler_pre()` in `av/main.c` and in the CI section of the README.
-- **x86_64 only.** The module hooks `__x64_sys_execve` by symbol name and
-  will not build or load on arm64.
+- **arm64 only.** The module hooks `__arm64_sys_execve` by symbol name and
+  will not build or load on x86_64.
 
 ## Reporting
 

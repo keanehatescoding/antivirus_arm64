@@ -33,7 +33,11 @@ permissions:
 
 jobs:
   build-deb:
-    runs-on: ubuntu-latest
+    # arm64-hosted (native) - debian/control now declares
+    # Architecture: arm64, and debian:trixie is a multi-arch image (no
+    # container change needed, unlike build-arch below). See
+    # build-matrix.yml's `build` job for the same reasoning.
+    runs-on: ubuntu-24.04-arm
     # Debian/Ubuntu, not a generic ubuntu-latest apt install: these
     # exact build-dep package names (notably gir1.2-gtk-4.0) were
     # confirmed against a real Debian 13 (trixie) box (see
@@ -96,8 +100,21 @@ jobs:
           if-no-files-found: error
 
   build-arch:
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    # arm64-hosted (native) - see build-deb's own comment above for the
+    # general reasoning. The container itself also has to change:
+    # official Arch Linux only targets x86_64 (confirmed via the Docker
+    # Hub API - the `archlinux` image publishes no arm64 manifest at
+    # all), so this uses menci/archlinuxarm instead, an actively
+    # maintained third-party image of Arch Linux ARM (the separate
+    # ALARM project that actually serves arm64 - see
+    # packaging/arch/PKGBUILD's own comment) built for exactly this
+    # kind of arm64 CI use. Not end-to-end build-verified in this
+    # environment (no arm64 runner/container access here) - if this
+    # image ever goes stale or disappears, any ALARM-based
+    # base-devel-equivalent image is a drop-in replacement, since
+    # PKGBUILD itself is untouched either way.
+    runs-on: ubuntu-24.04-arm
+    container: menci/archlinuxarm:base-devel
     steps:
       # git must exist BEFORE actions/checkout runs, not after - a
       # real CI run showed that without it, checkout silently falls
@@ -201,7 +218,11 @@ jobs:
           if-no-files-found: error
 
   build-rpm:
-    runs-on: ubuntu-latest
+    # arm64-hosted (native) - see build-deb's own comment above. Fedora
+    # officially supports aarch64, and fedora:latest is a multi-arch
+    # image, so no container change is needed here (unlike build-arch
+    # above).
+    runs-on: ubuntu-24.04-arm
     container: fedora:latest
     # No longer continue-on-error: this job used to have two stacked
     # bugs - BuildRequires: tlsh-devel never resolving on any shipping

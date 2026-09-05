@@ -68,7 +68,7 @@ install -m 0644 "$ROOT/packaging/icons/org.hyprav.avgui.svg" "$APPDIR/org.hyprav
 install -m 0644 "$ROOT/packaging/icons/org.hyprav.avgui.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/org.hyprav.avgui.svg"
 
 VERSION="${1:-$(cd "$ROOT" && git describe --tags --always 2>/dev/null || echo dev)}"
-OUTPUT="$HERE/HyprAV-avgui-${VERSION}-x86_64.AppImage"
+OUTPUT="$HERE/HyprAV-avgui-${VERSION}-aarch64.AppImage"
 
-ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+ARCH=aarch64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
 echo "Built: $OUTPUT"

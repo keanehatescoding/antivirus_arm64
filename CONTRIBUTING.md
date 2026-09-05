@@ -98,9 +98,13 @@ best avoided — particularly right before a tag.
   are both kernel-version-sensitive. That's exactly what the
   `build-matrix.yml` matrix exists to catch — "works on my kernel" isn't
   enough on its own.
-- x86_64 only, for now — the module resolves `__x64_sys_execve` by
-  symbol name. Porting to arm64 means finding the equivalent
-  `__arm64_sys_*` symbols throughout, not just a `Makefile` tweak.
+- arm64 only, for now — the module resolves `__arm64_sys_execve` by
+  symbol name and reads syscall args out of `pt_regs.regs[]`. Porting
+  to x86_64 means finding the equivalent `__x64_sys_*` symbols and the
+  `di`/`si`/`dx`/`r10`/`r8`/`r9` register mapping throughout (and
+  reinstating the raw `unlink(2)`/`rename(2)` kprobes — arm64 doesn't
+  have those syscalls, only the `*at()` variants), not just a
+  `Makefile` tweak.
 
 ## Adding or changing YARA rules
 

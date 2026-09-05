@@ -48,5 +48,5 @@ tagged release by that workflow's `build-appimage` job. Needs
 ```bash
 packaging/appimage/build-appimage.sh          # version defaults to `git describe`
 # or: packaging/appimage/build-appimage.sh 1.2.3
-./packaging/appimage/HyprAV-avgui-*-x86_64.AppImage
+./packaging/appimage/HyprAV-avgui-*-aarch64.AppImage
 ```

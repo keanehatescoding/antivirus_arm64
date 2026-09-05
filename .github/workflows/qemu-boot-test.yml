@@ -48,7 +48,11 @@ jobs:
 
   qemu-boot:
     needs: load-kernel-matrix
-    runs-on: ubuntu-latest
+    # arm64-hosted (native) - av.ko now hooks __arm64_sys_* symbols and
+    # reads arm64 pt_regs, so it must be built and booted against an
+    # arm64 kernel tree. See build-matrix.yml's `build` job for the
+    # same reasoning.
+    runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
@@ -62,8 +66,11 @@ jobs:
       - name: Install build and QEMU dependencies
         run: |
           sudo apt-get update
+          # qemu-system-arm (not qemu-system-x86) ships the
+          # qemu-system-aarch64 binary this job actually invokes below,
+          # on both Debian and Ubuntu.
           sudo apt-get install -y build-essential bc bison flex libssl-dev \
-            libelf-dev qemu-system-x86 cpio
+            libelf-dev qemu-system-arm cpio
 
       - name: Cache built kernel tree
         id: cache-kernel
@@ -81,7 +88,13 @@ jobs:
           # `scripts/config` calls below would silently keep serving
           # whatever kernel tree was already cached under this key,
           # never rebuilding to match the new config.
-          key: qemu-boot-kernel-tree-v2-${{ matrix.kernel_version }}-${{ hashFiles('.github/workflows/qemu-boot-test.yml') }}
+          #
+          # v3: arm64 port - x86_64-built cache entries (bzImage,
+          # tinyconfig+CONFIG_64BIT hack) are useless for the
+          # defconfig-based arm64/Image build below, so the arch switch
+          # itself forces a cache-key bump, same as build-matrix.yml's
+          # v7->v8 bump for the same reason.
+          key: qemu-boot-kernel-tree-v3-${{ matrix.kernel_version }}-${{ hashFiles('.github/workflows/qemu-boot-test.yml') }}
 
       - name: Download and build a bootable kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -102,11 +115,21 @@ jobs:
           tar -xf linux.tar.xz -C "$SRCDIR" --strip-components=1
           rm linux.tar.xz
           cd "$SRCDIR"
-          make tinyconfig
-          # Same base set build-matrix.yml uses (see that file's
-          # comment on CONFIG_64BIT specifically - tinyconfig defaults
-          # to a 32-bit build otherwise) ...
-          ./scripts/config --enable CONFIG_64BIT
+          # defconfig, not tinyconfig: unlike build-matrix.yml's
+          # compile-only job, this one has to actually BOOT under
+          # QEMU's -M virt machine, which means the GICv2/v3
+          # interrupt controller, PSCI (CPU start/stop/power), the
+          # ARM architected timer, and the virtio-mmio transport all
+          # need to be in the kernel - tinyconfig (allnoconfig-based)
+          # starts from zero and would need every one of those
+          # hand-enumerated from memory with no way to boot-test the
+          # result in this environment; arm64's defconfig already
+          # turns them all on as the common case for exactly this
+          # virt platform, so it's the safer starting point here.
+          # CONFIG_64BIT needs no override on arm64 (unlike x86, it's
+          # an unconditional def_bool y - there's no 32-bit sibling
+          # ambiguity to correct for).
+          make ARCH=arm64 defconfig
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
           ./scripts/config --enable CONFIG_CRYPTO
@@ -122,13 +145,14 @@ jobs:
           # this, execve() of ANYTHING - including init itself - fails
           # outright), /dev + /tmp for init/eicar.com to live in, and
           # the syslog(2) syscall init.c uses to read dmesg (observed
-          # directly in CI: without this explicit enable, init.c's
+          # directly in CI on the x86_64 build this was ported from:
+          # without this explicit enable, init.c's
           # syslog(SYSLOG_ACTION_READ_ALL) call fails ENOSYS - not
-          # reliably on by default under tinyconfig the way it looked
-          # in earlier local testing, so it's listed explicitly here
-          # rather than assumed). CONFIG_KALLSYMS is pulled in
-          # automatically by CONFIG_KPROBES (kprobes register by
-          # symbol name), so it doesn't need to be listed explicitly.
+          # reliably on by default the way it looked in earlier local
+          # testing, so it's listed explicitly here rather than
+          # assumed). CONFIG_KALLSYMS is pulled in automatically by
+          # CONFIG_KPROBES (kprobes register by symbol name), so it
+          # doesn't need to be listed explicitly.
           ./scripts/config --enable CONFIG_BINFMT_ELF
           ./scripts/config --enable CONFIG_BLK_DEV_INITRD
           ./scripts/config --enable CONFIG_DEVTMPFS
@@ -136,11 +160,15 @@ jobs:
           ./scripts/config --enable CONFIG_SHMEM
           ./scripts/config --enable CONFIG_TMPFS
           ./scripts/config --enable CONFIG_TTY
-          ./scripts/config --enable CONFIG_SERIAL_8250
-          ./scripts/config --enable CONFIG_SERIAL_8250_CONSOLE
+          # PL011, not 8250: QEMU's -M virt machine wires up an ARM
+          # PL011 UART (ttyAMA0), not the 8250/16550 (ttyS0) x86_64's
+          # -kernel boot path uses - see the "Boot in QEMU" step's
+          # console= arg below, which must match.
+          ./scripts/config --enable CONFIG_SERIAL_AMBA_PL011
+          ./scripts/config --enable CONFIG_SERIAL_AMBA_PL011_CONSOLE
           ./scripts/config --enable CONFIG_PRINTK
-          make olddefconfig
-          make -j"$(nproc)"
+          make ARCH=arm64 olddefconfig
+          make ARCH=arm64 -j"$(nproc)" Image modules
 
       - name: Build av.ko against this kernel tree
         run: |
@@ -153,18 +181,17 @@ jobs:
         run: |
           set -euxo pipefail
           cd tests/qemu-boot
-          # -march=x86-64 (the universal baseline, not -march=native):
-          # QEMU's default CPU model doesn't expose AVX, and glibc's
-          # own static-binary startup code (_dl_aux_init) unconditionally
-          # uses an AVX instruction on this build system's toolchain -
-          # a mismatch here crashes init before it prints anything.
-          # -cpu host/-cpu max below (matched to whichever accel is
-          # used) supplies AVX at the QEMU side; this flag is the
-          # other half of that - neither alone is sufficient.
-          gcc -Wall -Wextra -static -O2 -march=x86-64 -o init init.c
-          # Same flags, same reasoning - see cold_launcher.c's own
-          # header comment for why this is a separate binary at all.
-          gcc -Wall -Wextra -static -O2 -march=x86-64 -o cold_launcher cold_launcher.c
+          # No -march= override needed here the way the x86_64 build
+          # this was ported from needed -march=x86-64: that flag
+          # worked around QEMU's default CPU model lacking AVX, which
+          # glibc's static-binary startup code unconditionally used on
+          # that toolchain. arm64 has no equivalent baseline/AVX-style
+          # mismatch between the plain arm64 gcc target and QEMU's
+          # default -M virt CPU model.
+          gcc -Wall -Wextra -static -O2 -o init init.c
+          # See cold_launcher.c's own header comment for why this is a
+          # separate binary at all.
+          gcc -Wall -Wextra -static -O2 -o cold_launcher cold_launcher.c
           rm -rf root
           mkdir -p root/{proc,dev,tmp,sys}
           cp init root/init
@@ -199,10 +226,11 @@ jobs:
             echo "KVM unavailable - falling back to TCG (software emulation)"
           fi
 
-          timeout 90 qemu-system-x86_64 \
-            -kernel "$KDIR/arch/x86/boot/bzImage" \
+          timeout 90 qemu-system-aarch64 \
+            -M virt \
+            -kernel "$KDIR/arch/arm64/boot/Image" \
             -initrd initramfs.cpio.gz \
-            -append "console=ttyS0 panic=-1" \
+            -append "console=ttyAMA0 panic=-1" \
             -display none \
             -serial file:serial.log \
             -no-reboot \

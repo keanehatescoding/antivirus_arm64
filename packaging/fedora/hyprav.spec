@@ -110,10 +110,10 @@ Requires:       dkms
 Requires(post): dkms
 Requires(preun): dkms
 # NOT noarch, despite shipping only source + a dkms.conf: the module
-# hooks x86_64-specific kprobe symbols (see the description below), so
+# hooks arm64-specific kprobe symbols (see the description below), so
 # a noarch build would let this install - and its %post run dkms -
 # against unsupported architectures.
-ExclusiveArch:  x86_64
+ExclusiveArch:  aarch64
 
 %description -n hyprav-dkms
 Out-of-tree kernel module (av.ko) that hooks execve and file events
@@ -121,8 +121,10 @@ via kprobes and talks to the avd userspace daemon over netlink for
 anything heavier. Ships as DKMS source and is rebuilt automatically
 against every installed kernel.
 
-x86_64 only as shipped - the module hooks __x64_sys_execve by symbol
-name; arm64 needs source changes to hook __arm64_sys_execve instead.
+arm64 only as shipped - the module hooks __arm64_sys_execve by symbol
+name; x86_64 needs source changes to hook __x64_sys_execve instead
+(and reinstates the raw unlink(2)/rename(2) kprobes, which arm64
+doesn't have - see av/main.c).
 
 %package -n hyprav-gui
 Summary:        GTK4 management console for HyprAV
