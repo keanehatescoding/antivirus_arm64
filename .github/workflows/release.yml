@@ -181,7 +181,7 @@ jobs:
           mkdir -p release-assets
           find dist -type f \( \
               -name '*.deb' -o \
-              -name '*.pkg.tar.zst' -o \
+              -name '*.pkg.tar.*' -o \
               -name '*.rpm' -o \
               -name '*.flatpak' -o \
               -name '*.AppImage' \

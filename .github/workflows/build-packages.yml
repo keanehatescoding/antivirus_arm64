@@ -236,42 +236,28 @@ jobs:
           # far more rigorously, elsewhere (see PKGBUILD's own comment
           # on this variable).
           export HYPRAV_SKIP_AV_KO_CHECK=1
-          # v0.10.0's real CI run showed makepkg build and version the
-          # package correctly (both before and after also exporting
-          # PKGDEST="$PWD" here), yet "cp .../packaging/arch/*.pkg.tar.zst"
-          # still found nothing at that exact path either way - whatever
-          # this image's actual output location is, it isn't the one
-          # PKGBUILD's own working directory would suggest. Kept as a
-          # likely-correct hint; the copy step below no longer trusts it
-          # and locates the real files with find instead.
           export PKGDEST="$PWD"
           makepkg -s --noconfirm
           SCRIPT
           chmod +x /tmp/build-arch-pkg.sh
           su builder -c /tmp/build-arch-pkg.sh
 
-          # Diagnostic only, temporary: three straight real CI runs
-          # each showed makepkg print "Finished making: hyprav ..."
-          # and then no *.pkg.tar.zst findable anywhere under
-          # /home/builder by any search tried so far (fixed path,
-          # find with -xdev, find without -xdev). Dump everything
-          # actually on disk instead of guessing a fourth path.
-          echo "=== full tree under /home/builder/hyprav-ci-src/packaging/arch ==="
-          find /home/builder/hyprav-ci-src/packaging/arch
-          echo "=== every file anywhere under /home ==="
-          find /home -type f
-
           # Copy the built packages back into the real workspace (as
           # root, which can always write there) so the upload step
-          # below finds them at the usual path.
-          find /home/builder -iname '*.pkg.tar.zst' -exec cp {} packaging/arch/ \;
-          ls -la packaging/arch/*.pkg.tar.zst
+          # below finds them at the usual path. find, not a fixed
+          # glob: a real CI run showed this image's actual output
+          # extension is .pkg.tar.xz, not the .pkg.tar.zst every
+          # other Arch/ALARM image and PKGBUILD convention uses -
+          # *.pkg.tar.* covers whatever compressor this image
+          # defaults to without depending on that detail again.
+          find /home/builder -iname '*.pkg.tar.*' -exec cp {} packaging/arch/ \;
+          ls -la packaging/arch/*.pkg.tar.*
 
-      - name: Upload .pkg.tar.zst packages
+      - name: Upload Arch packages
         uses: actions/upload-artifact@v7
         with:
           name: arch-packages
-          path: packaging/arch/*.pkg.tar.zst
+          path: packaging/arch/*.pkg.tar.*
           if-no-files-found: error
 
   build-rpm:
