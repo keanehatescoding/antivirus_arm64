@@ -70,5 +70,11 @@ install -m 0644 "$ROOT/packaging/icons/org.hyprav.avgui.svg" "$APPDIR/usr/share/
 VERSION="${1:-$(cd "$ROOT" && git describe --tags --always 2>/dev/null || echo dev)}"
 OUTPUT="$HERE/HyprAV-avgui-${VERSION}-aarch64.AppImage"
 
-ARCH=aarch64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+# appimagetool's arch parser (extract_arch_from_text in
+# appimagetool.c) only recognizes the literal token "arm_aarch64" for
+# 64-bit ARM, not "aarch64" - passing the more obvious "aarch64" fails
+# with "Unable to guess the architecture" since it doesn't match any
+# of the hardcoded keywords and the AppDir has no ELF binaries for it
+# to fall back to (AppRun/av-gui are shell scripts, av_gui is Python).
+ARCH=arm_aarch64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
 echo "Built: $OUTPUT"
