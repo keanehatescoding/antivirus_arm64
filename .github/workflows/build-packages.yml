@@ -155,6 +155,15 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Force-fetch tags (belt-and-suspenders for pkgver())
+        # A real CI run showed fetch-tags: true above still wasn't
+        # enough in this container-based checkout - `git describe`
+        # still failed with "fatal: No names found, cannot describe
+        # anything." even though the tag itself (checked separately)
+        # really is an ancestor of HEAD. Fetch them explicitly rather
+        # than trust actions/checkout's tag handling here.
+        run: git fetch --tags --force
+
       - name: Install bootstrap dependencies
         # Only what's needed to get makepkg itself running as a
         # non-root user - `makepkg -s` below auto-installs every real
@@ -277,6 +286,11 @@ jobs:
           # them for its own `git describe --long --tags`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Force-fetch tags (belt-and-suspenders for git describe)
+        # See build-arch's identical step: fetch-tags: true alone
+        # wasn't enough in a real CI run.
+        run: git fetch --tags --force
 
       - name: Install rpmbuild tooling
         run: |
