@@ -162,7 +162,16 @@ jobs:
         # anything." even though the tag itself (checked separately)
         # really is an ancestor of HEAD. Fetch them explicitly rather
         # than trust actions/checkout's tag handling here.
-        run: git fetch --tags --force
+        #
+        # safe.directory is needed too: actions/checkout only adds
+        # that exception under a temporary HOME override scoped to its
+        # own steps (confirmed by a real CI run) - plain `run:` steps
+        # like this one see the real container HOME, which has no such
+        # exception, so bare git commands fail with "detected dubious
+        # ownership in repository".
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --tags --force
 
       - name: Install bootstrap dependencies
         # Only what's needed to get makepkg itself running as a
@@ -289,8 +298,11 @@ jobs:
 
       - name: Force-fetch tags (belt-and-suspenders for git describe)
         # See build-arch's identical step: fetch-tags: true alone
-        # wasn't enough in a real CI run.
-        run: git fetch --tags --force
+        # wasn't enough in a real CI run, and safe.directory needs
+        # re-declaring outside actions/checkout's own temp-HOME scope.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --tags --force
 
       - name: Install rpmbuild tooling
         run: |
