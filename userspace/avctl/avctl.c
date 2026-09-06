@@ -44,6 +44,7 @@
 #include <limits.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 
 #define PROC_PATH "/proc/kernel_av_signatures"
@@ -57,6 +58,23 @@
  * any C struct. Override with AVD_SOCK_PATH, same env var avd itself
  * accepts, for tests/non-default installs. */
 #define CONTROL_SOCK_PATH_DEFAULT "/run/avd/control.sock"
+
+/* Mirrors avd's own AVD_CONTROL_RECV_TIMEOUT_SECS (userspace/avd/avd.c)
+ * and the GUI's SOCKET_TIMEOUT_SECS (userspace/av-gui/av_gui/avd_client.py):
+ * without a client-side timeout here, avctl blocks forever if avd accepts
+ * the connection but then hangs (or is wedged) before writing a response.
+ * The daemon-side SO_RCVTIMEO/SO_SNDTIMEO it already sets only bounds its
+ * own accepted fd, not a client stuck in read() waiting for a reply. */
+#define AVCTL_CONTROL_TIMEOUT_SECS 5
+
+/* Defense-in-depth cap on a single control-socket response (issue #5):
+ * avd only ever sends a bounded, small reply (a handful of KB at most for
+ * e.g. VERDICTS RECENT), and avctl already fully trusts the root-owned
+ * daemon on the other end, so this is not a security boundary - just a
+ * backstop so a buggy/compromised avd cannot make this CLI grow its heap
+ * without bound via the cap-doubling loop in control_request(). 16MB is
+ * orders of magnitude above any legitimate response. */
+#define AVCTL_MAX_RESPONSE_BYTES (16 * 1024 * 1024)
 
 /* Must match the kernel side's own field-width limits: AV_HASH_HEX_MAXLEN
  * (av/sigtable.h) / SHA256_HEX_LEN (av/behavior.c) for hashes, and
@@ -1248,6 +1266,22 @@ static int control_request(const char *cmd, char **out)
         return -1;
     }
 
+    /* Client-side counterpart to avd's own SO_RCVTIMEO/SO_SNDTIMEO on the
+     * accepted fd (see control_conn_main() in userspace/avd/avd.c) and to
+     * the GUI's SOCKET_TIMEOUT_SECS: without this, avctl blocks forever
+     * in read() below if avd accepts the connection but never writes a
+     * response. Best-effort like the daemon side - a failure to set the
+     * option is warned about but does not refuse the connection. */
+    {
+        struct timeval tv = { .tv_sec = AVCTL_CONTROL_TIMEOUT_SECS, .tv_usec = 0 };
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
+            fprintf(stderr, "avctl: warning: could not set receive timeout: %s\n",
+                    strerror(errno));
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+            fprintf(stderr, "avctl: warning: could not set send timeout: %s\n",
+                    strerror(errno));
+    }
+
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     /* Reject rather than let snprintf() silently truncate: a truncated
@@ -1317,7 +1351,16 @@ static int control_request(const char *cmd, char **out)
             break;
         len += (size_t)n;
         if (len >= cap - 1) {
+            if (cap >= AVCTL_MAX_RESPONSE_BYTES) {
+                fprintf(stderr, "avctl: response too large (over %d bytes)\n",
+                        AVCTL_MAX_RESPONSE_BYTES);
+                free(buf);
+                close(fd);
+                return -1;
+            }
             cap *= 2;
+            if (cap > AVCTL_MAX_RESPONSE_BYTES)
+                cap = AVCTL_MAX_RESPONSE_BYTES;
             grown = realloc(buf, cap);
             if (!grown) {
                 fprintf(stderr, "avctl: out of memory\n");
@@ -1331,7 +1374,13 @@ static int control_request(const char *cmd, char **out)
     close(fd);
 
     if (n < 0) {
-        fprintf(stderr, "avctl: read from control socket failed: %s\n", strerror(errno));
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            fprintf(stderr, "avctl: timed out waiting for avd response "
+                            "(no reply within %d seconds)\n",
+                    AVCTL_CONTROL_TIMEOUT_SECS);
+        else
+            fprintf(stderr, "avctl: read from control socket failed: %s\n",
+                    strerror(errno));
         free(buf);
         return -1;
     }

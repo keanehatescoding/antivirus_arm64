@@ -18,6 +18,15 @@ DEFAULT_SOCK_PATH = "/run/avd/control.sock"
 # run this synchronously) forever instead of surfacing as an AvdError
 # the caller can show and move on from.
 SOCKET_TIMEOUT_SECS = 5
+# Defense-in-depth cap on a single control-socket response (issue #5):
+# avd only ever sends a bounded, small reply (see avd.c: write_all() only
+# ever sends a handful of KB), and this client already fully trusts the
+# root-owned daemon, so this is not a security boundary - just a backstop
+# so a buggy/compromised avd cannot make this GUI grow its heap without
+# bound via the recv() loop in _request(). Matches avctl's
+# AVCTL_MAX_RESPONSE_BYTES. 16MB is orders of magnitude above any
+# legitimate response.
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 
 def _sock_path():
@@ -45,10 +54,16 @@ def _request(cmd):
             sock.sendall((cmd + "\n").encode("utf-8"))
             sock.shutdown(socket.SHUT_WR)
             chunks = []
+            total = 0
             while True:
                 chunk = sock.recv(65536)
                 if not chunk:
                     break
+                total += len(chunk)
+                if total > MAX_RESPONSE_BYTES:
+                    raise AvdError(
+                        f"avd response too large (over {MAX_RESPONSE_BYTES} bytes)"
+                    )
                 chunks.append(chunk)
     except OSError as exc:
         raise AvdError(
