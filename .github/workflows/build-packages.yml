@@ -254,8 +254,11 @@ jobs:
           # root, which can always write there) so the upload step
           # below finds them at the usual path. find rather than a
           # fixed glob, since two prior CI runs proved the fixed path
-          # wrong despite matching PKGBUILD's own cwd/PKGDEST.
-          find / -xdev -iname '*.pkg.tar.zst' -exec cp {} packaging/arch/ \; 2>/dev/null
+          # wrong despite matching PKGBUILD's own cwd/PKGDEST. No
+          # -xdev: a third real CI run showed it finding nothing at
+          # all under "/" - /home is evidently a separate mount in
+          # this container, which -xdev refuses to cross into.
+          find /home/builder -iname '*.pkg.tar.zst' -exec cp {} packaging/arch/ \;
           ls -la packaging/arch/*.pkg.tar.zst
 
       - name: Upload .pkg.tar.zst packages
