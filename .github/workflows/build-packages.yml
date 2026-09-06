@@ -250,14 +250,20 @@ jobs:
           chmod +x /tmp/build-arch-pkg.sh
           su builder -c /tmp/build-arch-pkg.sh
 
+          # Diagnostic only, temporary: three straight real CI runs
+          # each showed makepkg print "Finished making: hyprav ..."
+          # and then no *.pkg.tar.zst findable anywhere under
+          # /home/builder by any search tried so far (fixed path,
+          # find with -xdev, find without -xdev). Dump everything
+          # actually on disk instead of guessing a fourth path.
+          echo "=== full tree under /home/builder/hyprav-ci-src/packaging/arch ==="
+          find /home/builder/hyprav-ci-src/packaging/arch
+          echo "=== every file anywhere under /home ==="
+          find /home -type f
+
           # Copy the built packages back into the real workspace (as
           # root, which can always write there) so the upload step
-          # below finds them at the usual path. find rather than a
-          # fixed glob, since two prior CI runs proved the fixed path
-          # wrong despite matching PKGBUILD's own cwd/PKGDEST. No
-          # -xdev: a third real CI run showed it finding nothing at
-          # all under "/" - /home is evidently a separate mount in
-          # this container, which -xdev refuses to cross into.
+          # below finds them at the usual path.
           find /home/builder -iname '*.pkg.tar.zst' -exec cp {} packaging/arch/ \;
           ls -la packaging/arch/*.pkg.tar.zst
 
