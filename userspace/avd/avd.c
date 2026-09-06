@@ -1222,13 +1222,17 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
     return -1;
   }
 
-  fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600);
-  fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0);
-  fprintf(f, "ORIGINAL_GID=%d\n", orig_st ? (int)orig_st->st_gid : 0);
-  fprintf(f, "TIMESTAMP=%lld\n", (long long)time(NULL));
-  fprintf(f, "RULE_NAME=%s\n", rule_name ? rule_name : "");
-  fprintf(f, "SHA256=%s\n", sha256_hex ? sha256_hex : "");
-  fprintf(f, "ORIGINAL_PATH=%s\n", orig_path);
+  if (fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600) < 0 ||
+      fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0) < 0 ||
+      fprintf(f, "ORIGINAL_GID=%d\n", orig_st ? (int)orig_st->st_gid : 0) < 0 ||
+      fprintf(f, "TIMESTAMP=%lld\n", (long long)time(NULL)) < 0 ||
+      fprintf(f, "RULE_NAME=%s\n", rule_name ? rule_name : "") < 0 ||
+      fprintf(f, "SHA256=%s\n", sha256_hex ? sha256_hex : "") < 0 ||
+      fprintf(f, "ORIGINAL_PATH=%s\n", orig_path) < 0) {
+    fclose(f);
+    unlink(meta_path);
+    return -1;
+  }
 
   if (fclose(f) != 0) {
     unlink(meta_path);
@@ -1401,6 +1405,8 @@ static int ensure_quarantine_dir(void) {
  * once, since removing-by-path is the one operation here that still
  * has to re-resolve a path name and can't be done purely through `fd`
  * (see quarantine_file()'s identity re-check that guards it). */
+static int write_all(int fd, const char *buf, size_t len);
+
 static int copy_fd_to(int fd, const char *dst) {
   int out_fd;
   char buf[65536];
@@ -1414,13 +1420,23 @@ static int copy_fd_to(int fd, const char *dst) {
   if (out_fd < 0)
     return -1;
 
-  while ((n = read(fd, buf, sizeof(buf))) > 0) {
-    if (write(out_fd, buf, (size_t)n) != n) {
+  for (;;) {
+    n = read(fd, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      ret = -1;
+      break;
+    }
+    if (n == 0)
+      break;
+    if (write_all(out_fd, buf, (size_t)n) != 0) {
       ret = -1;
       break;
     }
   }
-  if (n < 0)
+
+  if (ret == 0 && fdatasync(out_fd) != 0)
     ret = -1;
 
   close(out_fd);
@@ -2605,7 +2621,7 @@ static void handle_control_line(int fd, const char *line, uid_t peer_uid,
     const char *arg = line + sizeof("VERDICTS RECENT ") - 1;
 
     n = strtoul(arg, &end, 10);
-    if (end == arg) {
+    if (end == arg || *end != '\0') {
       send_err(fd, "malformed VERDICTS RECENT (expected a count)");
       return;
     }

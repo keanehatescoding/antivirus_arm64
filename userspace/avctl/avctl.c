@@ -212,6 +212,27 @@ static int do_protect_list(void)
     return 0;
 }
 
+/* Retries on EINTR and short writes - same contract as avd's write_all()
+ * on the other side of this protocol. Returns 0 once every byte of `buf`
+ * has been written, -1 (errno set) on a real write failure. */
+static int write_all(int fd, const void *buf, size_t len)
+{
+    const char *p = buf;
+    size_t off = 0;
+
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 static int write_command_to(const char *path, const char *cmd)
 {
     int fd = open(path, O_WRONLY);
@@ -246,7 +267,7 @@ static int write_command_to(const char *path, const char *cmd)
     buf[cmd_len] = '\n';
     buf[cmd_len + 1] = '\0';
 
-    written = write(fd, buf, cmd_len + 1);
+    written = write_all(fd, buf, cmd_len + 1);
     saved_errno = errno; /* capture before close()/free() can touch it */
     free(buf);
     close(fd);
@@ -1229,9 +1250,9 @@ static int control_request(const char *cmd, char **out)
     memcpy(req, cmd, cmd_len);
     req[cmd_len] = '\n';
     req[cmd_len + 1] = '\0';
-    n = write(fd, req, cmd_len + 1);
+    n = write_all(fd, req, cmd_len + 1);
     free(req);
-    if (n != (ssize_t)(cmd_len + 1)) {
+    if (n != 0) {
         fprintf(stderr, "avctl: write to control socket failed: %s\n", strerror(errno));
         close(fd);
         return -1;
