@@ -236,6 +236,12 @@ jobs:
           # far more rigorously, elsewhere (see PKGBUILD's own comment
           # on this variable).
           export HYPRAV_SKIP_AV_KO_CHECK=1
+          # Force the output location instead of trusting the
+          # container's default makepkg.conf: a real CI run (v0.10.0)
+          # built and versioned the package correctly but the "cp
+          # *.pkg.tar.zst" step below still found nothing, because
+          # this image's default PKGDEST isn't $PWD.
+          export PKGDEST="$PWD"
           makepkg -s --noconfirm
           SCRIPT
           chmod +x /tmp/build-arch-pkg.sh
