@@ -126,7 +126,21 @@ jobs:
       # ownership/permission error but is really just "there is no
       # .git here" - archlinux:base-devel doesn't ship git installed.
       - name: Install git (before checkout needs it)
-        run: pacman -Syu --noconfirm --quiet && pacman -S --noconfirm --needed --quiet git
+        run: |
+          # pacman's Landlock-based download sandbox (on by default
+          # since pacman 7) fails inside this container: "restricting
+          # filesystem access failed because the Landlock ruleset
+          # could not be applied: Operation not permitted" /
+          # "switching to sandbox user 'alpm' failed!" - GitHub
+          # Actions' container runtime doesn't permit the
+          # landlock_create_ruleset syscall pacman needs for it.
+          # Disabled here, once, before the very first pacman call in
+          # this job - the setting persists in this container's
+          # /etc/pacman.conf for every later step (sudo install,
+          # makepkg -s's own makedepend installs).
+          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
+          pacman -Syu --noconfirm --quiet
+          pacman -S --noconfirm --needed --quiet git
 
       - uses: actions/checkout@v7
         with:
