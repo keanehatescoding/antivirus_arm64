@@ -77,6 +77,7 @@
  * before any system header pulls in <bits/socket.h> - must come first. */
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2620,8 +2621,17 @@ static void handle_control_line(int fd, const char *line, uid_t peer_uid,
   } else if (PREFIX_MATCH(line, "VERDICTS RECENT ")) {
     const char *arg = line + sizeof("VERDICTS RECENT ") - 1;
 
+    /* strtoul() alone isn't enough: it silently accepts leading
+     * whitespace and a '+'/'-' sign, so "-1" would parse as
+     * ULONG_MAX instead of being rejected - cmd_verdicts_recent()
+     * would then treat that as "hand back every record available".
+     * Require the first character to be a decimal digit, and check
+     * errno for ERANGE (a huge but syntactically valid count clamps
+     * to ULONG_MAX/overflows rather than erroring on its own). */
+    errno = 0;
     n = strtoul(arg, &end, 10);
-    if (end == arg || *end != '\0') {
+    if (end == arg || *end != '\0' || !isdigit((unsigned char)arg[0]) ||
+        errno == ERANGE) {
       send_err(fd, "malformed VERDICTS RECENT (expected a count)");
       return;
     }
