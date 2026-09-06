@@ -236,11 +236,14 @@ jobs:
           # far more rigorously, elsewhere (see PKGBUILD's own comment
           # on this variable).
           export HYPRAV_SKIP_AV_KO_CHECK=1
-          # Force the output location instead of trusting the
-          # container's default makepkg.conf: a real CI run (v0.10.0)
-          # built and versioned the package correctly but the "cp
-          # *.pkg.tar.zst" step below still found nothing, because
-          # this image's default PKGDEST isn't $PWD.
+          # v0.10.0's real CI run showed makepkg build and version the
+          # package correctly (both before and after also exporting
+          # PKGDEST="$PWD" here), yet "cp .../packaging/arch/*.pkg.tar.zst"
+          # still found nothing at that exact path either way - whatever
+          # this image's actual output location is, it isn't the one
+          # PKGBUILD's own working directory would suggest. Kept as a
+          # likely-correct hint; the copy step below no longer trusts it
+          # and locates the real files with find instead.
           export PKGDEST="$PWD"
           makepkg -s --noconfirm
           SCRIPT
@@ -249,9 +252,11 @@ jobs:
 
           # Copy the built packages back into the real workspace (as
           # root, which can always write there) so the upload step
-          # below finds them at the usual path.
-          cp /home/builder/hyprav-ci-src/packaging/arch/*.pkg.tar.zst \
-            packaging/arch/
+          # below finds them at the usual path. find rather than a
+          # fixed glob, since two prior CI runs proved the fixed path
+          # wrong despite matching PKGBUILD's own cwd/PKGDEST.
+          find / -xdev -iname '*.pkg.tar.zst' -exec cp {} packaging/arch/ \; 2>/dev/null
+          ls -la packaging/arch/*.pkg.tar.zst
 
       - name: Upload .pkg.tar.zst packages
         uses: actions/upload-artifact@v7
