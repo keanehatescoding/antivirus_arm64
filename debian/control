@@ -27,7 +27,7 @@ Homepage: https://github.com/keanehatescoding/antivirus
 Rules-Requires-Root: no
 
 Package: hyprav-dkms
-Architecture: amd64
+Architecture: arm64
 Depends: dkms, ${misc:Depends}
 Description: HyprAV kprobe-based execve/file-event kernel module (DKMS)
  Out-of-tree kernel module (av.ko) that hooks execve and file events via
@@ -36,11 +36,13 @@ Description: HyprAV kprobe-based execve/file-event kernel module (DKMS)
  fuzzy hashing). Ships as DKMS source and is rebuilt automatically
  against every installed kernel.
  .
- x86_64 only as shipped - the module hooks __x64_sys_execve by symbol
- name; arm64 needs source changes to hook __arm64_sys_execve instead.
+ arm64 only as shipped - the module hooks __arm64_sys_execve by symbol
+ name; x86_64 needs source changes to hook __x64_sys_execve instead
+ (and reinstates the raw unlink(2)/rename(2) kprobes, which arm64
+ doesn't have - see av/main.c).
 
 Package: hyprav
-Architecture: amd64
+Architecture: arm64
 # pkexec, not policykit-1: the latter no longer exists as an
 # installable package on Debian 13/trixie (confirmed - `apt install
 # policykit-1` fails with "Depends: policykit-1 but it is not

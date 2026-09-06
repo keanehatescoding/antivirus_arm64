@@ -39,7 +39,15 @@ jobs:
 
   build:
     needs: load-kernel-matrix
-    runs-on: ubuntu-latest
+    # arm64-hosted (native, not cross-compiled): av/main.c now hooks
+    # __arm64_sys_* kprobe symbols and reads arm64 pt_regs->regs[N] -
+    # building it against an x86_64 kernel tree would fail to compile
+    # (or worse, "succeed" against the wrong architecture's headers).
+    # GitHub's free-tier hosted arm64 runners avoid needing a
+    # cross-compilation toolchain (CROSS_COMPILE=aarch64-linux-gnu-)
+    # just to build and boot a kernel this job already needs to run
+    # `make`/`insmod`-adjacent tooling against natively.
+    runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
@@ -78,8 +86,11 @@ jobs:
           # a cache hit would keep serving trees still built with
           # tinyconfig's stricter 1024 default, and the corrected
           # config step below would silently never run to fix it (same
-          # reason v6 was bumped from v5, see below).
-          key: kernel-tree-v7-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
+          # reason v6 was bumped from v5, see below). v8: bumped again
+          # for the arm64 port - a v7 cache entry holds an x86_64 tree
+          # built on the old ubuntu-latest (x86_64) runner and must
+          # never be served to this job's arm64 runner.
+          key: kernel-tree-v8-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
 
       - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -102,17 +113,12 @@ jobs:
           # subsystems our modules touch gets a real, complete symbol
           # table in a few minutes instead.
           make $LLVM_ARG tinyconfig
-          # tinyconfig is allnoconfig-based, and CONFIG_64BIT's Kconfig
-          # default doesn't survive that on x86 - it silently comes out
-          # as a 32-bit (CONFIG_X86_32) build otherwise. On 32-bit,
-          # struct pt_regs has no r8-r15 fields at all, so every module
-          # here that reads real_regs->r8/r10/etc (execveat/openat/
-          # rename's raw-syscall-register hooks) fails to compile with
-          # "no member named 'rN' in 'struct pt_regs'" - not a real
-          # compatibility break, just this matrix quietly building the
-          # wrong word size. Force it explicitly rather than relying on
-          # tinyconfig's default.
-          ./scripts/config --enable CONFIG_64BIT
+          # Unlike x86, arm64's CONFIG_64BIT is a plain `def_bool y` in
+          # arch/arm64/Kconfig with no 32-bit sibling to fall back to -
+          # there's no allnoconfig/tinyconfig word-size trap to force a
+          # workaround for here (arch/arm's separate 32-bit ARCH is a
+          # different Kconfig tree entirely, not something tinyconfig
+          # under ARCH=arm64 could silently drift into).
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
           ./scripts/config --enable CONFIG_CRYPTO
@@ -122,12 +128,13 @@ jobs:
           ./scripts/config --enable CONFIG_CRYPTO_SHA256
           ./scripts/config --enable CONFIG_PROC_FS
           ./scripts/config --enable CONFIG_NET
-          # Same explicit-value-wins trap as CONFIG_64BIT above:
-          # lib/Kconfig.debug's own default is "2048 if 64BIT", but
-          # tinyconfig bakes in "1024 if !64BIT" as a concrete .config
-          # value before the CONFIG_64BIT override above lands, and
-          # olddefconfig won't recompute a default over an existing
-          # explicit value. Left at 1024, av/main.c's
+          # Pinned defensively, same rationale this matrix always had
+          # (see git history): lib/Kconfig.debug's FRAME_WARN default
+          # is "2048 if 64BIT" - should already resolve correctly given
+          # CONFIG_64BIT is unconditionally on for arm64, but pinning it
+          # explicitly costs nothing and removes any dependence on that
+          # default actually being recomputed by olddefconfig. Left at
+          # a stricter value, av/main.c's
           # normalize_abs_path() (a 128-entry pointer array, ~1032
           # bytes of frame) trips -Wframe-larger-than= on every kernel
           # version here even though it's well under what any real
@@ -196,7 +203,9 @@ jobs:
           if-no-files-found: warn
 
   build-avctl:
-    runs-on: ubuntu-latest
+    # arm64-hosted, same as build/build-avd - avctl ships as a real
+    # compiled arm64 binary now, not just av.ko.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Build avctl
@@ -212,7 +221,8 @@ jobs:
           if-no-files-found: error
 
   build-avd:
-    runs-on: ubuntu-latest
+    # arm64-hosted - see build-avctl above.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Install libnl-genl, libyara, and libfuzzy

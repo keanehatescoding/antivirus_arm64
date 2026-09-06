@@ -59,8 +59,8 @@ dmesg | tail -20
 sudo rmmod av
 ```
 
-Targets x86_64 kernels 5.7+ only (hooks `__x64_sys_execve` by symbol name —
-see the wiki's Architecture page for the arm64 note and why it isn't
+Targets arm64 (aarch64) kernels 5.7+ only (hooks `__arm64_sys_execve` by
+symbol name — see the wiki's Architecture page for why x86_64 isn't
 supported). `make CC=clang LLVM=1` builds against a Clang-built kernel.
 
 ## Running the full stack
@@ -117,5 +117,5 @@ a QEMU boot test with real runtime detection, and a packaging build
 ## Security
 
 See [SECURITY.md](SECURITY.md) for scope, already-accepted tradeoffs
-(fail-open by default, a documented kernel TOCTOU gap, x86_64-only), and how
+(fail-open by default, a documented kernel TOCTOU gap, arm64-only), and how
 to report a vulnerability privately.

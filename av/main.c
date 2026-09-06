@@ -86,12 +86,12 @@
 #include "netlink_proto.h"
 #include "sigtable.h"
 
-#define HOOKED_SYSCALL_NAME "__x64_sys_execve" /* see README re: arch */
+#define HOOKED_SYSCALL_NAME "__arm64_sys_execve" /* see README re: arch */
 #define HOOKED_SYSCALLAT_NAME                                                  \
-  "__x64_sys_execveat" /* see README re: arch -                                \
-                        * same x86_64-only caveat as                           \
-                        * HOOKED_SYSCALL_NAME; the arm64                       \
-                        * equivalent is __arm64_sys_execveat. */
+  "__arm64_sys_execveat" /* see README re: arch - arm64-only,                  \
+                        * see HOOKED_SYSCALL_NAME above; the x86_64            \
+                        * equivalent (unsupported by this build) is            \
+                        * __x64_sys_execveat. */
 #define READ_CHUNK_SIZE 4096
 #define MAX_HASH_FILE_SIZE                                                     \
   (256 * 1024 * 1024) /* 256 MB cap on what                                    \
@@ -134,22 +134,26 @@ static struct kprobe kp_execveat = {
     .symbol_name = HOOKED_SYSCALLAT_NAME,
 };
 static struct kprobe kp_openat = {
-    .symbol_name = "__x64_sys_openat",
+    .symbol_name = "__arm64_sys_openat",
 };
-static struct kprobe kp_unlink = {
-    .symbol_name = "__x64_sys_unlink",
-};
+/* No kp_unlink/kp_rename here: arm64's native syscall table (see
+ * include/uapi/asm-generic/unistd.h) never had raw unlink(2)/rename(2)
+ * entries in the first place - those "old" syscalls were dropped in
+ * favor of the *at() forms when the arm64 ABI was designed, and only
+ * survive on arm64 at all via the compat (32-bit) syscall table, which
+ * this module doesn't hook. glibc's unlink()/rename() library calls
+ * compile down to unlinkat(AT_FDCWD, ...)/renameat(AT_FDCWD, ...,
+ * AT_FDCWD, ...) under the hood on arm64, so kp_unlinkat/kp_renameat
+ * below already see every call site that would have hit kp_unlink/
+ * kp_rename on x86_64 - nothing is lost by their absence here. */
 static struct kprobe kp_unlinkat = {
-    .symbol_name = "__x64_sys_unlinkat",
-};
-static struct kprobe kp_rename = {
-    .symbol_name = "__x64_sys_rename",
+    .symbol_name = "__arm64_sys_unlinkat",
 };
 static struct kprobe kp_renameat = {
-    .symbol_name = "__x64_sys_renameat",
+    .symbol_name = "__arm64_sys_renameat",
 };
 static struct kprobe kp_renameat2 = {
-    .symbol_name = "__x64_sys_renameat2",
+    .symbol_name = "__arm64_sys_renameat2",
 };
 
 static struct workqueue_struct *av_wq;
@@ -1074,14 +1078,14 @@ out:
  * unverified: see the regression case's comment for how it stays
  * visible in every CI run instead. */
 static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
   const char __user *user_filename;
   struct av_work *aw;
 
   if (!real_regs)
     return 0;
 
-  user_filename = (const char __user *)real_regs->di;
+  user_filename = (const char __user *)real_regs->regs[0];
   if (!user_filename)
     return 0;
 
@@ -1129,12 +1133,12 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
   return 0;
 }
 /* execveat(2): int execveat(int dirfd, const char *pathname,
- * char *const argv[], char *const envp[], int flags). x86_64 syscall
- * argument order puts dirfd in the first slot (real_regs->di) and
- * pathname in the second (real_regs->si) - same slot pattern as
- * openat's dfd/filename below, NOT the same as execve's filename-only
- * first slot. Reuses struct av_work / av_work_fn unchanged: the only
- * difference from handler_pre() is that the base directory for a
+ * char *const argv[], char *const envp[], int flags). The arm64
+ * syscall ABI puts dirfd in the first argument register (real_regs->
+ * regs[0]) and pathname in the second (real_regs->regs[1]) - same
+ * slot pattern as openat's dfd/filename below, NOT the same as
+ * execve's filename-only first slot. Reuses struct av_work / av_work_fn
+ * unchanged: the only difference from handler_pre() is that the base directory for a
  * relative pathname comes from resolving `dirfd` (AT_FDCWD or a real
  * fd, via resolve_dfd_path() - see openat/unlink for the identical
  * pattern) instead of unconditionally being the calling process's cwd.
@@ -1147,7 +1151,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
  * execveat() fileless-exec loaders actually use, so it's not a
  * theoretical gap.
  *
- * AT_EMPTY_PATH (flags argument, real_regs->r8) IS special-cased, but
+ * AT_EMPTY_PATH (flags argument, real_regs->regs[4]) IS special-cased, but
  * only when the pathname is ALSO actually empty: per execveat(2), an
  * empty pathname with AT_EMPTY_PATH set means dfd names the target
  * file directly (typically an anonymous memfd) - exactly the
@@ -1186,7 +1190,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
  * tracked by a separate cold_launcher.c case - it's the same
  * underlying mechanism, one write-up covers both call sites. */
 static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
   const char __user *user_filename;
   struct av_work *aw;
   struct path base;
@@ -1196,12 +1200,12 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   if (!real_regs)
     return 0;
 
-  user_filename = (const char __user *)real_regs->si;
+  user_filename = (const char __user *)real_regs->regs[1];
   if (!user_filename)
     return 0;
 
-  dfd = (int)real_regs->di;
-  empty_path = ((unsigned int)real_regs->r8 & AT_EMPTY_PATH) != 0;
+  dfd = (int)real_regs->regs[0];
+  empty_path = ((unsigned int)real_regs->regs[4] & AT_EMPTY_PATH) != 0;
 
   /* Resolve dfd BEFORE allocating/copying anything else - same
    * ordering as handler_pre_openat() and for the same reason: a
@@ -1299,10 +1303,10 @@ static void av_openat_work_fn(struct work_struct *w) {
 }
 
 /* openat(int dfd, const char *filename, int flags, umode_t mode) - on
- * the x86_64 syscall ABI, dfd is the FIRST argument (regs->di) and
- * filename is the SECOND (regs->si), unlike execve where the filename
- * is the first (regs->di). Getting this register mapping wrong is a
- * silent, hard-to-notice bug (you'd just never see openat events, no
+ * the arm64 syscall ABI, dfd is the FIRST argument (regs->regs[0]) and
+ * filename is the SECOND (regs->regs[1]), unlike execve where the
+ * filename is the first (regs->regs[0]). Getting this register mapping
+ * wrong is a silent, hard-to-notice bug (you'd just never see openat events, no
  * crash) - verify with a kprobe_log-style dmesg print if this hook
  * seems to never fire.
  *
@@ -1314,7 +1318,7 @@ static void av_openat_work_fn(struct work_struct *w) {
  * /etc/shadow while behavior.c only ever saw the bare string
  * "shadow". */
 static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
   const char __user *user_filename;
   int dfd;
   int flags;
@@ -1324,12 +1328,12 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
   if (!real_regs)
     return 0;
 
-  user_filename = (const char __user *)real_regs->si;
+  user_filename = (const char __user *)real_regs->regs[1];
   if (!user_filename)
     return 0;
 
-  dfd = (int)real_regs->di;
-  flags = (int)real_regs->dx;
+  dfd = (int)real_regs->regs[0];
+  flags = (int)real_regs->regs[2];
   /* Skip the allocation/copy entirely for read-only opens - this is
    * the overwhelming majority of opens on a normal system, and
    * filtering here (still atomic-safe - just an integer test) avoids
@@ -1463,27 +1467,21 @@ static int schedule_unlink_work(const char __user *user_path, int dfd) {
   return 0;
 }
 
-/* unlink(const char *pathname) - pathname is the first (and only)
- * argument, same register position as execve's filename. No dfd of
- * its own, so always resolves relative to cwd (AT_FDCWD). */
-static int handler_pre_unlink(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
-
-  if (!real_regs)
-    return 0;
-  return schedule_unlink_work((const char __user *)real_regs->di, AT_FDCWD);
-}
-
-/* unlinkat(int dfd, const char *pathname, int flag) - dfd is the FIRST
- * argument (regs->di), pathname is the SECOND (regs->si), same
- * position as openat's filename. */
+/* No handler_pre_unlink()/kp_unlink here - see kp_unlink's removal
+ * comment above kp_unlinkat's declaration: arm64 has no raw unlink(2)
+ * syscall to hook, and unlinkat below already sees every call that
+ * would have reached it.
+ *
+ * unlinkat(int dfd, const char *pathname, int flag) - dfd is the FIRST
+ * argument (regs->regs[0]), pathname is the SECOND (regs->regs[1]),
+ * same position as openat's filename. */
 static int handler_pre_unlinkat(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
 
   if (!real_regs)
     return 0;
-  return schedule_unlink_work((const char __user *)real_regs->si,
-                              (int)real_regs->di);
+  return schedule_unlink_work((const char __user *)real_regs->regs[1],
+                              (int)real_regs->regs[0]);
 }
 
 /* ---- rename/renameat/renameat2: extension-append burst + sensitive-
@@ -1616,46 +1614,42 @@ static int schedule_rename_work(const char __user *user_oldpath, int olddfd,
   return 0;
 }
 
-/* rename(const char *oldname, const char *newname) - same register
- * shape as unlink's single-arg case, just two of them: oldname is the
- * first arg (di), newname is the second (si). No dfd args of its own,
- * so both resolve relative to cwd (AT_FDCWD). */
-static int handler_pre_rename(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
-
-  if (!real_regs)
-    return 0;
-  return schedule_rename_work((const char __user *)real_regs->di, AT_FDCWD,
-                              (const char __user *)real_regs->si, AT_FDCWD);
-}
-
-/* renameat(int olddfd, const char *oldname, int newdfd, const char *newname)
- * - olddfd is the FIRST arg (di), oldname the SECOND (si), newdfd the
- * THIRD (dx), newname the FOURTH (r10, not r8 - standard x86_64
- * syscall arg order is di/si/dx/r10/r8/r9, since r10 substitutes for
- * rcx which the SYSCALL instruction itself clobbers). */
+/* No handler_pre_rename()/kp_rename here - same reasoning as
+ * kp_unlink's removal above: arm64 has no raw rename(2) syscall to
+ * hook (glibc's rename() compiles down to renameat(AT_FDCWD, ...,
+ * AT_FDCWD, ...) on this arch), and renameat below already sees every
+ * call that would have reached it.
+ *
+ * renameat(int olddfd, const char *oldname, int newdfd, const char *newname)
+ * - olddfd is the FIRST arg (regs[0]), oldname the SECOND (regs[1]),
+ * newdfd the THIRD (regs[2]), newname the FOURTH (regs[3]) - the
+ * arm64 syscall ABI passes arguments in x0-x5 straight through with
+ * no register substitution, unlike x86_64's r10-for-rcx quirk (rcx is
+ * clobbered by the SYSCALL instruction itself there; AArch64's SVC
+ * instruction has no equivalent clobber, so there's nothing to work
+ * around here). */
 static int handler_pre_renameat(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
 
   if (!real_regs)
     return 0;
   return schedule_rename_work(
-      (const char __user *)real_regs->si, (int)real_regs->di,
-      (const char __user *)real_regs->r10, (int)real_regs->dx);
+      (const char __user *)real_regs->regs[1], (int)real_regs->regs[0],
+      (const char __user *)real_regs->regs[3], (int)real_regs->regs[2]);
 }
 
 /* renameat2(int olddfd, const char *oldname, int newdfd, const char *newname,
  * unsigned int flags) - same first four args as renameat (flags, the
- * fifth/r8, isn't currently used - RENAME_EXCHANGE/RENAME_NOREPLACE/
+ * fifth/regs[4], isn't currently used - RENAME_EXCHANGE/RENAME_NOREPLACE/
  * RENAME_WHITEOUT aren't distinguished by this heuristic today). */
 static int handler_pre_renameat2(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
 
   if (!real_regs)
     return 0;
   return schedule_rename_work(
-      (const char __user *)real_regs->si, (int)real_regs->di,
-      (const char __user *)real_regs->r10, (int)real_regs->dx);
+      (const char __user *)real_regs->regs[1], (int)real_regs->regs[0],
+      (const char __user *)real_regs->regs[3], (int)real_regs->regs[2]);
 }
 
 /* ---- pre-existing kernel taint check ----
@@ -1846,32 +1840,18 @@ static int __init av_init(void) {
     goto err_kp_execveat;
   }
 
-  kp_unlink.pre_handler = handler_pre_unlink;
-  ret = register_kprobe(&kp_unlink);
-  if (ret < 0) {
-    pr_err("kernel-av: register_kprobe(unlink) failed: %d\n", ret);
-    goto err_kp_openat;
-  }
-
   kp_unlinkat.pre_handler = handler_pre_unlinkat;
   ret = register_kprobe(&kp_unlinkat);
   if (ret < 0) {
     pr_err("kernel-av: register_kprobe(unlinkat) failed: %d\n", ret);
-    goto err_kp_unlink;
-  }
-
-  kp_rename.pre_handler = handler_pre_rename;
-  ret = register_kprobe(&kp_rename);
-  if (ret < 0) {
-    pr_err("kernel-av: register_kprobe(rename) failed: %d\n", ret);
-    goto err_kp_unlinkat;
+    goto err_kp_openat;
   }
 
   kp_renameat.pre_handler = handler_pre_renameat;
   ret = register_kprobe(&kp_renameat);
   if (ret < 0) {
     pr_err("kernel-av: register_kprobe(renameat) failed: %d\n", ret);
-    goto err_kp_rename;
+    goto err_kp_unlinkat;
   }
 
   kp_renameat2.pre_handler = handler_pre_renameat2;
@@ -1886,12 +1866,8 @@ static int __init av_init(void) {
 
 err_kp_renameat:
   unregister_kprobe(&kp_renameat);
-err_kp_rename:
-  unregister_kprobe(&kp_rename);
 err_kp_unlinkat:
   unregister_kprobe(&kp_unlinkat);
-err_kp_unlink:
-  unregister_kprobe(&kp_unlink);
 err_kp_openat:
   unregister_kprobe(&kp_openat);
 err_kp_execveat:
@@ -1916,9 +1892,7 @@ err_sigtable:
 static void __exit av_exit(void) {
   unregister_kprobe(&kp_renameat2);
   unregister_kprobe(&kp_renameat);
-  unregister_kprobe(&kp_rename);
   unregister_kprobe(&kp_unlinkat);
-  unregister_kprobe(&kp_unlink);
   unregister_kprobe(&kp_openat);
   unregister_kprobe(&kp_execveat);
   unregister_kprobe(&kp_execve);

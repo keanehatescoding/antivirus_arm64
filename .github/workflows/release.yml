@@ -52,7 +52,12 @@ jobs:
     uses: ./.github/workflows/build-packages.yml
 
   build-flatpak:
-    runs-on: ubuntu-latest
+    # arm64-hosted (native) - av-gui's own code is arch-agnostic, but
+    # bundling it alongside a native hyprav install (see
+    # packaging/flatpak/README.md) is only meaningful on the arch that
+    # install actually targets. See build-matrix.yml's `build` job for
+    # the same reasoning.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
@@ -93,17 +98,19 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           [ "$GITHUB_REF_TYPE" = "tag" ] || VERSION="$(git describe --tags --always)"
           flatpak build-bundle repo \
-            "hyprav-gui-${VERSION}-x86_64.flatpak" org.hyprav.avgui
+            "hyprav-gui-${VERSION}-aarch64.flatpak" org.hyprav.avgui
 
       - name: Upload .flatpak bundle
         uses: actions/upload-artifact@v7
         with:
           name: flatpak-package
-          path: hyprav-gui-*-x86_64.flatpak
+          path: hyprav-gui-*-aarch64.flatpak
           if-no-files-found: error
 
   build-appimage:
-    runs-on: ubuntu-latest
+    # arm64-hosted (native) - see build-flatpak's own comment above;
+    # same reasoning applies to this bundle.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
@@ -123,7 +130,7 @@ jobs:
         run: |
           curl -fsSL --retry 3 --retry-all-errors \
             -o /usr/local/bin/appimagetool \
-            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage
           chmod +x /usr/local/bin/appimagetool
 
       # appimagetool is itself packaged as a (type-2 runtime) AppImage,

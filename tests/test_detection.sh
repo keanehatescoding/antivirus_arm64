@@ -12,12 +12,24 @@
 #
 set -u
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# av.ko is arm64-only (hooks __arm64_sys_* symbols, reads arm64
+# pt_regs) - it can never be insmod'd on a non-aarch64 host. Delegate to
+# the cross-compile + QEMU boot-test version instead of just failing;
+# that path needs no root at all (nothing is insmod'd into this host).
+if [ "$(uname -m)" != "aarch64" ]; then
+    echo "test_detection.sh: host is $(uname -m), not aarch64 - av.ko can't be"
+    echo "  insmod'd here. Delegating to test_detection_qemu.sh (cross-compile"
+    echo "  + QEMU boot test)."
+    exec "$REPO_ROOT/tests/test_detection_qemu.sh"
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script needs root (insmod/rmmod). Re-run with sudo."
     exit 1
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AV_DIR="$REPO_ROOT/av"
 # Private mktemp -d, not a fixed /tmp/av_test_eicar.com path: this script
 # runs as root and writes the EICAR file plus build/insmod/rmmod logs,

@@ -33,7 +33,11 @@ permissions:
 
 jobs:
   build-deb:
-    runs-on: ubuntu-latest
+    # arm64-hosted (native) - debian/control now declares
+    # Architecture: arm64, and debian:trixie is a multi-arch image (no
+    # container change needed, unlike build-arch below). See
+    # build-matrix.yml's `build` job for the same reasoning.
+    runs-on: ubuntu-24.04-arm
     # Debian/Ubuntu, not a generic ubuntu-latest apt install: these
     # exact build-dep package names (notably gir1.2-gtk-4.0) were
     # confirmed against a real Debian 13 (trixie) box (see
@@ -96,8 +100,21 @@ jobs:
           if-no-files-found: error
 
   build-arch:
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    # arm64-hosted (native) - see build-deb's own comment above for the
+    # general reasoning. The container itself also has to change:
+    # official Arch Linux only targets x86_64 (confirmed via the Docker
+    # Hub API - the `archlinux` image publishes no arm64 manifest at
+    # all), so this uses menci/archlinuxarm instead, an actively
+    # maintained third-party image of Arch Linux ARM (the separate
+    # ALARM project that actually serves arm64 - see
+    # packaging/arch/PKGBUILD's own comment) built for exactly this
+    # kind of arm64 CI use. Not end-to-end build-verified in this
+    # environment (no arm64 runner/container access here) - if this
+    # image ever goes stale or disappears, any ALARM-based
+    # base-devel-equivalent image is a drop-in replacement, since
+    # PKGBUILD itself is untouched either way.
+    runs-on: ubuntu-24.04-arm
+    container: menci/archlinuxarm:base-devel
     steps:
       # git must exist BEFORE actions/checkout runs, not after - a
       # real CI run showed that without it, checkout silently falls
@@ -109,15 +126,52 @@ jobs:
       # ownership/permission error but is really just "there is no
       # .git here" - archlinux:base-devel doesn't ship git installed.
       - name: Install git (before checkout needs it)
-        run: pacman -Syu --noconfirm --quiet && pacman -S --noconfirm --needed --quiet git
+        run: |
+          # pacman's Landlock-based download sandbox (on by default
+          # since pacman 7) fails inside this container: "restricting
+          # filesystem access failed because the Landlock ruleset
+          # could not be applied: Operation not permitted" /
+          # "switching to sandbox user 'alpm' failed!" - GitHub
+          # Actions' container runtime doesn't permit the
+          # landlock_create_ruleset syscall pacman needs for it.
+          # Disabled here, once, before the very first pacman call in
+          # this job - the setting persists in this container's
+          # /etc/pacman.conf for every later step (sudo install,
+          # makepkg -s's own makedepend installs).
+          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
+          pacman -Syu --noconfirm --quiet
+          pacman -S --noconfirm --needed --quiet git
 
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
           # PKGBUILD's pkgver() runs `git describe --long --tags`,
           # which needs full tag history - the default shallow
-          # (depth-1) checkout has none of it.
+          # (depth-1) checkout has none of it. fetch-depth: 0 alone
+          # isn't enough either: actions/checkout still passes
+          # `--no-tags` to its underlying git fetch unless fetch-tags
+          # is set, which a real CI run confirmed - pkgver() failed
+          # with "fatal: No names found, cannot describe anything."
           fetch-depth: 0
+          fetch-tags: true
+
+      - name: Force-fetch tags (belt-and-suspenders for pkgver())
+        # A real CI run showed fetch-tags: true above still wasn't
+        # enough in this container-based checkout - `git describe`
+        # still failed with "fatal: No names found, cannot describe
+        # anything." even though the tag itself (checked separately)
+        # really is an ancestor of HEAD. Fetch them explicitly rather
+        # than trust actions/checkout's tag handling here.
+        #
+        # safe.directory is needed too: actions/checkout only adds
+        # that exception under a temporary HOME override scoped to its
+        # own steps (confirmed by a real CI run) - plain `run:` steps
+        # like this one see the real container HOME, which has no such
+        # exception, so bare git commands fail with "detected dubious
+        # ownership in repository".
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --tags --force
 
       - name: Install bootstrap dependencies
         # Only what's needed to get makepkg itself running as a
@@ -201,7 +255,11 @@ jobs:
           if-no-files-found: error
 
   build-rpm:
-    runs-on: ubuntu-latest
+    # arm64-hosted (native) - see build-deb's own comment above. Fedora
+    # officially supports aarch64, and fedora:latest is a multi-arch
+    # image, so no container change is needed here (unlike build-arch
+    # above).
+    runs-on: ubuntu-24.04-arm
     container: fedora:latest
     # No longer continue-on-error: this job used to have two stacked
     # bugs - BuildRequires: tlsh-devel never resolving on any shipping
@@ -232,7 +290,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # See build-arch's checkout step: fetch-depth: 0 alone
+          # doesn't fetch tags, and the release-only step below needs
+          # them for its own `git describe --long --tags`.
           fetch-depth: 0
+          fetch-tags: true
+
+      - name: Force-fetch tags (belt-and-suspenders for git describe)
+        # See build-arch's identical step: fetch-tags: true alone
+        # wasn't enough in a real CI run, and safe.directory needs
+        # re-declaring outside actions/checkout's own temp-HOME scope.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --tags --force
 
       - name: Install rpmbuild tooling
         run: |

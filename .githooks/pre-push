@@ -5,11 +5,18 @@
 # touches av/, userspace/avctl/, or userspace/avd/ - a docs-only push
 # shouldn't insmod a kernel module.
 #
-# This needs root (insmod/rmmod) and should only run inside your VM.
-# Runs via pkexec rather than sudo: pkexec goes through the system's
-# polkit authentication agent instead of demanding an interactive
-# terminal for a password/fingerprint prompt, so it also works from
-# non-interactive/agent-driven shells that can't satisfy sudo's prompt.
+# av.ko is arm64-only (hooks __arm64_sys_* symbols, reads arm64
+# pt_regs), so it can only ever be insmod'd on a native aarch64 host -
+# tests/run_all.sh knows this and self-elevates via pkexec (rather than
+# sudo: pkexec goes through the system's polkit authentication agent
+# instead of demanding an interactive terminal for a password/
+# fingerprint prompt, so it also works from non-interactive/agent-driven
+# shells) only in that case. On any other host - e.g. this x86_64 dev
+# machine - run_all.sh runs entirely unprivileged: test_detection.sh
+# cross-compiles av.ko and boot-tests it under QEMU instead of insmod'ing
+# it here, and the tests that need a module actually loaded on this host
+# (sigtable/avd-socket/netlink) are skipped rather than failed. This hook
+# no longer wraps the call in pkexec itself - see run_all.sh.
 #
 # Enable with: scripts/setup-hooks.sh   (or: git config core.hooksPath .githooks)
 # Bypass once with: git push --no-verify (not recommended, especially
@@ -77,13 +84,12 @@ fi
 echo "==> pre-push: changes detected in av/, userspace/avctl/, or userspace/avd/"
 echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 
-# No separate preflight credential check: 'pkexec tests/run_all.sh'
-# fails on its own, with its own clear error (and no polkit agent
-# available shows up as pkexec exiting nonzero immediately), if
-# authentication genuinely can't happen - no need to duplicate that
-# check. pkexec wants an absolute path to the program it runs, unlike
-# sudo, which resolves relative paths against the caller's cwd.
-if pkexec "$REPO_ROOT/tests/run_all.sh"; then
+# No separate preflight credential check: on a native aarch64 host,
+# run_all.sh's own 'exec pkexec "$0"' fails on its own, with its own
+# clear error (and no polkit agent available shows up as pkexec exiting
+# nonzero immediately), if authentication genuinely can't happen - no
+# need to duplicate that check here.
+if "$REPO_ROOT/tests/run_all.sh"; then
     echo "pre-push: all tests passed"
     exit 0
 else

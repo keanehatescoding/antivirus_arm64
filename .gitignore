@@ -18,6 +18,10 @@ tests/qemu-boot/cold_launcher
 tests/qemu-boot/root/
 tests/qemu-boot/initramfs.cpio.gz
 tests/qemu-boot/serial.log
+# Cached cross-compiled arm64 kernel tree, built by
+# tests/test_detection_qemu.sh so a from-scratch defconfig build
+# doesn't have to happen on every push that touches av/.
+tests/qemu-boot/.kernel-cache/
 packaging/arch/pkg/
 packaging/arch/src/
 packaging/arch/*.pkg.tar.*
