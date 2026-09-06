@@ -246,7 +246,17 @@ jobs:
           cat > /tmp/ptrace_test.c << 'EOF'
           #include <sys/ptrace.h>
           #include <stddef.h>
-          int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); return 0; }
+          /* Padding, referenced (not dead code) so it survives to the
+           * binary: without it this binary is so small that UPX's
+           * fixed-size decompression stub dominates the packed
+           * output, and on aarch64 (where that stub is bigger than on
+           * x86_64) that alone drags the packed file's overall
+           * entropy below entropy.yar's 7.0 threshold - see the
+           * elf_analysis.yar/entropy.yar smoke-test steps below, which
+           * pack this same binary and depend on it actually reading
+           * as high-entropy once packed. */
+          static const char padding[200000] = "padding";
+          int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, (void *)padding); return 0; }
           EOF
           gcc -o /tmp/ptrace_test /tmp/ptrace_test.c
           yara rules/heuristics.yar /tmp/ptrace_test | grep -q Imports_Ptrace
