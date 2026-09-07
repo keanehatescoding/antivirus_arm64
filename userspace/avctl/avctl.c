@@ -67,13 +67,28 @@
  * own accepted fd, not a client stuck in read() waiting for a reply. */
 #define AVCTL_CONTROL_TIMEOUT_SECS 5
 
+/* Slow-verb budget for commands whose daemon-side work is not immediate:
+ * cmd_scan() runs the whole scan synchronously (SHA-256 + fuzzy/TLSH +
+ * up to SCAN_TIMEOUT_SECS=10s of YARA alone) before writing a single
+ * reply byte, and QUARANTINE RESTORE/DELETE copy file data - a uniform
+ * 5s timeout would abort legitimate slow scans (the same class of bug
+ * that once forced DAEMON_TIMEOUT_MS 2000 -> 12000 in av/main.c, since
+ * avd's 10s YARA budget never fit inside the old 2s kernel wait). 30s
+ * keeps the worst case bounded while leaving headroom over the 10s YARA
+ * budget plus large-file hashing time (which has no size cap yet -
+ * see issue #3). The GUI needs no equivalent: it only sends fast
+ * read-only verbs directly (SCAN/privileged verbs go through
+ * pkexec_helper.py + avctl, i.e. this exact path). */
+#define AVCTL_CONTROL_SLOW_TIMEOUT_SECS 30
+
 /* Defense-in-depth cap on a single control-socket response (issue #5):
  * avd only ever sends a bounded, small reply (a handful of KB at most for
  * e.g. VERDICTS RECENT), and avctl already fully trusts the root-owned
  * daemon on the other end, so this is not a security boundary - just a
  * backstop so a buggy/compromised avd cannot make this CLI grow its heap
  * without bound via the cap-doubling loop in control_request(). 16MB is
- * orders of magnitude above any legitimate response. */
+ * orders of magnitude above any legitimate response. Counts actual
+ * response payload bytes: a response of exactly this size is accepted. */
 #define AVCTL_MAX_RESPONSE_BYTES (16 * 1024 * 1024)
 
 /* Must match the kernel side's own field-width limits: AV_HASH_HEX_MAXLEN
@@ -1241,6 +1256,23 @@ static const char *control_sock_path(void)
     return p ? p : CONTROL_SOCK_PATH_DEFAULT;
 }
 
+/* Selects the client-side socket timeout for one control-socket command.
+ * Fast read-only verbs (QUARANTINE LIST and the like) get
+ * AVCTL_CONTROL_TIMEOUT_SECS; verbs whose daemon side does real work
+ * before replying (SCAN, QUARANTINE RESTORE/DELETE) get
+ * AVCTL_CONTROL_SLOW_TIMEOUT_SECS. Matched on the "VERB " prefix with
+ * the trailing space so e.g. "SCANX" can never match "SCAN ". */
+static int control_timeout_for(const char *cmd)
+{
+    if (strncmp(cmd, "SCAN ", sizeof("SCAN ") - 1) == 0 ||
+        strncmp(cmd, "QUARANTINE RESTORE ",
+                sizeof("QUARANTINE RESTORE ") - 1) == 0 ||
+        strncmp(cmd, "QUARANTINE DELETE ",
+                sizeof("QUARANTINE DELETE ") - 1) == 0)
+        return AVCTL_CONTROL_SLOW_TIMEOUT_SECS;
+    return AVCTL_CONTROL_TIMEOUT_SECS;
+}
+
 /*
  * Connects to avd's control socket, sends `cmd` followed by a newline,
  * and reads the whole response into a malloc'd, NUL-terminated buffer
@@ -1259,6 +1291,7 @@ static int control_request(const char *cmd, char **out)
     ssize_t n;
     char *req;
     int fd;
+    int timeout_secs = control_timeout_for(cmd);
 
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -1271,9 +1304,11 @@ static int control_request(const char *cmd, char **out)
      * the GUI's SOCKET_TIMEOUT_SECS: without this, avctl blocks forever
      * in read() below if avd accepts the connection but never writes a
      * response. Best-effort like the daemon side - a failure to set the
-     * option is warned about but does not refuse the connection. */
+     * option is warned about but does not refuse the connection. The
+     * value itself is per-command (see control_timeout_for()): slow
+     * verbs need headroom over the daemon's own scan/copy time. */
     {
-        struct timeval tv = { .tv_sec = AVCTL_CONTROL_TIMEOUT_SECS, .tv_usec = 0 };
+        struct timeval tv = { .tv_sec = timeout_secs, .tv_usec = 0 };
         if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
             fprintf(stderr, "avctl: warning: could not set receive timeout: %s\n",
                     strerror(errno));
@@ -1350,17 +1385,26 @@ static int control_request(const char *cmd, char **out)
         if (n == 0)
             break;
         len += (size_t)n;
+        /* Payload limit, not buffer limit: exactly AVCTL_MAX_RESPONSE_BYTES
+         * response bytes are accepted (the buffer then holds those plus
+         * the NUL at buf[len]). Only len > MAX is rejected, so a
+         * legitimate MAX-byte response is never reported as "over 16MB"
+         * - matching the GUI's `total > MAX_RESPONSE_BYTES` check. The
+         * buffer itself may grow to MAX+2 (MAX payload + 1 probe byte +
+         * NUL) so the loop can always tell EOF apart from "one byte
+         * over the limit" instead of mistaking a zero-length read for
+         * EOF. */
+        if (len > (size_t)AVCTL_MAX_RESPONSE_BYTES) {
+            fprintf(stderr, "avctl: response too large (over %d bytes)\n",
+                    AVCTL_MAX_RESPONSE_BYTES);
+            free(buf);
+            close(fd);
+            return -1;
+        }
         if (len >= cap - 1) {
-            if (cap >= AVCTL_MAX_RESPONSE_BYTES) {
-                fprintf(stderr, "avctl: response too large (over %d bytes)\n",
-                        AVCTL_MAX_RESPONSE_BYTES);
-                free(buf);
-                close(fd);
-                return -1;
-            }
             cap *= 2;
-            if (cap > AVCTL_MAX_RESPONSE_BYTES)
-                cap = AVCTL_MAX_RESPONSE_BYTES;
+            if (cap > (size_t)AVCTL_MAX_RESPONSE_BYTES + 2)
+                cap = (size_t)AVCTL_MAX_RESPONSE_BYTES + 2;
             grown = realloc(buf, cap);
             if (!grown) {
                 fprintf(stderr, "avctl: out of memory\n");
@@ -1377,7 +1421,7 @@ static int control_request(const char *cmd, char **out)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             fprintf(stderr, "avctl: timed out waiting for avd response "
                             "(no reply within %d seconds)\n",
-                    AVCTL_CONTROL_TIMEOUT_SECS);
+                    timeout_secs);
         else
             fprintf(stderr, "avctl: read from control socket failed: %s\n",
                     strerror(errno));
