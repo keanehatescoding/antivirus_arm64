@@ -177,7 +177,12 @@ echo
 
 echo "-- Test 2: AT_FDCWD + relative path --"
 dmesg -C
-(cd "$TESTDIR" && "$TESTDIR/execveat_runner" AT_FDCWD eicar.com 0 || true)
+# Status intentionally ignored: a detection kill exits nonzero, and the
+# verdict comes from check_detected() below, not this exit status.
+# (An if rather than `A && B || true` - that is not if-then-else.)
+if (cd "$TESTDIR" && "$TESTDIR/execveat_runner" AT_FDCWD eicar.com 0); then
+	:
+fi
 sleep 1
 if check_detected "$TESTDIR/eicar.com"; then
 	echo "PASS: relative path resolved against cwd correctly"

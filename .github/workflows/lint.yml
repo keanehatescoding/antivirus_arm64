@@ -1,0 +1,72 @@
+name: Lint (static analysis)
+
+# Tier 0 CI: runs the same static-analysis checks the local pre-commit
+# hook runs (shellcheck, cppcheck, yamllint) unconditionally on every
+# push/PR, independent of what happens to be installed on a given
+# developer's machine. Pre-commit deliberately no-ops when a tool is
+# missing (see its header comment) to keep commits fast, so without
+# this job unlinted shell/YAML/C changes could merge freely with no
+# backstop. See issue #9.
+#
+# cppcheck scope intentionally matches pre-commit exactly (av/ with
+# warning,style,performance; userspace/avctl/ with warning,style):
+# userspace/avd/ is NOT covered here because it currently reports
+# style findings (redundantCondition etc.) that pre-commit never gated
+# on either - widening cppcheck to avd/ is a separate cleanup, not
+# part of closing #9.
+
+on:
+  push:
+  pull_request:
+
+# Nothing here pushes, comments, or writes back to the repository -
+# read-only is enough, and persist-credentials: false below means
+# there's no token to abuse even if a lint step somehow got
+# compromised.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install lint dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            shellcheck cppcheck yamllint
+
+      - name: shellcheck tracked shell scripts and githooks
+        run: |
+          set -euo pipefail
+          # Same file set pre-commit lints (tests/*.sh plus the
+          # extensionless .githooks/* hooks), extended to every tracked
+          # *.sh so scripts/ and packaging/ changes are covered too -
+          # pre-commit's `tests/*.sh|.githooks/*` case pattern misses
+          # those directories.
+          mapfile -t SHFILES < <(git ls-files '*.sh' '.githooks/pre-commit' '.githooks/pre-push')
+          shellcheck "${SHFILES[@]}"
+
+      - name: cppcheck av/ (kernel module)
+        run: |
+          cppcheck --quiet --enable=warning,style,performance \
+            --suppress=missingIncludeSystem --inline-suppr \
+            --error-exitcode=1 av/
+
+      - name: cppcheck userspace/avctl/
+        run: |
+          cppcheck --quiet --enable=warning,style --inline-suppr \
+            --error-exitcode=1 userspace/avctl/
+
+      - name: yamllint tracked workflows and packaging metadata
+        run: |
+          # Scoped to tracked YAML only: bare `yamllint .` would also
+          # descend into untracked/vendored trees (tests/qemu-boot/
+          # .kernel-cache/, packaging/arch/src/) that this repo does
+          # not own.
+          yamllint .github/workflows/ .github/dependabot.yml \
+            packaging/flatpak/org.hyprav.avgui.yml
