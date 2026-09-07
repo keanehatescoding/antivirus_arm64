@@ -26,7 +26,7 @@ AVCTL_DIR="$REPO_ROOT/userspace/avctl"
 AVCTL="$AVCTL_DIR/avctl"
 
 TEST_TMP_DIR="$(mktemp -d -- /tmp/av_test_avctl_timeouts.XXXXXX)" || exit 1
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 # False positive, same pattern as tests/test_sha256.sh: cleanup() is
 # invoked via the trap on the next line, which the linter cannot see.
 cleanup() { rm -rf "$TEST_TMP_DIR"; }
