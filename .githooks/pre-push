@@ -2,8 +2,9 @@
 #
 # .githooks/pre-push - runs the full build+load+detect+unload test suite
 # before anything leaves your machine, but ONLY when the push actually
-# touches av/, userspace/avctl/, or userspace/avd/ - a docs-only push
-# shouldn't insmod a kernel module.
+# touches av/, userspace/avctl/, userspace/avd/, userspace/av-gui/,
+# rules/, corpus/, or packaging/ - a docs-only push shouldn't insmod a
+# kernel module.
 #
 # av.ko is arm64-only (hooks __arm64_sys_* symbols, reads arm64
 # pt_regs), so it can only ever be insmod'd on a native aarch64 host -
@@ -40,8 +41,8 @@ while read -r _ local_sha _ remote_sha; do
         # New branch/tag on the remote. git diff-tree on a single commit
         # only shows that ONE commit's own changes, not the full range
         # being introduced - on a multi-commit new branch this silently
-        # missed every commit but the tip, which could let an av/avctl/
-        # avd change reach GitHub with the test suite never having run.
+        # missed every commit but the tip, which could let a gated-path
+        # change reach GitHub with the test suite never having run.
         # Diff against the merge-base with the default branch instead,
         # so every commit on the new branch is actually inspected.
         base="$(git merge-base "$local_sha" origin/HEAD 2>/dev/null)"
@@ -56,7 +57,7 @@ while read -r _ local_sha _ remote_sha; do
             # commit has the same "only the tip commit's own delta"
             # problem this whole branch fixed - list every file that
             # actually exists in the resulting tree instead (not a
-            # diff at all), so an av/avctl/avd file already present at
+            # diff at all), so a gated-path file already present at
             # local_sha is never missed regardless of how many commits
             # got it there.
             files="$(git ls-tree -r --name-only "$local_sha")"
@@ -76,12 +77,12 @@ done
 # match result, so a real match could be misreported as "no match"
 # and the test suite silently skipped. A herestring has no second
 # process and no pipe to close early, so this can't happen.
-if ! grep -qE '^(av/|userspace/avctl/|userspace/avd/)' <<< "$CHANGED_FILES"; then
-    echo "pre-push: no changes under av/, userspace/avctl/, or userspace/avd/ - skipping test suite"
+if ! grep -qE '^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/|packaging/)' <<< "$CHANGED_FILES"; then
+    echo "pre-push: no changes under av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, corpus/, or packaging/ - skipping test suite"
     exit 0
 fi
 
-echo "==> pre-push: changes detected in av/, userspace/avctl/, or userspace/avd/"
+echo "==> pre-push: changes detected in av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, corpus/, or packaging/"
 echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 
 # No separate preflight credential check: on a native aarch64 host,
