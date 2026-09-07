@@ -57,7 +57,7 @@ run_case() {
     local mode="$1" max_secs="$2"
     shift 2
     local sock="$TEST_TMP_DIR/$mode.sock"
-    rm -f "$sock"
+    rm -f "$sock" "$sock.ready"
     AVD_SOCK_PATH="$sock" TEST_TMP_DIR="$TEST_TMP_DIR" MODE="$mode" \
         python3 - "$sock" "$mode" <<'EOF' &
 import os, socket, time
@@ -65,6 +65,10 @@ path, mode = __import__("sys").argv[1], __import__("sys").argv[2]
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(path)
 s.listen(1)
+# Readiness marker AFTER listen(): bind() alone already creates the
+# socket path, so polling for the path cannot distinguish "bound" from
+# "listening" - a client connecting in that gap gets ECONNREFUSED.
+open(path + ".ready", "w").close()
 conn, _ = s.accept()
 data = b""
 while not data.endswith(b"\n"):
@@ -87,11 +91,12 @@ conn.close()
 s.close()
 EOF
     local server_pid=$!
-    # Wait for the server to bind before connecting (poll for the
-    # socket path rather than a fixed sleep, so a loaded CI machine
-    # cannot flake here).
+    # Wait for the server to be listening before connecting (poll for
+    # the readiness marker rather than a fixed sleep, so a loaded CI
+    # machine cannot flake here). The marker is created after listen(),
+    # unlike the socket path itself, which already exists after bind().
     local tries=0
-    while [ ! -S "$sock" ] && [ "$tries" -lt 50 ]; do
+    while [ ! -f "$sock.ready" ] && [ "$tries" -lt 50 ]; do
         sleep 0.1
         tries=$((tries + 1))
     done
@@ -113,11 +118,13 @@ EOF
 }
 
 echo "== wedged server fails within the 5s fast-verb budget =="
-# 15s outer guard vs the 5s budget: proves boundedness with slack for
-# scheduling jitter, without asserting an exact second.
+# 8s bound = 5s budget + scheduling slack (same as the trickle case
+# below): a regression that idles 10-14s before reporting failure must
+# not pass. The `timeout 15` inside run_case stays as the outer hang
+# guard so the script itself always terminates.
 read -r elapsed rc <<<"$(run_case wedged 15 quarantine list)"
 if [ "$rc" -ne 0 ] && grep -q "within 5 seconds" "$TEST_TMP_DIR/wedged.err" \
-        && [ "$elapsed" -lt 15 ]; then
+        && [ "$elapsed" -lt 8 ]; then
     pass "wedged server failed after ${elapsed}s with timeout message (rc=$rc)"
 else
     fail "wedged server: elapsed=${elapsed}s rc=$rc err=$(head -c 200 "$TEST_TMP_DIR/wedged.err")"
