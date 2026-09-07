@@ -213,7 +213,10 @@ jobs:
         # a contributor's local build shouldn't hard-fail on a warning
         # from a compiler/libc version CI doesn't use, but CI itself
         # should never let one merge silently.
-        run: make -C userspace/avctl CFLAGS="-Wall -Wextra -O2 -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Wformat-security"
+        run: |
+          make -C userspace/avctl \
+            CFLAGS="-Wall -Wextra -O2 -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Wformat-security -fPIE" \
+            LDFLAGS="-pie -Wl,-z,relro,-z,now"
       - uses: actions/upload-artifact@v7
         with:
           name: avctl
@@ -231,7 +234,10 @@ jobs:
           sudo apt-get install -y libnl-genl-3-dev libyara-dev libfuzzy-dev pkg-config
       - name: Build avd
         # Same CI-only -Werror rationale as build-avctl above.
-        run: make -C userspace/avd CFLAGS="-Wall -Wextra -O2 -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Wformat-security"
+        run: |
+          make -C userspace/avd \
+            CFLAGS="-Wall -Wextra -O2 -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Wformat-security -fPIE" \
+            LDFLAGS="-pie -Wl,-z,relro,-z,now"
 
       - name: Smoke-test YARA rules against EICAR
         run: |
