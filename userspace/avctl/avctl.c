@@ -42,6 +42,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -1292,6 +1294,7 @@ static int control_request(const char *cmd, char **out)
     char *req;
     int fd;
     int timeout_secs = control_timeout_for(cmd);
+    struct timespec deadline, now;
 
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -1361,6 +1364,18 @@ static int control_request(const char *cmd, char **out)
     }
     shutdown(fd, SHUT_WR);
 
+    /* Absolute response deadline: CLOCK_MONOTONIC + timeout_secs from the
+     * moment the request is fully sent. SO_RCVTIMEO above only bounds each
+     * individual read() call, so a peer trickling one byte just under that
+     * interval at a time would never trip any single call's timeout and
+     * could hold this client until the 16MB cap - effectively unbounded
+     * (same rationale as read_line()'s absolute deadline on the daemon
+     * side, which exists for exactly this trickle case). poll() with the
+     * remaining budget bounds the whole response instead; SO_RCVTIMEO
+     * stays as a second layer under it for the read() itself. */
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_secs;
+
     cap = 65536;
     buf = malloc(cap);
     if (!buf) {
@@ -1370,6 +1385,48 @@ static int control_request(const char *cmd, char **out)
     }
     len = 0;
     for (;;) {
+        struct pollfd pfd;
+        long remaining_ms;
+        int pr;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        remaining_ms = (deadline.tv_sec - now.tv_sec) * 1000L +
+                       (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        if (remaining_ms <= 0) {
+            errno = ETIMEDOUT;
+            n = -1;
+            break;
+        }
+
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        pr = poll(&pfd, 1, (int)remaining_ms);
+        if (pr < 0) {
+            /* Same EINTR handling as the read() below: a signal is not
+             * a peer failure, and the deadline above still bounds the
+             * total wait no matter how many times this retries. */
+            if (errno == EINTR)
+                continue;
+            n = -1;
+            break;
+        }
+        if (pr == 0) {
+            /* poll() consumed the whole remaining budget with no data
+             * readable - the absolute deadline is exhausted. */
+            errno = ETIMEDOUT;
+            n = -1;
+            break;
+        }
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            errno = EIO;
+            n = -1;
+            break;
+        }
+        /* POLLHUP with no data falls through to read(), which returns
+         * 0 (clean EOF) - the normal end of a complete response, not
+         * an error. */
+
         n = read(fd, buf + len, cap - len - 1);
         if (n < 0) {
             /* A signal arriving mid-read makes read() return -1/EINTR
@@ -1377,8 +1434,11 @@ static int control_request(const char *cmd, char **out)
              * response may still be coming - retry rather than
              * treating an interrupted call as a real failure (same
              * EINTR handling as write_all()/read_line() on avd's side
-             * of this same protocol). */
-            if (errno == EINTR)
+             * of this same protocol). EAGAIN/EWOULDBLOCK (the
+             * SO_RCVTIMEO layer firing in a poll/read race) likewise
+             * retries: the poll() above re-waits only the remaining
+             * budget, so this cannot spin past the deadline. */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             break;
         }
@@ -1418,7 +1478,7 @@ static int control_request(const char *cmd, char **out)
     close(fd);
 
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)
             fprintf(stderr, "avctl: timed out waiting for avd response "
                             "(no reply within %d seconds)\n",
                     timeout_secs);
