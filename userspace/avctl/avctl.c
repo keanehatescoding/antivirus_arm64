@@ -1542,6 +1542,9 @@ static int do_scan(const char *path)
 {
     char cmd[PATH_MAX + 8];
     char *resp, *cursor;
+    /* `line` feeds strchr() and is written through via *tab1 below, so it
+     * cannot be const (const trips -Wdiscarded-qualifiers under -Werror). */
+    /* cppcheck-suppress constVariablePointer ; intentional non-const, see above */
     char *line;
     int n;
 
