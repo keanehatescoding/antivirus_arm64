@@ -246,11 +246,13 @@ jobs:
           printf 'X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.com
           yara tests/fixtures/test.yar /tmp/eicar.com | grep -q EICAR_Test_String
 
-      - name: Smoke-test heuristics.yar against a real ptrace-importing binary
+      - name: Smoke-test heuristics.yar against a real ptrace+memfd binary
         run: |
           set -euxo pipefail
           cat > /tmp/ptrace_test.c << 'EOF'
+          #define _GNU_SOURCE
           #include <sys/ptrace.h>
+          #include <sys/mman.h>
           #include <stddef.h>
           /* Padding, referenced (not dead code) so it survives to the
            * binary: without it this binary is so small that UPX's
@@ -262,12 +264,15 @@ jobs:
            * pack this same binary and depend on it actually reading
            * as high-entropy once packed. */
           static const char padding[200000] = "padding";
-          int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, (void *)padding); return 0; }
+          int main(void) { int fd = memfd_create("jit", 0); ptrace(PTRACE_ATTACH, 1234, NULL, (void *)padding); return (fd < 0); }
           EOF
           gcc -o /tmp/ptrace_test /tmp/ptrace_test.c
-          yara rules/heuristics.yar /tmp/ptrace_test | grep -q Imports_Ptrace
+          # Imports_Ptrace/Imports_Memfd_Create are private building blocks -
+          # only the compound rule surfaces in CLI output (and in avd scoring).
+          yara rules/heuristics.yar /tmp/ptrace_test | grep -q Multiple_Suspicious_Imports
+          ! yara rules/heuristics.yar /tmp/ptrace_test | grep -q '^Imports_Ptrace'
           # a genuinely clean binary should NOT match
-          ! yara rules/heuristics.yar /bin/ls | grep -q Imports_Ptrace
+          ! yara rules/heuristics.yar /bin/ls | grep -q Multiple_Suspicious_Imports
 
       - name: Smoke-test elf_analysis.yar against a real UPX-packed binary
         run: |

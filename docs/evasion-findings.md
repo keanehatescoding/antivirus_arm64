@@ -8,7 +8,10 @@ at runtime via `dlopen("libc.so.6")` + `dlsym(handle, "ptrace")` instead
 of linking it directly means there's no direct import entry to find.
 
 Verified: `objdump -T` on the evasion binary shows no `ptrace` entry;
-`yara rules/heuristics.yar` produces no `Imports_Ptrace` match.
+`yara rules/heuristics.yar` produces no `Imports_Ptrace` match. (The
+sub-rules are now `private` building blocks for the compound
+`Multiple_Suspicious_Imports` rule - only the compound rule ever surfaces
+in CLI output or `avd` scoring - so this holds twice over.)
 
 **Interesting nuance**: the evasion technique itself isn't free —
 `Imports_Dlopen` (a rule explicitly marked "very low confidence, do not

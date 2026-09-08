@@ -1070,6 +1070,15 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
     size_t used = strlen(ctx->rule_name);
     size_t remaining = sizeof(ctx->rule_name) - used;
 
+    /* Private rules are building blocks for compound rules (see
+     * rules/heuristics.yar) - never score them here. On this libyara
+     * version the engine doesn't deliver private matches to this
+     * callback at all, but that filtering is the engine's business;
+     * scoring must not silently double-count (15+15+40=70 instead of
+     * the intended 40) if that ever changes. */
+    if (RULE_IS_PRIVATE(rule))
+      return CALLBACK_CONTINUE;
+
     ctx->matched = 1;
     ctx->match_count++;
 
@@ -1088,11 +1097,11 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
       }
     }
 
-    /* Collect every matching rule rather than stopping at the
-     * first - with related rules (e.g. Imports_Ptrace and the
-     * compound Multiple_Suspicious_Imports both matching the same
-     * file), aborting early could hide the more meaningful
-     * compound match behind a low-confidence single-API one. */
+    /* Collect every visible match rather than stopping at the first -
+     * corroboration across unrelated weak signals is exactly what pushes
+     * a file over MALICIOUS_SCORE_THRESHOLD. (Private building blocks
+     * never reach here - skipped above - so the compound rule's weight
+     * already stands alone.) */
     if (remaining > 1) {
       snprintf(ctx->rule_name + used, remaining, "%s%s", used > 0 ? "," : "",
                rule->identifier);
