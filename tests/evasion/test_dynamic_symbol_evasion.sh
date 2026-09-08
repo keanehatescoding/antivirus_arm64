@@ -71,7 +71,10 @@ objdump -T "$EVASION_TMP_DIR/dynsym_evasion" | grep -i ptrace && \
 
 echo
 echo "--- control: direct ptrace+memfd_create imports (must be detected) ---"
-CONTROL_MATCHES="$(yara "$RULES" "$EVASION_TMP_DIR/direct_imports" || true)"
+if ! CONTROL_MATCHES="$(yara "$RULES" "$EVASION_TMP_DIR/direct_imports")"; then
+    echo "ERROR: yara failed on the control binary - cannot assess detection"
+    exit 1
+fi
 echo "$CONTROL_MATCHES"
 if echo "$CONTROL_MATCHES" | grep -q "^Multiple_Suspicious_Imports"; then
     echo "control OK: compound rule fires on direct imports"
@@ -82,7 +85,10 @@ fi
 
 echo
 echo "--- running heuristics.yar ---"
-MATCHES="$(yara "$RULES" "$EVASION_TMP_DIR/dynsym_evasion" || true)"
+if ! MATCHES="$(yara "$RULES" "$EVASION_TMP_DIR/dynsym_evasion")"; then
+    echo "ERROR: yara failed on the evasion binary - cannot assess evasion"
+    exit 1
+fi
 echo "$MATCHES"
 
 echo

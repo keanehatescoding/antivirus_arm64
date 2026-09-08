@@ -270,9 +270,20 @@ jobs:
           # Imports_Ptrace/Imports_Memfd_Create are private building blocks -
           # only the compound rule surfaces in CLI output (and in avd scoring).
           yara rules/heuristics.yar /tmp/ptrace_test | grep -q Multiple_Suspicious_Imports
-          ! yara rules/heuristics.yar /tmp/ptrace_test | grep -q '^Imports_Ptrace'
+          # No `! yara ... | grep` negation here: with pipefail that would
+          # also pass if yara itself errored. Run yara first (set -e fails
+          # the step on a real error), then assert on the captured output.
+          yara rules/heuristics.yar /tmp/ptrace_test > /tmp/ptrace_matches.txt
+          if grep -q '^Imports_Ptrace' /tmp/ptrace_matches.txt; then
+            echo "::error::private sub-rule leaked into CLI output"
+            exit 1
+          fi
           # a genuinely clean binary should NOT match
-          ! yara rules/heuristics.yar /bin/ls | grep -q Multiple_Suspicious_Imports
+          yara rules/heuristics.yar /bin/ls > /tmp/ls_matches.txt
+          if grep -q Multiple_Suspicious_Imports /tmp/ls_matches.txt; then
+            echo "::error::clean binary unexpectedly matched the compound rule"
+            exit 1
+          fi
 
       - name: Smoke-test elf_analysis.yar against a real UPX-packed binary
         run: |

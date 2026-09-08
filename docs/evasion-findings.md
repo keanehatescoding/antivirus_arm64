@@ -7,11 +7,10 @@ table — the binary's static dynamic-symbol imports. Resolving `ptrace`
 at runtime via `dlopen("libc.so.6")` + `dlsym(handle, "ptrace")` instead
 of linking it directly means there's no direct import entry to find.
 
-Verified: `objdump -T` on the evasion binary shows no `ptrace` entry;
-`yara rules/heuristics.yar` produces no `Imports_Ptrace` match. (The
-sub-rules are now `private` building blocks for the compound
-`Multiple_Suspicious_Imports` rule - only the compound rule ever surfaces
-in CLI output or `avd` scoring - so this holds twice over.)
+Verified: `objdump -T` on the evasion binary shows no `ptrace` entry, and
+`yara rules/heuristics.yar` reports no `Multiple_Suspicious_Imports` match
+(the only public rule that could fire - the `Imports_*` sub-rules are
+`private` building blocks and never surface in CLI output or `avd` scoring).
 
 **Interesting nuance**: the evasion technique itself isn't free —
 `Imports_Dlopen` (a rule explicitly marked "very low confidence, do not
