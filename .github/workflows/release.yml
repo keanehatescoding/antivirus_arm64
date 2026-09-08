@@ -127,10 +127,27 @@ jobs:
         # build-appimage.sh tries to execute it. --retry/--retry-all-errors
         # covers a transient GitHub Releases hiccup instead of failing
         # the whole job on the first blip.
+        # No pinned checksum: upstream only publishes appimagetool as a
+        # rolling `continuous` build with no accompanying digest, so there
+        # is nothing stable to pin (issue #6). The sanity checks below at
+        # least fail loudly on an error page or truncated download instead
+        # of silently handing a corrupt binary to build-appimage.sh.
         run: |
           curl -fsSL --retry 3 --retry-all-errors \
             -o /usr/local/bin/appimagetool \
             https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage
+          if [ ! -s /usr/local/bin/appimagetool ]; then
+            echo "::error::appimagetool download is empty"
+            exit 1
+          fi
+          # Type-2 AppImages are ELF binaries - reject HTML error pages
+          # and truncated downloads (od, not `file`: coreutils is always
+          # present on the runner, `file` is not guaranteed).
+          if [ "$(head -c 4 /usr/local/bin/appimagetool | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
+            echo "::error::appimagetool download is not an ELF binary"
+            exit 1
+          fi
+          sha256sum /usr/local/bin/appimagetool
           chmod +x /usr/local/bin/appimagetool
 
       # appimagetool is itself packaged as a (type-2 runtime) AppImage,

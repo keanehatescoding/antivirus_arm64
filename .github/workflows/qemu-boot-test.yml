@@ -102,6 +102,7 @@ jobs:
           set -euxo pipefail
           MAJOR="$(echo "${{ matrix.kernel_version }}" | cut -d. -f1)"
           SRCDIR="linux-${{ matrix.kernel_version }}-qemu-boot"
+          TARBALL="linux-${{ matrix.kernel_version }}.tar.xz"
           # --retry/--retry-all-errors: kernel.org's CDN occasionally
           # resets the connection mid-transfer (curl exit 92, "HTTP/2
           # stream ... PROTOCOL_ERROR") - observed directly on this
@@ -109,11 +110,29 @@ jobs:
           # the HTTP/2-specific reset entirely on retry rather than
           # just hoping a same-protocol retry doesn't hit it again.
           curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
-            --connect-timeout 20 -o linux.tar.xz \
+            --connect-timeout 20 -o "$TARBALL" \
             "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${{ matrix.kernel_version }}.tar.xz"
+          # kernel.org publishes a PGP-signed sha256sums.asc per major
+          # series alongside the tarballs - verify against it before
+          # extracting, so a substituted mirror artifact fails loudly
+          # instead of being silently compiled and booted (issue #6).
+          curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 20 -o sha256sums.asc \
+            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc"
+          EXPECTED="$(awk -v f="$TARBALL" '$2 == f {print $1}' sha256sums.asc)"
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::no sha256 entry for $TARBALL in sha256sums.asc"
+            exit 1
+          fi
+          ACTUAL="$(sha256sum "$TARBALL" | awk '{print $1}')"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::sha256 mismatch for $TARBALL"
+            exit 1
+          fi
+          rm -f sha256sums.asc
           mkdir -p "$SRCDIR"
-          tar -xf linux.tar.xz -C "$SRCDIR" --strip-components=1
-          rm linux.tar.xz
+          tar -xf "$TARBALL" -C "$SRCDIR" --strip-components=1
+          rm "$TARBALL"
           cd "$SRCDIR"
           # defconfig, not tinyconfig: unlike build-matrix.yml's
           # compile-only job, this one has to actually BOOT under

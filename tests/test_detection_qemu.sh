@@ -31,6 +31,7 @@ command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || MISSING+=("aarch64-linux-gnu
 command -v qemu-system-aarch64 >/dev/null 2>&1 || MISSING+=("qemu-system-aarch64")
 command -v curl >/dev/null 2>&1 || MISSING+=("curl")
 command -v cpio >/dev/null 2>&1 || MISSING+=("cpio")
+command -v sha256sum >/dev/null 2>&1 || MISSING+=("sha256sum")
 if [ "${#MISSING[@]}" -gt 0 ]; then
     echo "test_detection_qemu.sh: missing required tool(s): ${MISSING[*]}"
     echo "  Arch/CachyOS: sudo pacman -S aarch64-linux-gnu-gcc qemu-system-aarch64 cpio curl"
@@ -69,9 +70,27 @@ else
     mkdir -p "$CACHE_ROOT"
     MAJOR="$(echo "$KERNEL_VERSION" | cut -d. -f1)"
     TARBALL="$CACHE_ROOT/linux-$KERNEL_VERSION.tar.xz"
+    SUMS="$CACHE_ROOT/sha256sums-v${MAJOR}.asc"
     curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
         --connect-timeout 20 -o "$TARBALL" \
         "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz" || exit 1
+    # Same verification as .github/workflows/qemu-boot-test.yml: kernel.org
+    # publishes a PGP-signed sha256sums.asc per major series - check the
+    # tarball against it before extracting (issue #6).
+    curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
+        --connect-timeout 20 -o "$SUMS" \
+        "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc" || exit 1
+    EXPECTED="$(awk -v f="linux-${KERNEL_VERSION}.tar.xz" '$2 == f {print $1}' "$SUMS")"
+    if [ -z "$EXPECTED" ]; then
+        echo "test_detection_qemu.sh: no sha256 entry for linux-${KERNEL_VERSION}.tar.xz in $SUMS" >&2
+        exit 1
+    fi
+    ACTUAL="$(sha256sum "$TARBALL" | awk '{print $1}')"
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        echo "test_detection_qemu.sh: sha256 mismatch for $TARBALL" >&2
+        exit 1
+    fi
+    rm -f "$SUMS"
     mkdir -p "$KDIR"
     tar -xf "$TARBALL" -C "$KDIR" --strip-components=1 || exit 1
     rm -f "$TARBALL"
