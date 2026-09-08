@@ -47,6 +47,22 @@ int main(void) {
 EOF
 gcc -o "$EVASION_TMP_DIR/dynsym_evasion" "$EVASION_TMP_DIR/dynsym_evasion.c" -ldl
 
+# Positive control: a binary importing ptrace AND memfd_create directly
+# must still trip the (public) compound rule - guards against this test
+# going green just because the rule set itself is broken.
+cat > "$EVASION_TMP_DIR/direct_imports.c" << 'EOF'
+#define _GNU_SOURCE
+#include <sys/ptrace.h>
+#include <sys/mman.h>
+#include <stddef.h>
+int main(void) {
+    int fd = memfd_create("jit", 0);
+    ptrace(PTRACE_ATTACH, 1234, NULL, NULL);
+    return (fd < 0);
+}
+EOF
+gcc -o "$EVASION_TMP_DIR/direct_imports" "$EVASION_TMP_DIR/direct_imports.c"
+
 echo
 echo "--- dynamic symbol table (confirming ptrace is NOT a direct import) ---"
 objdump -T "$EVASION_TMP_DIR/dynsym_evasion" | grep -i ptrace && \
@@ -54,16 +70,36 @@ objdump -T "$EVASION_TMP_DIR/dynsym_evasion" | grep -i ptrace && \
     echo "confirmed: no direct ptrace import (as intended)"
 
 echo
+echo "--- control: direct ptrace+memfd_create imports (must be detected) ---"
+if ! CONTROL_MATCHES="$(yara "$RULES" "$EVASION_TMP_DIR/direct_imports")"; then
+    echo "ERROR: yara failed on the control binary - cannot assess detection"
+    exit 1
+fi
+echo "$CONTROL_MATCHES"
+if echo "$CONTROL_MATCHES" | grep -q "^Multiple_Suspicious_Imports"; then
+    echo "control OK: compound rule fires on direct imports"
+else
+    echo "CONTROL FAILED: compound rule did not fire - rule set itself is broken"
+    exit 1
+fi
+
+echo
 echo "--- running heuristics.yar ---"
-MATCHES="$(yara "$RULES" "$EVASION_TMP_DIR/dynsym_evasion" || true)"
+if ! MATCHES="$(yara "$RULES" "$EVASION_TMP_DIR/dynsym_evasion")"; then
+    echo "ERROR: yara failed on the evasion binary - cannot assess evasion"
+    exit 1
+fi
 echo "$MATCHES"
 
 echo
-if echo "$MATCHES" | grep -q "^Imports_Ptrace"; then
-    echo "RESULT: Imports_Ptrace still fired - evasion FAILED"
+# Imports_Ptrace/Imports_Memfd_Create are private building blocks since the
+# double-count fix - only Multiple_Suspicious_Imports surfaces, so a failed
+# evasion shows up as the compound rule, not the sub-rule.
+if echo "$MATCHES" | grep -q "^Multiple_Suspicious_Imports"; then
+    echo "RESULT: compound rule still fired - evasion FAILED"
     exit 1
 else
-    echo "RESULT: Imports_Ptrace evaded successfully"
+    echo "RESULT: compound rule evaded successfully"
     if echo "$MATCHES" | grep -q "^Imports_Dlopen"; then
         echo "  (but Imports_Dlopen fired instead - the evasion TECHNIQUE itself"
         echo "   is a weak signal, even though the specific API it hides is not)"
