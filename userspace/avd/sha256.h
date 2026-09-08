@@ -31,9 +31,15 @@ void sha256_final(struct sha256_ctx *ctx, unsigned char digest[SHA256_DIGEST_SIZ
  * digest (64 chars + NUL) into hex_out, which must be at least 65
  * bytes. Hashes through a dup()'d handle seeked to the start - same
  * convention as check_fuzzy_corpus()/check_tlsh_corpus() in avd.c - so
- * this never disturbs `fd`'s own read offset. Returns 0 on success, -1
- * on any I/O error.
+ * this never disturbs `fd`'s own read offset.
+ *
+ * `max_bytes` bounds the read itself: at most max_bytes+1 bytes are
+ * ever consumed, so a file that grows past the cap mid-hash (after
+ * the caller's fstat() snapshot) still can't keep a scan worker busy.
+ * Returns 0 on success, -1 on any I/O error, -2 if more than
+ * max_bytes are readable (no digest written - a truncated prefix hash
+ * would be a wrong hash presented as the file's own).
  */
-int sha256_fd(int fd, char hex_out[65]);
+int sha256_fd(int fd, char hex_out[65], size_t max_bytes);
 
 #endif /* AVD_SHA256_H */
