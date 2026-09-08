@@ -646,6 +646,15 @@ static int hash_file_multi(const char *path, const struct path *pwd,
     ctx[i].tfm = crypto_alloc_shash(ctx[i].crypto_name, 0, 0);
     if (IS_ERR(ctx[i].tfm)) {
       ret = PTR_ERR(ctx[i].tfm);
+      /* Distinct from a generic open/hash skip: an allocation failure
+       * here means this exec bypasses BOTH the signature check and the
+       * daemon scan below with no verdict at all (issue #1). Log it so
+       * memory-pressure-induced fail-opens leave an audit trail instead
+       * of vanishing into the generic skip path. Ratelimited: this fires
+       * at most once per exec under sustained pressure. */
+      pr_warn_ratelimited("kernel-av: event=hash-error reason=crypto-alloc "
+                          "algo=%s err=%d\n",
+                          ctx[i].crypto_name, ret);
       ctx[i].tfm = NULL;
       goto out;
     }
@@ -949,8 +958,16 @@ static void av_work_fn(struct work_struct *w) {
 
   ret = hash_file_multi(aw->path, &aw->pwd, &digest, &ident);
   if (ret) {
-    /* Couldn't open/hash it (permissions, already gone, etc.) -
-     * not the job of the signature path, just skip. */
+    /* hash_file_multi() already logs crypto-alloc failures with their
+     * algo/err detail; log every failure here as well with path/pid/err
+     * so no hash bypass - ENOMEM, -EFAULT, -EFBIG, or a plain missing
+     * file - is a silent skip of both the signature and daemon checks
+     * (issue #1). Still fail-open by design (see the daemon fail-open
+     * note below), but now with a greppable audit trail. Ratelimited:
+     * this can fire once per exec under sustained pressure. */
+    pr_warn_ratelimited("kernel-av: event=hash-error path=\"%s\" pid=%d "
+                        "err=%d (skipped signature and daemon checks)\n",
+                        abs_path, pid_nr(aw->target_pid), ret);
     goto out;
   }
 
