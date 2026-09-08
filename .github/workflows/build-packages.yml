@@ -43,9 +43,12 @@ jobs:
     # confirmed against a real Debian 13 (trixie) box (see
     # debian/control's own comment) - Ubuntu's repos aren't guaranteed
     # to carry the same names/versions.
-    container: debian:trixie
+    # Digest-pinned (issue #8) so the image can't silently change
+    # between runs - refresh via the registry API or
+    # `docker buildx imagetools inspect debian:trixie`.
+    container: debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
 
@@ -93,7 +96,7 @@ jobs:
           mv ../*.deb ../*.buildinfo ../*.changes dist/
 
       - name: Upload .deb packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: deb-packages
           path: dist/*.deb
@@ -114,7 +117,8 @@ jobs:
     # base-devel-equivalent image is a drop-in replacement, since
     # PKGBUILD itself is untouched either way.
     runs-on: ubuntu-24.04-arm
-    container: menci/archlinuxarm:base-devel
+    # Digest-pinned (issue #8) - refresh like build-deb's image above.
+    container: menci/archlinuxarm:base-devel@sha256:68b3b9434a41b92d80b66a384034d73d5598771ed175bead99ae7c380905c964
     steps:
       # git must exist BEFORE actions/checkout runs, not after - a
       # real CI run showed that without it, checkout silently falls
@@ -142,7 +146,7 @@ jobs:
           pacman -Syu --noconfirm --quiet
           pacman -S --noconfirm --needed --quiet git
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
           # PKGBUILD's pkgver() runs `git describe --long --tags`,
@@ -254,7 +258,7 @@ jobs:
           ls -la packaging/arch/*.pkg.tar.*
 
       - name: Upload Arch packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: arch-packages
           path: packaging/arch/*.pkg.tar.*
@@ -266,7 +270,8 @@ jobs:
     # image, so no container change is needed here (unlike build-arch
     # above).
     runs-on: ubuntu-24.04-arm
-    container: fedora:latest
+    # Digest-pinned (issue #8) - refresh like build-deb's image above.
+    container: fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
     # No longer continue-on-error: this job used to have two stacked
     # bugs - BuildRequires: tlsh-devel never resolving on any shipping
     # Fedora release (fixed by vendoring TLSH as pure C, see
@@ -293,7 +298,7 @@ jobs:
       - name: Install git (before checkout needs it)
         run: dnf install -y -q git
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
           # See build-arch's checkout step: fetch-depth: 0 alone
@@ -377,7 +382,7 @@ jobs:
             packaging/fedora/hyprav.spec
 
       - name: Upload .rpm packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: rpm-packages
           path: rpmbuild-out/**/*.rpm
