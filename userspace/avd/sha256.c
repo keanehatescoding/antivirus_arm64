@@ -145,7 +145,7 @@ void sha256_final(struct sha256_ctx *ctx, unsigned char digest[SHA256_DIGEST_SIZ
   }
 }
 
-int sha256_fd(int fd, char hex_out[65]) {
+int sha256_fd(int fd, char hex_out[65], size_t max_bytes) {
   static const char hexchars[] = "0123456789abcdef";
   struct sha256_ctx ctx;
   unsigned char buf[65536];
@@ -153,6 +153,7 @@ int sha256_fd(int fd, char hex_out[65]) {
   int dup_fd;
   FILE *fp;
   size_t n;
+  uint64_t total = 0;
   int i;
 
   dup_fd = dup(fd);
@@ -171,13 +172,35 @@ int sha256_fd(int fd, char hex_out[65]) {
   }
 
   sha256_init(&ctx);
-  while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
-    sha256_update(&ctx, buf, n);
-
-  if (ferror(fp)) {
-    fclose(fp);
-    return -1;
+  for (;;) {
+    size_t want = sizeof(buf);
+    /* Cap the read itself at max_bytes+1: enough to detect "over the
+     * cap" without hashing unbounded bytes when the file grew past
+     * the caller's fstat() snapshot mid-scan. The (size_t)-1 guard
+     * keeps max_bytes+1 from wrapping when a caller passes no limit. */
+    if (max_bytes != (size_t)-1) {
+      uint64_t allowance = (uint64_t)max_bytes + 1 - total;
+      if ((uint64_t)want > allowance)
+        want = (size_t)allowance;
+    }
+    n = fread(buf, 1, want, fp);
+    if (n > 0) {
+      total += n;
+      if (total > (uint64_t)max_bytes) {
+        fclose(fp); /* also closes dup_fd */
+        return -2;
+      }
+      sha256_update(&ctx, buf, n);
+    }
+    if (n < want) {
+      if (ferror(fp)) {
+        fclose(fp);
+        return -1;
+      }
+      break; /* EOF */
+    }
   }
+
   fclose(fp); /* also closes dup_fd */
 
   sha256_final(&ctx, digest);

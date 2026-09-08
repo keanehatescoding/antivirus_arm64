@@ -1704,18 +1704,48 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
    * that as "owner unknown", visible to root only. See struct
    * verdict_record's uid field comment. */
   uid_t owner_uid = fstat(fd, &owner_st) == 0 ? owner_st.st_uid : (uid_t)-1;
+  /* SHA256 size gate (issue #3): sha256_fd() used to stream the whole
+   * file with no timeout, unlike YARA (SCAN_TIMEOUT_SECS) and
+   * fuzzy/TLSH (MAX_FUZZY_TLSH_FILE_SIZE). Two layers now, mirroring
+   * the fuzzy path's own fast-reject plus capped-read shape: the
+   * fstat() check below skips obviously-huge files without starting
+   * a hash at all, and sha256_fd()'s max_bytes bound enforces the
+   * same cap during the read itself, so a file that grows past the
+   * snapshot mid-scan still can't keep a worker busy past cap+1
+   * bytes. Both layers fail open, matching fuzzy_tlsh_size_ok(). */
+  bool sha256_size_ok = true;
+  if (owner_uid != (uid_t)-1 &&
+      owner_st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
+    fprintf(stderr,
+            "avd: skipping sha256 hash - file is %lld bytes, over the %d cap\n",
+            (long long)owner_st.st_size, MAX_FUZZY_TLSH_FILE_SIZE);
+    sha256_size_ok = false;
+  }
 
   memset(out, 0, sizeof(*out));
   out->verdict = AV_VERDICT_CLEAN;
 
   if (sha256_hex && sha256_hex[0])
     hash = sha256_hex;
-  else if (sha256_fd(fd, sha256_buf) == 0)
-    hash = sha256_buf;
-  else
-    hash = ""; /* on-demand scan of a file sha256_fd() couldn't hash -
-               * proceed without one rather than failing the scan
-               * over it */
+  else if (!sha256_size_ok)
+    hash = ""; /* fast-path reject above already logged */
+  else {
+    int sret = sha256_fd(fd, sha256_buf, MAX_FUZZY_TLSH_FILE_SIZE);
+    if (sret == 0)
+      hash = sha256_buf;
+    else {
+      /* -2 means the file grew over the cap mid-read (the fstat()
+       * snapshot was under it); -1 is a plain I/O error. Either
+       * way, proceed without a hash rather than failing the scan
+       * over it. */
+      if (sret == -2)
+        fprintf(stderr,
+                "avd: skipping sha256 hash - file grew over the %d cap "
+                "during read\n",
+                MAX_FUZZY_TLSH_FILE_SIZE);
+      hash = "";
+    }
+  }
 
   printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
          on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
@@ -1858,6 +1888,7 @@ record:
 static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
                                 const char *sha256_hex) {
   struct scan_result result;
+  struct stat st;
   int fd;
 
   printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
@@ -1876,11 +1907,31 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
    * replaces the previous design's lstat-baseline-then-re-check-at-
    * rename-time approach, which could only narrow that window, not
    * close it. */
-  fd = open(path, O_RDONLY);
+  /* O_NONBLOCK + fstat/S_ISREG, same as cmd_scan()'s on-demand path:
+   * without it, a FIFO path with no writer blocks a scan worker
+   * indefinitely on open() - repeated N times (N = worker count) this
+   * DoSes on-access scanning entirely. The flag is cleared once the
+   * file is known-regular, where it has no read() effect anyway. */
+  fd = open(path, O_RDONLY | O_NONBLOCK);
   if (fd < 0) {
     fprintf(stderr, "avd: could not open \"%s\" for scanning: %s\n", path,
             strerror(errno));
     send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+    return;
+  }
+
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    fprintf(stderr, "avd: refusing to scan non-regular file \"%s\"\n", path);
+    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+    close(fd);
+    return;
+  }
+
+  if (fcntl(fd, F_SETFL, O_RDONLY) != 0) {
+    fprintf(stderr, "avd: could not prepare \"%s\" for scanning: %s\n", path,
+            strerror(errno));
+    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+    close(fd);
     return;
   }
 

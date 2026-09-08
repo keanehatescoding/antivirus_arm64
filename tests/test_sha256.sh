@@ -65,10 +65,11 @@ static void check_buf(const char *label, const unsigned char *data, size_t len,
     }
 }
 
-static void check_fd(const char *label, int fd, const char *expected) {
+static void check_fd(const char *label, int fd, const char *expected,
+                     size_t max_bytes) {
     char hex[65];
 
-    if (sha256_fd(fd, hex) != 0) {
+    if (sha256_fd(fd, hex, max_bytes) != 0) {
         printf("  FAIL: %s: sha256_fd() itself failed\n", label);
         FAIL++;
         return;
@@ -78,6 +79,22 @@ static void check_fd(const char *label, int fd, const char *expected) {
         PASS++;
     } else {
         printf("  FAIL: %s: got %s, expected %s\n", label, hex, expected);
+        FAIL++;
+    }
+}
+
+/* max_bytes bounds the read itself (see sha256.h): more than max_bytes
+ * readable must report -2 and write no digest, even when an fstat()
+ * snapshot taken a moment earlier was under the cap. */
+static void check_fd_over_limit(const char *label, int fd, size_t max_bytes) {
+    char hex[65];
+
+    memset(hex, 0, sizeof(hex));
+    if (sha256_fd(fd, hex, max_bytes) == -2) {
+        printf("  PASS: %s\n", label);
+        PASS++;
+    } else {
+        printf("  FAIL: %s: expected -2 (over limit), got %s\n", label, hex);
         FAIL++;
     }
 }
@@ -96,15 +113,41 @@ int main(void) {
 
     /* sha256_fd() is what avd actually calls (see perform_scan() in
      * avd.c) - exercise the fd-based path too, not just the buffer
-     * API the three checks above use directly. */
+     * API the three checks above use directly. The 1MB cap is
+     * generous for a 3-byte file; the boundary checks below pin the
+     * max_bytes enforcement itself. */
     {
         int fd = open("kat_abc.txt", O_RDONLY);
         if (fd >= 0) {
             check_fd("sha256_fd() on a real file (\"abc\")", fd,
-                     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+                     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                     1024 * 1024);
             close(fd);
         } else {
             printf("  FAIL: could not open kat_abc.txt for the sha256_fd() check\n");
+            FAIL++;
+        }
+    }
+    {
+        /* max_bytes exactly the file size still succeeds ... */
+        int fd = open("kat_abc.txt", O_RDONLY);
+        if (fd >= 0) {
+            check_fd("sha256_fd() with max_bytes == file size", fd,
+                     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                     3);
+            close(fd);
+        } else {
+            printf("  FAIL: could not open kat_abc.txt for the exact-cap check\n");
+            FAIL++;
+        }
+        /* ... but one byte less reports -2 instead of hashing a
+         * truncated prefix. */
+        fd = open("kat_abc.txt", O_RDONLY);
+        if (fd >= 0) {
+            check_fd_over_limit("sha256_fd() with max_bytes < file size", fd, 2);
+            close(fd);
+        } else {
+            printf("  FAIL: could not open kat_abc.txt for the over-limit check\n");
             FAIL++;
         }
     }
