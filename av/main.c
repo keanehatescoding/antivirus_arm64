@@ -82,6 +82,7 @@
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
+#include "av_log.h"
 #include "behavior.h"
 #include "netlink_chan.h"
 #include "netlink_proto.h"
@@ -841,11 +842,27 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
                     const char *reason, const struct av_file_identity *ident) {
   struct task_struct *task;
   char *protected_path;
+  char *esc_path;
+  char esc_reason[512];
+  const char *log_path;
+
+  /* path= is the exec target's pathname and reason= carries
+   * signature/daemon rule names - both attacker-influenced, so both
+   * are escaped before any quoted-field logging (CWE-117, see
+   * av_log.h). type= is always a static literal at every call site
+   * ("signature"/"daemon"/"fail-closed"), never formatted input.
+   * esc_reason is stack-sized: every current reason fits in ~128
+   * bytes; the escaper truncates safely regardless. */
+  esc_path = kmalloc(PATH_MAX, GFP_KERNEL);
+  log_path = esc_path ? av_escape_log_str(path, esc_path, PATH_MAX)
+                      : "<path-escape-oom>";
+  av_escape_log_str(reason, esc_reason, sizeof(esc_reason));
 
   if (pid_nr(target_pid) == 1) {
     pr_alert("kernel-av: event=suppressed action=none type=%s "
              "path=\"%s\" reason=\"%s\" pid=1\n",
-             type, path, reason);
+             type, log_path, esc_reason);
+    kfree(esc_path);
     return;
   }
 
@@ -861,11 +878,16 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
    * an operator-managed allow-list, same suppressed-not-skipped
    * treatment as the PID-1 guard above. */
   if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
+    char *esc_prot = kmalloc(PATH_MAX, GFP_KERNEL);
+    const char *log_prot = esc_prot && protected_path
+        ? av_escape_log_str(protected_path, esc_prot, PATH_MAX)
+        : (protected_path ? "<path-escape-oom>" : "?");
     pr_alert("kernel-av: event=suppressed action=none type=%s "
              "path=\"%s\" reason=\"%s\" pid=%d protected_exe=\"%s\"\n",
-             type, path, reason, pid_nr(target_pid),
-             protected_path ? protected_path : "?");
+             type, log_path, esc_reason, pid_nr(target_pid), log_prot);
+    kfree(esc_prot);
     kfree(protected_path);
+    kfree(esc_path);
     return;
   }
   kfree(protected_path);
@@ -886,16 +908,17 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
       pr_alert(
           "kernel-av: event=detected action=kill type=%s "
           "path=\"%s\" reason=\"%s\" pid=%d dev=%u:%u ino=%lu size=%lld\n",
-          type, path, reason, pid_nr(target_pid), MAJOR(ident->dev),
+          type, log_path, esc_reason, pid_nr(target_pid), MAJOR(ident->dev),
           MINOR(ident->dev), ident->ino, (long long)ident->size);
     } else {
       pr_alert("kernel-av: event=detected action=kill type=%s "
                "path=\"%s\" reason=\"%s\" pid=%d\n",
-               type, path, reason, pid_nr(target_pid));
+               type, log_path, esc_reason, pid_nr(target_pid));
     }
     send_sig(SIGKILL, task, 0);
   }
   rcu_read_unlock();
+  kfree(esc_path);
 }
 
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
@@ -935,6 +958,8 @@ static void av_work_fn(struct work_struct *w) {
   char sig_name[AV_SIG_NAME_LEN];
   char reason[AV_SIG_NAME_LEN + 32];
   char *abs_path;
+  char *esc_path;
+  const char *log_path;
   int ret;
 
   /* hash_file_multi()/open_exec_target() already resolve a relative
@@ -955,6 +980,16 @@ static void av_work_fn(struct work_struct *w) {
     return;
   }
   resolve_absolute_path(aw->path, &aw->pwd, abs_path, PATH_MAX);
+  /* Escaped rendering of abs_path for the dmesg lines below (CWE-117 -
+   * see av_log.h). The recorded identity (av_behavior_record_exec) and
+   * the daemon message keep the raw bytes; only log lines use this.
+   * On allocation failure the event is still logged with a placeholder
+   * path rather than skipped - a missing path on an error line is
+   * strictly better than a missing line (see the audit note at the
+   * hash-error log below). */
+  esc_path = kmalloc(PATH_MAX, GFP_KERNEL);
+  log_path = esc_path ? av_escape_log_str(abs_path, esc_path, PATH_MAX)
+                      : "<path-escape-oom>";
 
   ret = hash_file_multi(aw->path, &aw->pwd, &digest, &ident);
   if (ret) {
@@ -967,7 +1002,7 @@ static void av_work_fn(struct work_struct *w) {
      * this can fire once per exec under sustained pressure. */
     pr_warn_ratelimited("kernel-av: event=hash-error path=\"%s\" pid=%d "
                         "err=%d (skipped signature and daemon checks)\n",
-                        abs_path, pid_nr(aw->target_pid), ret);
+                        log_path, pid_nr(aw->target_pid), ret);
     goto out;
   }
 
@@ -1014,7 +1049,7 @@ static void av_work_fn(struct work_struct *w) {
        * (10 msgs/5s) instead of one line per exec. */
       pr_info_ratelimited("kernel-av: event=clean type=daemon path=\"%s\" "
                           "pid=%d md5=%s sha1=%s sha256=%s dev=%u:%u ino=%lu\n",
-                          abs_path, pid_nr(aw->target_pid), digest.md5,
+                          log_path, pid_nr(aw->target_pid), digest.md5,
                           digest.sha1, digest.sha256, MAJOR(ident.dev),
                           MINOR(ident.dev), ident.ino);
     } else if (atomic_read(&av_daemon_fail_closed)) {
@@ -1036,13 +1071,14 @@ static void av_work_fn(struct work_struct *w) {
        * Same pr_info_ratelimited reasoning as above. */
       pr_info_ratelimited("kernel-av: event=clean type=fail-open path=\"%s\" "
                           "pid=%d md5=%s sha1=%s sha256=%s err=%d\n",
-                          abs_path, pid_nr(aw->target_pid), digest.md5,
+                          log_path, pid_nr(aw->target_pid), digest.md5,
                           digest.sha1, digest.sha256, nl_ret);
     }
   }
 
 out:
   kfree(abs_path);
+  kfree(esc_path);
   path_put(&aw->pwd);
   put_pid(aw->target_pid);
   kfree(aw);
