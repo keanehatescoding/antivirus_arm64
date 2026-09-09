@@ -243,7 +243,7 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
   enum av_algo algo;
   int n;
 
-  /* DAC mode (0644) alone only checks UID 0, not the capability that
+  /* DAC mode (0640) alone only checks UID 0, not the capability that
    * UID actually holds - any root process, even one that dropped
    * CAP_SYS_ADMIN, could otherwise mutate the signature table. The
    * netlink channel gates the equivalent operation behind
@@ -321,7 +321,7 @@ static struct proc_dir_entry *sig_proc_entry;
 
 int av_sigtable_proc_init(void) {
   sig_proc_entry =
-      proc_create("kernel_av_signatures", 0644, NULL, &sig_proc_ops);
+      proc_create("kernel_av_signatures", 0640, NULL, &sig_proc_ops);
   if (!sig_proc_entry)
     return -ENOMEM;
   return 0;

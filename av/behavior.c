@@ -510,7 +510,7 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
   char cmd[8], hex[SHA256_HEX_LEN + 1], name[TRUST_NAME_LEN];
   int n;
 
-  /* DAC mode (0644) alone only checks UID 0, not the capability that
+  /* DAC mode (0640) alone only checks UID 0, not the capability that
    * UID actually holds - any root process, even one that dropped
    * CAP_SYS_ADMIN, could otherwise mutate the trust list. The
    * netlink channel gates the equivalent operation behind
@@ -571,7 +571,7 @@ static struct proc_dir_entry *trust_proc_entry;
 
 int av_behavior_trust_proc_init(void) {
   trust_proc_entry =
-      proc_create("kernel_av_trusted", 0644, NULL, &trust_proc_ops);
+      proc_create("kernel_av_trusted", 0640, NULL, &trust_proc_ops);
   if (!trust_proc_entry)
     return -ENOMEM;
   return 0;
@@ -945,7 +945,7 @@ static struct proc_dir_entry *protected_proc_entry;
 
 int av_behavior_protect_proc_init(void) {
   protected_proc_entry =
-      proc_create("kernel_av_protected", 0644, NULL, &protected_proc_ops);
+      proc_create("kernel_av_protected", 0640, NULL, &protected_proc_ops);
   if (!protected_proc_entry)
     return -ENOMEM;
   return 0;
