@@ -407,16 +407,26 @@ jobs:
 
       - name: rpmlint (spec/packaging regression check)
         # Issue #13: nothing caught packaging-metadata regressions
-        # automatically. Default flags: nonzero exit on errors,
-        # warnings informational (placeholder-maintainer style
-        # findings stay warnings until item 1 is resolved by the owner).
+        # automatically. Two E-level findings are false positives here,
+        # confirmed by real CI runs, so the gate below ignores exactly
+        # those tags (same pattern as the namcap step above):
+        # spelling-error (project vocabulary like kprobe/execve/netlink/
+        # avctl, unknown to rpmlint's en_US dictionary - rewording
+        # accurate technical terms to dodge a spellchecker would be
+        # worse), no-binary (hyprav-dkms ships DKMS *source* by design,
+        # like its deb/arch siblings). Any OTHER error fails the build;
+        # warnings stay informational (placeholder-maintainer style
+        # findings until item 1 is resolved by the owner).
         # Note %check above already ran inside `rpmbuild -bb`, so this
         # step only lints metadata, it doesn't re-run tests.
         run: |
           set -euxo pipefail
           dnf install -y -q rpmlint
           mapfile -t RPMS < <(find rpmbuild-out -name '*.rpm')
-          rpmlint packaging/fedora/hyprav.spec "${RPMS[@]}"
+          rpmlint packaging/fedora/hyprav.spec "${RPMS[@]}" 2>&1 | tee rpmlint.log || true
+          if grep ' E: ' rpmlint.log | grep -vE 'spelling-error|no-binary'; then
+            echo "rpmlint reported errors (see above)"; exit 1
+          fi
 
       - name: Upload .rpm packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
