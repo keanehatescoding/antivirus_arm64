@@ -43,6 +43,8 @@ jobs:
       versions: ${{ steps.read.outputs.versions }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - id: read
         run: echo "versions=$(jq -c '.versions' .github/kernel-versions.json)" >> "$GITHUB_OUTPUT"
 
@@ -62,6 +64,8 @@ jobs:
         kernel_version: ${{ fromJSON(needs.load-kernel-matrix.outputs.versions) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
 
       - name: Install build and QEMU dependencies
         run: |

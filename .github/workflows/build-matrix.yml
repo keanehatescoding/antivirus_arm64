@@ -34,6 +34,8 @@ jobs:
       versions: ${{ steps.read.outputs.versions }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - id: read
         run: echo "versions=$(jq -c '.versions' .github/kernel-versions.json)" >> "$GITHUB_OUTPUT"
 
@@ -63,6 +65,8 @@ jobs:
         toolchain: [gcc, clang]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies (gcc)
         if: matrix.toolchain == 'gcc'
@@ -226,6 +230,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - name: Build avctl
         # -Werror only in CI, not the Makefile's own default CFLAGS -
         # a contributor's local build shouldn't hard-fail on a warning
@@ -246,6 +252,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - name: Install libnl-genl, libyara, and libfuzzy
         run: |
           sudo apt-get update
