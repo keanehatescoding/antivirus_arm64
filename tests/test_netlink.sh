@@ -347,10 +347,10 @@ if [[ ${DAEMON_Y_VERDICT,,} == *permitted* ]]; then
 else
     fail "AV_C_VERDICT from Y unexpectedly accepted - Y was never registered: $DAEMON_Y_VERDICT"
 fi
-if dmesg | grep -q 'netlink REGISTER from portid .* rejected'; then
+if dmesg --raw | grep -q '<1>.*netlink REGISTER from portid .* rejected'; then
     pass "kernel logged the REGISTER hijack rejection at pr_alert"
 else
-    fail "expected REGISTER-rejection log line not found in dmesg"
+    fail "expected pr_alert REGISTER-rejection log line not found in dmesg"
     dmesg | tail -10
 fi
 
