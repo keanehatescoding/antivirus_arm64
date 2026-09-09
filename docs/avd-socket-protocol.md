@@ -108,7 +108,7 @@ not a path, must not contain `/`.
 
 Gated **per command, not per connection** - the kernel's IOC `/proc`
 entries (`kernel_av_signatures`, `kernel_av_trusted`,
-`kernel_av_protected`) are `0640` root-only reads with writes
+`kernel_av_protected`) are `0600` owner-only reads with writes
 additionally checked against `CAP_SYS_ADMIN`, so this socket stays
 reachable by any peer and enforces its own per-command rules
 instead of relying on two sockets with two different modes. Right
@@ -122,7 +122,7 @@ returning `ERR permission denied ...` otherwise.
 `STATUS` answers any peer with aggregate counts only - nothing
 per-file. `VERDICTS RECENT` and `QUARANTINE LIST` also answer any
 peer, but unlike the IOC `/proc` entries (which hold no per-user
-data and are root-only reads), each row is a specific file's path and SHA-256 hash -
+data and are owner-only reads), each row is a specific file's path and SHA-256 hash -
 worth protecting the same way file contents themselves are. Both
 filter their rows to ones the connecting peer's uid owns (the
 scanned/quarantined file's original owner, not the triggering
