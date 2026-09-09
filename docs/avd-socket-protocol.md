@@ -106,10 +106,12 @@ not a path, must not contain `/`.
 
 ## Authorization
 
-Gated **per command, not per connection** - matches this codebase's
-existing precedent of world-readable `/proc` state (e.g.
-`/proc/kernel_av_signatures` is `0644`) with writes checked
-separately, rather than two sockets with two different modes. Right
+Gated **per command, not per connection** - the kernel's IOC `/proc`
+entries (`kernel_av_signatures`, `kernel_av_trusted`,
+`kernel_av_protected`) are `0600` owner-only reads with writes
+additionally checked against `CAP_SYS_ADMIN`, so this socket stays
+reachable by any peer and enforces its own per-command rules
+instead of relying on two sockets with two different modes. Right
 after `accept()`, `avd` reads the connecting process's credentials via
 `SO_PEERCRED` (kernel-populated at `connect()` time from the actual
 peer process - not attacker-writable, same trust boundary as
@@ -119,8 +121,8 @@ returning `ERR permission denied ...` otherwise.
 
 `STATUS` answers any peer with aggregate counts only - nothing
 per-file. `VERDICTS RECENT` and `QUARANTINE LIST` also answer any
-peer, but unlike `/proc/kernel_av_signatures` (which holds no
-per-user data), each row is a specific file's path and SHA-256 hash -
+peer, but unlike the IOC `/proc` entries (which hold no per-user
+data and are owner-only reads), each row is a specific file's path and SHA-256 hash -
 worth protecting the same way file contents themselves are. Both
 filter their rows to ones the connecting peer's uid owns (the
 scanned/quarantined file's original owner, not the triggering
