@@ -52,7 +52,7 @@ Architecture: arm64
 # in everything actually needed.
 Depends: ${shlibs:Depends}, ${misc:Depends}, pkexec
 Recommends: hyprav-dkms
-Description: HyprAV userspace scanning daemon and control CLI
+Description: Userspace scanning daemon and control CLI for HyprAV
  avd is the privileged userspace daemon that the av.ko kernel module
  defers heavyweight checks to: YARA matching, ELF structural analysis,
  entropy scoring, ssdeep/TLSH fuzzy hashing, and quarantine
