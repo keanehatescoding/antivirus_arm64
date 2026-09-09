@@ -13,8 +13,9 @@
 #     AV_C_VERDICT is rejected without wedging the module
 #   - only the currently-registered daemon's portid is honored for
 #     AV_C_VERDICT ("portid pinning")
-#   - a second AV_C_REGISTER silently replaces the first (documented,
-#     known "single daemon only" behavior - see docs/netlink-protocol.md)
+#   - a second AV_C_REGISTER while one is live is rejected with -EBUSY
+#     (hijack rejection - see docs/netlink-protocol.md), while a
+#     same-portid re-REGISTER stays idempotent
 #   - a real end-to-end AV_C_SCAN_REQUEST/AV_C_VERDICT round trip via
 #     the real avd binary, for both a clean and a malicious (YARA-only,
 #     not signature-table) exec
@@ -246,17 +247,17 @@ else
     dmesg | tail -10
 fi
 
-section "daemon re-registration: a second AV_C_REGISTER replaces the first"
+section "daemon re-registration: a second AV_C_REGISTER while one is live is rejected"
 # The single-shot "$HELPER register" used elsewhere in this script
-# can't prove *replacement* - each invocation is a fresh process, so
-# its socket (and portid) is already gone by the time a second
-# daemon registers, and dmesg alone can't tell "a second REGISTER
-# happened" apart from "a second REGISTER happened and actually
-# overwrote the first". `"$HELPER" batch` keeps one connection (and
-# therefore one stable portid) open across multiple commands via a
-# bash coproc, so daemon X's portid can be re-tested for real *after*
-# daemon Y registers - proving the kernel stopped honoring X, not just
-# that Y was accepted.
+# can't prove *rejection-while-live* - each invocation is a fresh
+# process, so its socket (and portid) is already gone by the time a
+# second daemon registers, and dmesg alone can't tell "a second
+# REGISTER happened" apart from "a second REGISTER happened and was
+# rejected". `"$HELPER" batch` keeps one connection (and therefore
+# one stable portid) open across multiple commands via a bash coproc,
+# so daemon Y's REGISTER can be attempted for real *while* daemon X
+# is still pinned - proving the kernel rejects the hijack (and keeps
+# honoring X), not just that a REGISTER was seen.
 # 2>&1 here, not just on the single-shot invocations elsewhere in this
 # script: send_and_report() in netlink_test_helper.c prints "OK" to
 # stdout but "ERR ..." to stderr, and a coproc's pipe only carries its
@@ -318,32 +319,39 @@ DAEMON_Y_REG=""
 drain_batch "${DAEMON_Y[1]}" "${DAEMON_Y[0]}" || fail "drain of Y before register failed"
 printf 'register\n' >&"${DAEMON_Y[1]}"
 read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_REG
-if [[ $DAEMON_Y_REG == OK ]]; then
-    pass "daemon Y's AV_C_REGISTER (second registration) accepted"
+if [[ ${DAEMON_Y_REG,,} == *busy* ]]; then
+    pass "daemon Y's AV_C_REGISTER (second registration while X live) rejected with -EBUSY"
 else
-    fail "daemon Y's AV_C_REGISTER unexpectedly rejected: $DAEMON_Y_REG"
+    fail "daemon Y's AV_C_REGISTER not rejected with -EBUSY as expected: $DAEMON_Y_REG"
 fi
 
-# The actual proof of replacement: X's portid, which was just accepted
-# above, must now be rejected, and Y's must now be accepted.
+# The actual proof of hijack rejection: X's portid, which was accepted
+# above, must still be honored after Y's REGISTER was refused - and
+# Y's must not be.
 DAEMON_X_VERDICT_AFTER=""
 drain_batch "${DAEMON_X[1]}" "${DAEMON_X[0]}" || fail "drain of X before re-verdict failed"
 printf 'verdict 1 0\n' >&"${DAEMON_X[1]}"
 read -r -t 10 -u "${DAEMON_X[0]}" DAEMON_X_VERDICT_AFTER
-if [[ ${DAEMON_X_VERDICT_AFTER,,} == *permitted* ]]; then
-    pass "AV_C_VERDICT from X (old daemon) rejected after Y registered - portid was replaced, not just added"
+if [[ $DAEMON_X_VERDICT_AFTER == OK ]]; then
+    pass "AV_C_VERDICT from X still accepted after Y's REGISTER was rejected - X stayed pinned"
 else
-    fail "AV_C_VERDICT from X still accepted after Y registered - portid was NOT replaced: $DAEMON_X_VERDICT_AFTER"
+    fail "AV_C_VERDICT from X rejected after Y's REGISTER was refused - X should still be pinned: $DAEMON_X_VERDICT_AFTER"
 fi
 
 DAEMON_Y_VERDICT=""
 drain_batch "${DAEMON_Y[1]}" "${DAEMON_Y[0]}" || fail "drain of Y before verdict failed"
 printf 'verdict 1 0\n' >&"${DAEMON_Y[1]}"
 read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_VERDICT
-if [[ $DAEMON_Y_VERDICT == OK ]]; then
-    pass "AV_C_VERDICT from Y (new daemon) accepted"
+if [[ ${DAEMON_Y_VERDICT,,} == *permitted* ]]; then
+    pass "AV_C_VERDICT from Y (never registered) rejected - only X's portid is honored"
 else
-    fail "AV_C_VERDICT from Y unexpectedly rejected: $DAEMON_Y_VERDICT"
+    fail "AV_C_VERDICT from Y unexpectedly accepted - Y was never registered: $DAEMON_Y_VERDICT"
+fi
+if dmesg --raw | grep -q '<1>.*netlink REGISTER from portid .* rejected'; then
+    pass "kernel logged the REGISTER hijack rejection at pr_alert"
+else
+    fail "expected pr_alert REGISTER-rejection log line not found in dmesg"
+    dmesg | tail -10
 fi
 
 # Capture both PIDs before waiting on either - empirically, once the
@@ -392,8 +400,9 @@ else
     cat "$AVD_LOG"
     exit 1
 fi
-# avd's own AV_C_REGISTER on startup should now be the pinned daemon,
-# overwriting fake daemon Y from the section above.
+# avd's own AV_C_REGISTER on startup should now take the slot freed
+# when the fake daemons above exited (their socket close fires
+# NETLINK_URELEASE, clearing the registration) - no overwrite involved.
 sleep 1
 if dmesg | grep -q 'kernel-av: netlink daemon registered'; then
     pass "avd re-registered itself as the pinned daemon"

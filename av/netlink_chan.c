@@ -106,10 +106,27 @@ static int av_nl_register_doit(struct sk_buff *skb, struct genl_info *info)
 {
     /* GENL_ADMIN_PERM on this op (see av_genl_ops below) already
      * requires CAP_NET_ADMIN, so any caller that reaches this point is
-     * privileged - but log the portid either way so a legitimate
-     * daemon restart (or an attempted hijack from a privileged
-     * process) is visible in dmesg. */
+     * privileged - but that alone can't tell a legitimate daemon
+     * restart apart from a second privileged process registering while
+     * one is already live. Reject the latter with -EBUSY instead of
+     * silently overwriting daemon_portid (which would divert all
+     * future scan unicasts - and daemon-death detection - to the
+     * newcomer). A re-REGISTER from the already-registered portid
+     * itself is allowed so a daemon retrying after a lost reply can't
+     * lock itself out, and a genuinely dead daemon doesn't either:
+     * av_netlink_notify() clears daemon_registered on NETLINK_URELEASE,
+     * so by the time a replacement daemon registers the flag is
+     * already false. Either way the attempt is visible in dmesg -
+     * pr_alert on rejection, pr_info on success. */
     spin_lock(&daemon_lock);
+    if (daemon_registered && info->snd_portid != daemon_portid) {
+        u32 old_portid = daemon_portid;
+        spin_unlock(&daemon_lock);
+        pr_alert("kernel-av: netlink REGISTER from portid %u rejected "
+                 "(daemon already registered, portid %u)\n",
+                 info->snd_portid, old_portid);
+        return -EBUSY;
+    }
     daemon_portid = info->snd_portid;
     daemon_registered = true;
     spin_unlock(&daemon_lock);
