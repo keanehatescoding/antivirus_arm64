@@ -34,7 +34,10 @@ pkgrel=1
 # .github/workflows/build-packages.yml's build-arch job.
 arch=('aarch64')
 url="https://github.com/keanehatescoding/antivirus"
-license=('GPL3')
+# SPDX identifier (namcap E-errors on anything else - confirmed by a
+# real CI run rejecting 'GPL3'). Matches LICENSE and
+# packaging/fedora/hyprav.spec's own License: field.
+license=('GPL-3.0-only')
 # python-gobject/gtk4 are needed at BUILD time, not just runtime:
 # package_hyprav-gui()'s `make install` (userspace/av-gui/Makefile)
 # depends on `checkdeps`, which imports gi and loads GTK4 before
@@ -44,7 +47,13 @@ license=('GPL3')
 # of gap debian/control's own comment already documents and accounts
 # for (python3-gi/gir1.2-gtk-4.0 there) and packaging/fedora/hyprav.spec
 # (python3-gobject/gtk4) - this file just hadn't caught up.
-makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4')
+# 'dkms' and 'polkit' are here only because namcap's split-package
+# rule E-errors unless every subpackage runtime dep also appears in
+# makedepends (confirmed by a real CI run). Neither is a compile
+# input: dkms only consumes the staged source tree on the target
+# machine, and polkit is just the installed action file plus the
+# runtime `pkexec` dependency package_hyprav() already declares.
+makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4' 'dkms' 'polkit')
 source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus.git}")
 sha256sums=('SKIP')
 
