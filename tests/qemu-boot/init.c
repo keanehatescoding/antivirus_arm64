@@ -45,31 +45,41 @@
 #define EICAR                                                                \
   "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
-/* Expected outcome of the cold-pathname bypass case near the end of
- * main(). That case used to print its result and gate nothing, which
- * meant it could also rot into a silent no-op (a missing or
- * non-executable /cold_launcher exits 127, which read as "not killed",
- * i.e. indistinguishable from the bypass it is supposed to be
- * detecting). It gates now, in both directions:
+/* What the cold-pathname case near the end of main() asserts - phrased
+ * as a property of THIS HARNESS, deliberately, rather than of the gap
+ * in av/main.c.
  *
- *   1 = the gap is still OPEN - the current, documented state (issue
- *       #2, discussion #33, and handler_pre()'s comment in av/main.c).
- *       The bypass MUST reproduce. If it stops reproducing, that is
- *       good news, but it fails the build anyway so the expectation
- *       and the docs get flipped deliberately instead of quietly
- *       drifting out of date.
- *   0 = the gap is CLOSED - /cold_launcher MUST be killed, and a
- *       surviving cold exec is a regression.
+ * That case runs cold_launcher.c, which execve()s /tmp/eicar_cold.com
+ * without touching the pathname first, trying to reproduce the
+ * documented cold-page bypass (av/main.c's handler_pre() comment,
+ * issue #2). Measured: it does NOT reproduce here. Kernels 6.12.107,
+ * 6.18.48 and 7.2.2 all hashed and killed the inner exec, as does the
+ * serial.log checked in beside this file. The likeliest reason is that
+ * the launcher is small enough for its .rodata pathname to be faulted
+ * in alongside its text by fault-around before execve() runs, so the
+ * page is never actually cold - a property of a 12-line static binary
+ * under QEMU, NOT evidence that the gap is closed. A pass here says
+ * nothing about #2 either way; #2 and discussion #33 track that.
  *
- * Flip this to 0 in the same change that closes the gap, together with
- * SECURITY.md's accepted-tradeoffs list and docs/evasion-findings.md
- * (whose own finding #4 is explicitly about re-running adversarial
- * tests after a fix rather than assuming them), plus the wiki's CI
- * and Packaging page.
+ * The case used to print its result and gate nothing, so this had gone
+ * unnoticed: it reported "NOT reproduced this run" and passed, while
+ * SECURITY.md claimed the gap was reproduced on every CI run. Worse, a
+ * missing or non-executable /cold_launcher exits 127, which read as
+ * "not killed" - indistinguishable from the bypass the case exists to
+ * detect, so the whole thing could rot into a no-op silently.
  *
- * Both branches below compile either way - this is a plain `if`, not
- * an `#if`, so the inactive one can't bit-rot unnoticed. */
-#define AV_EXPECT_COLD_BYPASS 1
+ * It now gates on what it can actually observe:
+ *
+ *   1 = the cold exec IS detected and killed here (current, measured).
+ *       If that stops being true, either detection regressed or this
+ *       harness finally started reproducing the bypass - both need a
+ *       human, neither should be a printed line nobody reads.
+ *   0 = the bypass reproduces here and the cold exec survives. Set
+ *       this only with evidence, and update #2 to match.
+ *
+ * Both branches compile either way - a plain `if`, not an `#if`, so
+ * the inactive one cannot bit-rot before the day it is needed. */
+#define AV_EXPECT_COLD_EXEC_DETECTED 1
 
 static void outmsg(const char *fmt, ...) {
   static char buf[65536];
@@ -308,81 +318,95 @@ int main(int argc, char *const argv[]) {
   }
   outmsg("QEMU_TEST: EICAR detection check passed\n");
 
-  /* ---- Regression case: cold-pathname bypass ----
+  /* ---- Regression case: cold-pathname exec ----
    * av/main.c's handler_pre() comment is the authoritative writeup of
-   * the mechanism. cold_launcher.c is a dedicated, separate binary
-   * specifically so its embedded pathname literal is guaranteed
-   * genuinely untouched at exec time - see its own header comment for
-   * why init.c itself can't offer that guarantee.
+   * the gap this is aimed at. cold_launcher.c is a dedicated, separate
+   * binary specifically so its embedded pathname literal has the best
+   * chance of being genuinely untouched at exec time - see its own
+   * header comment for why init.c can't offer that itself, and
+   * AV_EXPECT_COLD_EXEC_DETECTED above for what actually happens.
    *
-   * Unlike the EICAR check above, this case deliberately does NOT
-   * touch the pathname before exec - that touch is what makes the
-   * primary check exercise the common/intended case, and skipping it
-   * here is the whole point. Expectation is set by
-   * AV_EXPECT_COLD_BYPASS at the top of this file. */
+   * Unlike the EICAR check above, nothing here touches the pathname
+   * before exec; that touch is what makes the primary check exercise
+   * the common case, and skipping it is the whole point. */
   {
     int killed, exited, code;
+    char *log;
 
     write_file("/tmp/eicar_cold.com", EICAR);
     run_and_wait("/cold_launcher", NULL, &killed, &exited, &code);
 
-    /* Rule out a broken test before interpreting the result either
-     * way. Exactly two outcomes are meaningful: SIGKILL (av.ko caught
-     * the cold exec), or cold_launcher.c's own `return 1` after its
-     * inner execve() fails ENOEXEC (it ran, so the exec was not
-     * blocked). Anything else - notably code 127, which is
-     * run_and_wait's OWN outer execv() failing because /cold_launcher
-     * is missing or non-executable in the initramfs - says nothing
-     * about av/main.c and used to be reported as merely
-     * "INCONCLUSIVE" while still passing the build. */
+    /* Rule out a broken harness before interpreting the outcome either
+     * way. Exactly two shapes are meaningful: SIGKILL (av.ko caught the
+     * cold exec), or cold_launcher.c's own `return 1` after its inner
+     * execve() fails ENOEXEC (it survived). Anything else - notably
+     * code 127, run_and_wait's OWN outer execv() failing because
+     * /cold_launcher is missing or non-executable in the initramfs -
+     * says nothing about av/main.c. */
     if (!killed && !(exited && code == 1)) {
-      outmsg("QEMU_TEST: FAIL: cold-pathname bypass case is broken - "
+      outmsg("QEMU_TEST: FAIL: cold-pathname case is broken - "
              "/cold_launcher exited unexpectedly (exited=%d code=%d, not "
              "killed). Expected either a SIGKILL or its own exit code 1; "
              "code 127 means /cold_launcher is missing or non-executable "
-             "in the initramfs. This is a defect in this test, not in "
-             "the av/main.c gap it tracks.\n",
+             "in the initramfs. This is a defect in this harness, not in "
+             "the av/main.c gap it is aimed at.\n",
              exited, code);
       outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
       reboot(RB_POWER_OFF);
       return 1;
     }
 
-    if (AV_EXPECT_COLD_BYPASS) {
-      if (killed) {
-        outmsg("QEMU_TEST: FAIL: cold-pathname bypass did NOT reproduce - "
-               "/cold_launcher was killed, but AV_EXPECT_COLD_BYPASS says "
-               "the gap is still open. Either the gap is genuinely closed "
-               "(good news: flip AV_EXPECT_COLD_BYPASS to 0 in "
-               "tests/qemu-boot/init.c and update SECURITY.md and "
-               "docs/evasion-findings.md to match), or this run's "
-               "environment resident-faulted the pathname page for some "
-               "unrelated reason. Do not silence this by relaxing the "
-               "check - establish which of the two it is first; see "
-               "av/main.c's handler_pre() comment and issue #2.\n");
-        outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
-        reboot(RB_POWER_OFF);
-        return 1;
-      }
-      outmsg("QEMU_TEST: cold-pathname bypass reproduced as documented "
-             "(exited=%d code=%d, not killed) - known open gap, asserted "
-             "here so it cannot close or rot unnoticed\n",
-             exited, code);
-    } else {
-      if (!killed) {
-        outmsg("QEMU_TEST: FAIL: cold-pathname bypass REGRESSION - "
-               "/cold_launcher survived a cold exec (exited=%d code=%d, "
-               "not killed). AV_EXPECT_COLD_BYPASS says this gap is "
-               "closed, so a surviving cold exec means the exec-time "
-               "detection path regressed - see issue #2 and "
-               "discussion #33.\n",
+    /* Corroborate the exit status against dmesg rather than trusting
+     * it alone - a SIGKILL from anything other than av.ko would
+     * otherwise read as a successful detection. This substring is
+     * contiguous in av_kill()'s format string and names the inner
+     * exec specifically, so the EICAR check's own kill line above
+     * cannot satisfy it. */
+    log = read_kernel_log();
+    {
+      const int detected =
+          strstr(log, "action=kill type=signature "
+                      "path=\"/tmp/eicar_cold.com\"") != NULL;
+
+      if (AV_EXPECT_COLD_EXEC_DETECTED) {
+        if (!killed || !detected) {
+          outmsg("QEMU_TEST: FAIL: cold exec was NOT detected "
+                 "(killed=%d dmesg-kill-line=%d exited=%d code=%d). "
+                 "AV_EXPECT_COLD_EXEC_DETECTED says this harness detects "
+                 "it - every kernel in the matrix did when that was set. "
+                 "So either exec-time detection regressed, or this "
+                 "harness has started genuinely reproducing the "
+                 "cold-page bypass of issue #2. Establish which before "
+                 "touching this check; if it is the latter, that is a "
+                 "real finding for #2 and discussion #33, not something "
+                 "to silence by flipping the toggle.\n",
+                 killed, detected, exited, code);
+          outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", log);
+          reboot(RB_POWER_OFF);
+          return 1;
+        }
+        outmsg("QEMU_TEST: cold exec detected and killed - note this "
+               "harness does not reproduce the issue #2 bypass, so this "
+               "is a detection regression guard, not evidence about "
+               "that gap\n");
+      } else {
+        if (killed || detected) {
+          outmsg("QEMU_TEST: FAIL: cold exec WAS detected "
+                 "(killed=%d dmesg-kill-line=%d), but "
+                 "AV_EXPECT_COLD_EXEC_DETECTED says this harness "
+                 "reproduces the bypass. Good news if the harness was "
+                 "just made to reproduce it and detection then caught "
+                 "up - flip the toggle back to 1 and update issue #2 "
+                 "and SECURITY.md to match.\n",
+                 killed, detected);
+          outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", log);
+          reboot(RB_POWER_OFF);
+          return 1;
+        }
+        outmsg("QEMU_TEST: cold-pathname bypass reproduced as documented "
+               "(exited=%d code=%d, not killed, no kill line in dmesg)\n",
                exited, code);
-        outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
-        reboot(RB_POWER_OFF);
-        return 1;
       }
-      outmsg("QEMU_TEST: cold-pathname exec correctly blocked (killed) - "
-             "gap stays closed\n");
     }
   }
 

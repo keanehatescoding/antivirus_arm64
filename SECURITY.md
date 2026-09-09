@@ -79,10 +79,15 @@ not oversights. A *new* way to defeat one of them is still very welcome:
   crashed daemon can't become a system-wide DoS. `avctl policy set
   fail-closed` opts out of this. See `docs/netlink-protocol.md`.
 - **A known TOCTOU gap in `handler_pre()`** (kernel side) around when the
-  exec'd pathname is captured relative to the exec itself. It's reproduced
-  on every CI run via `tests/qemu-boot/cold_launcher.c`; three fixes were
-  considered and rejected. Full writeup in the comment above
-  `handler_pre()` in `av/main.c` and in the CI section of the README.
+  exec'd pathname is captured relative to the exec itself. Three fixes were
+  considered and rejected; full writeup in the comment above
+  `handler_pre()` in `av/main.c`, and design options in issue #2 /
+  discussion #33. `tests/qemu-boot/cold_launcher.c` exercises it on every
+  CI run but does **not** currently reproduce it — every kernel in the
+  matrix detects and kills the cold exec, most likely because the
+  launcher is too small for its pathname page to still be cold by the
+  time it `execve()`s. That case now gates on the detection it actually
+  observes, so the discrepancy can't go unnoticed again.
 - **arm64 only.** The module hooks `__arm64_sys_execve` by symbol name and
   will not build or load on x86_64.
 
