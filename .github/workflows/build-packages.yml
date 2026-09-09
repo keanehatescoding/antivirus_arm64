@@ -95,6 +95,16 @@ jobs:
           mkdir -p dist
           mv ../*.deb ../*.buildinfo ../*.changes dist/
 
+      - name: lintian (packaging metadata regression check)
+        # Issue #13: nothing caught packaging-metadata regressions
+        # automatically. --fail-on error keeps this green on warnings
+        # (e.g. the placeholder-maintainer findings, item 1, which need
+        # the owner's real identity) while errors break the build.
+        run: |
+          set -euxo pipefail
+          apt-get install -y -qq --no-install-recommends lintian
+          lintian --fail-on error dist/*.deb
+
       - name: Upload .deb packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
@@ -257,6 +267,20 @@ jobs:
           find /home/builder -iname '*.pkg.tar.*' -exec cp {} packaging/arch/ \;
           ls -la packaging/arch/*.pkg.tar.*
 
+      - name: namcap (PKGBUILD/packaging regression check)
+        # Issue #13: nothing caught packaging-metadata regressions
+        # automatically. namcap exits 0 even with findings, so gate on
+        # error tags explicitly; warnings (e.g. the pkgdesc naming
+        # note namcap reports today) stay informational.
+        run: |
+          set -euxo pipefail
+          pacman -S --noconfirm --needed --quiet namcap
+          cd packaging/arch
+          namcap PKGBUILD ./*.pkg.tar.* 2>&1 | tee "$GITHUB_WORKSPACE/namcap.log"
+          if grep -q ' E: ' "$GITHUB_WORKSPACE/namcap.log"; then
+            echo "namcap reported errors (see above)"; exit 1
+          fi
+
       - name: Upload Arch packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
@@ -380,6 +404,29 @@ jobs:
             --define "_sourcedir $GITHUB_WORKSPACE/rpmbuild-sources" \
             --define "_rpmdir $GITHUB_WORKSPACE/rpmbuild-out" \
             packaging/fedora/hyprav.spec
+
+      - name: rpmlint (spec/packaging regression check)
+        # Issue #13: nothing caught packaging-metadata regressions
+        # automatically. Two E-level findings are false positives here,
+        # confirmed by real CI runs, so the gate below ignores exactly
+        # those tags (same pattern as the namcap step above):
+        # spelling-error (project vocabulary like kprobe/execve/netlink/
+        # avctl, unknown to rpmlint's en_US dictionary - rewording
+        # accurate technical terms to dodge a spellchecker would be
+        # worse), no-binary (hyprav-dkms ships DKMS *source* by design,
+        # like its deb/arch siblings). Any OTHER error fails the build;
+        # warnings stay informational (placeholder-maintainer style
+        # findings until item 1 is resolved by the owner).
+        # Note %check above already ran inside `rpmbuild -bb`, so this
+        # step only lints metadata, it doesn't re-run tests.
+        run: |
+          set -euxo pipefail
+          dnf install -y -q rpmlint
+          mapfile -t RPMS < <(find rpmbuild-out -name '*.rpm')
+          rpmlint packaging/fedora/hyprav.spec "${RPMS[@]}" 2>&1 | tee rpmlint.log || true
+          if grep ' E: ' rpmlint.log | grep -vE 'spelling-error|no-binary'; then
+            echo "rpmlint reported errors (see above)"; exit 1
+          fi
 
       - name: Upload .rpm packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7

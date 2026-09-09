@@ -39,7 +39,7 @@
 # itself (not just parses) is left for CI to confirm (this job is
 # continue-on-error, so a miss here doesn't block builds either way).
 %if 0%{!?gitcommit:1}
-%global gitcommit 32d9af8
+%global gitcommit c2051d7
 %endif
 
 # Same guarded-%%global idiom as gitcommit above, so a real release
@@ -62,7 +62,7 @@
 Name:           hyprav
 Version:        %{pkgversion}
 Release:        1%{?dist}
-Summary:        Kernel-level Linux antivirus (kprobe execve/file monitor + YARA/entropy/fuzzy-hash daemon)
+Summary:        Kprobe-based Linux antivirus with YARA/entropy/fuzzy-hash daemon
 
 # SPDX identifier (current Fedora Licensing Guidelines). Older Fedora
 # releases (pre F38-ish) used the short name "GPLv3" instead - adjust
@@ -175,6 +175,15 @@ EOF
 
 make -C userspace/av-gui install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
+%check
+# Rootless known-answer tests for the vendored hashing code
+# (CONTRIBUTING.md: hashing code needs no root, unlike most of tests/
+# which needs module loads and network). rpmbuild -bb runs %check by
+# default, so CI's build-rpm job exercises these on every push/PR.
+# The full tests/run_all.sh stays out - it needs root, av.ko, and QEMU.
+tests/test_sha256.sh
+tests/test_tlsh_core.sh
+
 %post
 %systemd_post avd.service
 
@@ -216,6 +225,6 @@ dkms remove -m hyprav-av -v %{version} --all || :
 %{_datadir}/applications/av-gui.desktop
 
 %changelog
-* Tue Aug 25 2026 Your Name <you@example.com> - 0.9.0.129.g32d9af8-1
+* Tue Aug 25 2026 Your Name <you@example.com> - 0.9.0.129.gc2051d7-1
 - Initial packaging: hyprav-dkms (av.ko kernel module), hyprav
   (avd daemon + avctl CLI), hyprav-gui (GTK4 console).
