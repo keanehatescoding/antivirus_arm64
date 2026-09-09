@@ -104,7 +104,7 @@ by watching your own shell die.
 
 | Command | Direction | Purpose |
 |---|---|---|
-| `AV_C_REGISTER` | daemon → kernel | Daemon announces itself; kernel stores its netlink port ID for future unicasts. **Only one daemon connection is supported right now** — a second `REGISTER` overwrites the stored portid. |
+| `AV_C_REGISTER` | daemon → kernel | Daemon announces itself; kernel stores its netlink port ID for future unicasts. **Only one daemon connection is supported** — a second `REGISTER` from a different portid while one is live is rejected with `-EBUSY` (logged at `pr_alert`); re-registering from the already-registered portid is an idempotent no-op. |
 | `AV_C_SCAN_REQUEST` | kernel → daemon | Kernel asks the daemon to analyze a file. |
 | `AV_C_VERDICT` | daemon → kernel | Daemon's answer, correlated by `REQID`. |
 
@@ -122,8 +122,11 @@ by watching your own shell die.
 ## Known limitations (document these in your report)
 
 - **Single daemon only.** No multi-client support - only one daemon can
-  be registered at a time, and a second `REGISTER` silently replaces
-  the first. **Fixed:** `REGISTER` and `VERDICT` now require
+  be registered at a time. A second `REGISTER` from a different portid
+  while one is live is rejected with `-EBUSY` and logged at `pr_alert`
+  (a same-portid re-REGISTER stays idempotent, and a dead daemon's
+  `NETLINK_URELEASE` clears the slot so its replacement can register).
+  **Fixed:** `REGISTER` and `VERDICT` now require
   `GENL_ADMIN_PERM` (CAP_NET_ADMIN), and `VERDICT` is additionally
   checked against the currently-registered daemon's portid, so an
   unprivileged local process can no longer impersonate the daemon or
