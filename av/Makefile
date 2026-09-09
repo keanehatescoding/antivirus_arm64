@@ -30,6 +30,16 @@ endif
 ifneq ($(LLVM),)
   MAKE_ARGS += LLVM=$(LLVM)
 endif
+# Reproducible builds (issue #13): when a build harness defines
+# SOURCE_DATE_EPOCH (dpkg-buildpackage and rpm do), forward it as the
+# kernel build system's KBUILD_BUILD_TIMESTAMP (see
+# Documentation/kbuild/reproducible-builds.rst) so the embedded build
+# string doesn't capture the wall clock. Unset locally (plain DKMS
+# build) -> untouched, previous behavior exactly. Userspace needs no
+# equivalent: no C source here uses __DATE__/__TIME__ (verified).
+ifdef SOURCE_DATE_EPOCH
+MAKE_ARGS += KBUILD_BUILD_TIMESTAMP="$(shell date -u -d "@$(SOURCE_DATE_EPOCH)" 2>/dev/null)"
+endif
 
 all:
 	$(MAKE) $(MAKE_ARGS) modules

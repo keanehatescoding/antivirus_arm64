@@ -39,7 +39,7 @@
 # itself (not just parses) is left for CI to confirm (this job is
 # continue-on-error, so a miss here doesn't block builds either way).
 %if 0%{!?gitcommit:1}
-%global gitcommit 32d9af8
+%global gitcommit c2051d7
 %endif
 
 # Same guarded-%%global idiom as gitcommit above, so a real release
@@ -174,6 +174,15 @@ CLEAN="make KDIR=\${kernel_source_dir} clean"
 EOF
 
 make -C userspace/av-gui install DESTDIR=%{buildroot} PREFIX=%{_prefix}
+
+%check
+# Rootless known-answer tests for the vendored hashing code
+# (CONTRIBUTING.md: hashing code needs no root, unlike most of tests/
+# which needs module loads and network). rpmbuild -bb runs %check by
+# default, so CI's build-rpm job exercises these on every push/PR.
+# The full tests/run_all.sh stays out - it needs root, av.ko, and QEMU.
+tests/test_sha256.sh
+tests/test_tlsh_core.sh
 
 %post
 %systemd_post avd.service
