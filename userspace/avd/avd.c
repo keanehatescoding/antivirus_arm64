@@ -194,7 +194,7 @@
  * files - kernel-triggered or a control-socket SCAN - can tie up the
  * whole pool for as long as the read takes; kernel-side scans then
  * queue past avd_scan_queue_max and fail open. Same 256MB value as
- * the kernel side's MAX_HASH_FILE_SIZE (av/main.c) for consistency,
+ * the kernel side's max_hash_file_size default (av/main.c) for consistency,
  * though the two caps guard unrelated code paths. */
 #define MAX_FUZZY_TLSH_FILE_SIZE (256 * 1024 * 1024)
 #define MALICIOUS_SCORE_THRESHOLD 100

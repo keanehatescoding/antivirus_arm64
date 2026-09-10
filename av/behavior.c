@@ -68,8 +68,17 @@
  * above any realistic concurrent-process count while still bounding
  * the DoS. */
 #define MAX_BEHAVIOR_ENTRIES 8192
-#define WRITE_OPEN_WINDOW_MS 2000 /* sliding window size */
-#define WRITE_OPEN_THRESHOLD                                                   \
+#define WRITE_OPEN_WINDOW_MS_DEFAULT 2000
+#define WRITE_OPEN_WINDOW_MS_MIN 100
+#define WRITE_OPEN_WINDOW_MS_MAX 60000
+/* Trailing-window size for the rapid-write heuristic - a load-time
+ * module param (issue #14) so operators can tune it without
+ * rebuilding; validated in av_behavior_init(). */
+static int write_open_window_ms = WRITE_OPEN_WINDOW_MS_DEFAULT;
+module_param(write_open_window_ms, int, 0444);
+MODULE_PARM_DESC(write_open_window_ms,
+                 "rapid-write heuristic trailing window in ms (default 2000, within [100, 60000], otherwise reset to the default at load)");
+#define WRITE_OPEN_THRESHOLD_DEFAULT                                             \
   50 /* DISTINCT write-intent opens within                                     \
       * the window that trip the "rapid                                        \
       * modification" heuristic - tunable,                                     \
@@ -79,8 +88,24 @@
       * showed systemd's routine cgroup                                        \
       * writes tripping it well within                                         \
       * normal boot activity - see README                                      \
-      * for the incident writeup */
-#define MAX_TRACKED_PATHS WRITE_OPEN_THRESHOLD
+      * for the incident writeup.                                              \
+      *                                                                        \
+      * Same load-time-tunable contract as                                      \
+      * write_open_window_ms above (issue #14).                                 \
+      * Capped at MAX_TRACKED_PATHS: the                                       \
+      * per-process dedup ring below holds                                      \
+      * that many entries, so a higher                                          \
+      * threshold could never trip - raising                                    \
+      * past it needs a rebuild with a                                          \
+      * larger ring, not just a new                                             \
+      * param value. */
+#define WRITE_OPEN_THRESHOLD_MIN 1
+#define WRITE_OPEN_THRESHOLD_MAX MAX_TRACKED_PATHS
+static int write_open_threshold = WRITE_OPEN_THRESHOLD_DEFAULT;
+module_param(write_open_threshold, int, 0444);
+MODULE_PARM_DESC(write_open_threshold,
+                 "distinct write-intent opens within the window that trip the rapid-modification heuristic (default 50, within [1, MAX_TRACKED_PATHS (50)], otherwise reset to the default at load)");
+#define MAX_TRACKED_PATHS 50
 /* Sized to exactly cover the
  * threshold: a real mass-distinct-
  * file writer will trip `rapid`
@@ -103,13 +128,22 @@
          * stays small in practice. 30s is a                                   \
          * starting point, not a tuned value. */
 
-#define RENAME_WINDOW_MS 2000
-#define RENAME_THRESHOLD                                                       \
+#define RENAME_WINDOW_MS_DEFAULT 2000
+#define RENAME_WINDOW_MS_MIN 100
+#define RENAME_WINDOW_MS_MAX 60000
+/* Trailing-window size for the rapid-rename heuristic - same
+ * load-time-tunable contract as write_open_window_ms above
+ * (issue #14). */
+static int rename_window_ms = RENAME_WINDOW_MS_DEFAULT;
+module_param(rename_window_ms, int, 0444);
+MODULE_PARM_DESC(rename_window_ms,
+                 "rapid-rename heuristic trailing window in ms (default 2000, within [100, 60000], otherwise reset to the default at load)");
+#define RENAME_THRESHOLD_DEFAULT                                                 \
   20 /* DISTINCT extension-append renames                                      \
       * within the window before this trips -                                  \
       * tunable, not derived from a real                                       \
       * ransomware sample. Deliberately LOWER                                  \
-      * than WRITE_OPEN_THRESHOLD (50): this                                   \
+      * than the write-open default (50): this                                 \
       * only counts renames matching the                                       \
       * specific extension-append SHAPE (see                                   \
       * is_extension_append_rename() below),                                   \
@@ -118,8 +152,20 @@
       * open" - that's already a much rarer,                                   \
       * more specific signal, so it can trip                                   \
       * sooner without the same false-positive                                 \
-      * exposure. */
-#define MAX_TRACKED_RENAMES RENAME_THRESHOLD
+      * exposure.                                                              \
+      *                                                                        \
+      * Same load-time-tunable contract and                                     \
+      * ring-capacity cap as write_open_threshold                               \
+      * above (issue #14): capped at                                            \
+      * MAX_TRACKED_RENAMES, raising past it                                    \
+      * needs a rebuild with a larger ring. */
+#define RENAME_THRESHOLD_MIN 1
+#define RENAME_THRESHOLD_MAX MAX_TRACKED_RENAMES
+static int rename_threshold = RENAME_THRESHOLD_DEFAULT;
+module_param(rename_threshold, int, 0444);
+MODULE_PARM_DESC(rename_threshold,
+                 "distinct extension-append renames within the window that trip the rapid-rename heuristic (default 20, within [1, MAX_TRACKED_RENAMES (20)], otherwise reset to the default at load)");
+#define MAX_TRACKED_RENAMES 20
 /* Same sizing rationale as
  * MAX_TRACKED_PATHS above - sized
  * to exactly cover the threshold. */
@@ -1346,7 +1392,7 @@ void av_behavior_record_exec(pid_t pid, const char *path,
      * entry) reliably means this pid was actually recycled by a
      * different task - only then is it safe to clear the sliding-
      * window state rather than letting it age out on its own over up
-     * to WRITE_OPEN_WINDOW_MS. */
+     * to write_open_window_ms. */
     if (e->start_time != start_time) {
       e->start_time = start_time;
       e->recent_path_next = 0;
@@ -1385,11 +1431,12 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
      * is exempted. */
     u32 path_hash = full_name_hash(NULL, path, strlen(path));
     unsigned int in_window = sliding_window_note(
-        path_hash, jiffies, WRITE_OPEN_WINDOW_MS, e->recent_path_hashes,
+        path_hash, jiffies, (unsigned int)write_open_window_ms,
+        e->recent_path_hashes,
         e->recent_path_jiffies, MAX_TRACKED_PATHS, &e->recent_path_next,
         &e->recent_path_filled);
 
-    if (in_window > WRITE_OPEN_THRESHOLD)
+    if (in_window > (unsigned int)write_open_threshold)
       rapid = true;
   }
   mutex_unlock(&behavior_lock);
@@ -1474,11 +1521,12 @@ void av_behavior_check_rename(pid_t pid, const char *oldpath,
        * sensitive-path check above still applies regardless. */
       u32 path_hash = full_name_hash(NULL, oldpath, strlen(oldpath));
       unsigned int in_window = sliding_window_note(
-          path_hash, jiffies, RENAME_WINDOW_MS, e->recent_rename_hashes,
+          path_hash, jiffies, (unsigned int)rename_window_ms,
+          e->recent_rename_hashes,
           e->recent_rename_jiffies, MAX_TRACKED_RENAMES,
           &e->recent_rename_next, &e->recent_rename_filled);
 
-      if (in_window > RENAME_THRESHOLD)
+      if (in_window > (unsigned int)rename_threshold)
         rapid = true;
     }
     mutex_unlock(&behavior_lock);
@@ -1495,6 +1543,44 @@ void av_behavior_check_rename(pid_t pid, const char *oldpath,
 int av_behavior_init(void) {
   int ret;
 
+  /* Load-time tunable validation (issue #14) - same reset-to-default
+   * with-a-warning contract as av_wq_max_active in main.c, so a typo
+   * in modprobe.d can never load the module with a dead heuristic
+   * (a threshold above the ring capacity it is counted in could never
+   * trip) or a trip-on-first-event one (a non-positive threshold or
+   * window). */
+  if (write_open_window_ms < WRITE_OPEN_WINDOW_MS_MIN ||
+      write_open_window_ms > WRITE_OPEN_WINDOW_MS_MAX) {
+    pr_warn("kernel-av: write_open_window_ms=%d out of range [%d,%d], "
+            "using default %d\n",
+            write_open_window_ms, WRITE_OPEN_WINDOW_MS_MIN,
+            WRITE_OPEN_WINDOW_MS_MAX, WRITE_OPEN_WINDOW_MS_DEFAULT);
+    write_open_window_ms = WRITE_OPEN_WINDOW_MS_DEFAULT;
+  }
+  if (write_open_threshold < WRITE_OPEN_THRESHOLD_MIN ||
+      write_open_threshold > WRITE_OPEN_THRESHOLD_MAX) {
+    pr_warn("kernel-av: write_open_threshold=%d out of range [%d,%d], "
+            "using default %d\n",
+            write_open_threshold, WRITE_OPEN_THRESHOLD_MIN,
+            WRITE_OPEN_THRESHOLD_MAX, WRITE_OPEN_THRESHOLD_DEFAULT);
+    write_open_threshold = WRITE_OPEN_THRESHOLD_DEFAULT;
+  }
+  if (rename_window_ms < RENAME_WINDOW_MS_MIN ||
+      rename_window_ms > RENAME_WINDOW_MS_MAX) {
+    pr_warn("kernel-av: rename_window_ms=%d out of range [%d,%d], "
+            "using default %d\n",
+            rename_window_ms, RENAME_WINDOW_MS_MIN, RENAME_WINDOW_MS_MAX,
+            RENAME_WINDOW_MS_DEFAULT);
+    rename_window_ms = RENAME_WINDOW_MS_DEFAULT;
+  }
+  if (rename_threshold < RENAME_THRESHOLD_MIN ||
+      rename_threshold > RENAME_THRESHOLD_MAX) {
+    pr_warn("kernel-av: rename_threshold=%d out of range [%d,%d], "
+            "using default %d\n",
+            rename_threshold, RENAME_THRESHOLD_MIN, RENAME_THRESHOLD_MAX,
+            RENAME_THRESHOLD_DEFAULT);
+    rename_threshold = RENAME_THRESHOLD_DEFAULT;
+  }
   hash_init(behavior_table);
   hash_init(trust_table);
   hash_init(protected_table);

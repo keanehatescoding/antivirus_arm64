@@ -49,8 +49,9 @@ in the kernel headers the way a raw `NETLINK_*` family would.
 ```
 
 The workqueue thread (`av_work_fn` in `main.c`) blocks waiting for the
-verdict with a timeout (default 12000ms — see `DAEMON_TIMEOUT_MS` in
-`main.c`; raised from an earlier 2000ms default that was shorter than
+verdict with a timeout (default 12000ms — the `daemon_timeout_ms`
+module param in `main.c`, tunable at load without rebuilding; raised
+from an earlier 2000ms default that was shorter than
 avd's own `SCAN_TIMEOUT_SECS` of 10s, which meant any scan taking
 longer than 2s had its verdict dropped here regardless of what avd
 decided) — this is safe because it's
@@ -91,7 +92,7 @@ captured back at the kprobe/exec moment itself. A process that started
 still get killed if an operator flips it to fail-closed before that
 exec's work item is processed, since the check reads the *current*
 value, not the value at launch time. With no daemon connected the scan
-fails fast rather than waiting the full `DAEMON_TIMEOUT_MS`, so this
+fails fast rather than waiting the full `daemon_timeout_ms`, so this
 window is normally small, but it's not zero — and it isn't scoped to
 some other process either: if you flip this from an interactive shell
 with no daemon running, don't be surprised if that shell's own recent
