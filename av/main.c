@@ -651,7 +651,7 @@ static int hash_file_multi(const char *path, const struct path *pwd,
   };
   void *buf = NULL;
   loff_t pos = 0;
-  ssize_t n;
+  ssize_t n = 0;
   int ret = 0;
   int i;
 
@@ -729,19 +729,24 @@ static int hash_file_multi(const char *path, const struct path *pwd,
     goto out;
   }
 
-  while ((n = kernel_read(f, buf, read_chunk_size, &pos)) > 0) {
-    /* The i_size_read() check above only bounds the size at open
-     * time - a file that keeps growing while this loop reads it
-     * (e.g. a shell script appending to itself; ETXTBSY only
-     * protects an exec'd interpreter's own image, not a script file
-     * it's reading) would otherwise let kernel_read() keep consuming
-     * data forever, pinning this worker thread indefinitely. `pos`
-     * is kernel_read()'s own running byte count, so re-checking it
-     * against the same cap here catches that case the same way. */
-    if (pos > max_hash_file_size) {
-      ret = -EFBIG;
-      goto out;
-    }
+  /* Never read past max_hash_file_size: each iteration is capped to
+   * the remaining budget, so a file that grows mid-hash (e.g. a shell
+   * script appending to itself; ETXTBSY only protects an exec'd
+   * interpreter's own image, not a script file it's reading) is cut
+   * off at the cap instead of letting one more full-sized
+   * kernel_read() pull up to read_chunk_size bytes past it - and those
+   * over-budget bytes never enter the digest. When the budget is
+   * exhausted, the inode size is re-checked: over cap means the file
+   * genuinely outgrew it while hashing (-EFBIG, same as the open-time
+   * check); at or under cap means the reads simply reached EOF
+   * exactly at the boundary and hashing completes normally. */
+  while (pos < (loff_t)max_hash_file_size) {
+    size_t to_read = (size_t)((loff_t)max_hash_file_size - pos);
+    if (to_read > (size_t)read_chunk_size)
+      to_read = (size_t)read_chunk_size;
+    n = kernel_read(f, buf, to_read, &pos);
+    if (n <= 0)
+      break;
     for (i = 0; i < 3; i++) {
       if (!ctx[i].active)
         continue;
@@ -753,6 +758,11 @@ static int hash_file_multi(const char *path, const struct path *pwd,
      * file can spin ~16k iterations without sleeping - yield
      * periodically so a CONFIG_PREEMPT_NONE kernel stays responsive. */
     cond_resched();
+  }
+  if (pos >= (loff_t)max_hash_file_size &&
+      i_size_read(file_inode(f)) > (loff_t)max_hash_file_size) {
+    ret = -EFBIG;
+    goto out;
   }
   if (n < 0) {
     ret = n;
