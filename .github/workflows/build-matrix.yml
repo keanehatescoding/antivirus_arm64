@@ -97,8 +97,13 @@ jobs:
           # PGP verification of sha256sums.asc (issue #6 follow-up) -
           # pre-v9 cache entries were populated from tarballs checked
           # against an unverified sums file, so rebuild once through
-          # the verified path.
-          key: kernel-tree-v9-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
+          # the verified path. The verification inputs are hashed into
+          # the key itself, so later helper/key changes invalidate the
+          # cache instead of reusing a tree built under a previous
+          # policy (same as qemu-boot's hashFiles).
+          key: kernel-tree-v9-${{ matrix.kernel_version }}-${{ matrix.toolchain }}-${{
+            hashFiles('.github/scripts/verify-kernel-tarball.sh',
+              '.github/scripts/kernel-autosigner.asc') }}
 
       - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'

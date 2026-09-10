@@ -33,7 +33,6 @@ command -v curl >/dev/null 2>&1 || MISSING+=("curl")
 command -v cpio >/dev/null 2>&1 || MISSING+=("cpio")
 command -v sha256sum >/dev/null 2>&1 || MISSING+=("sha256sum")
 command -v gpg >/dev/null 2>&1 || MISSING+=("gpg")
-command -v gpgv >/dev/null 2>&1 || MISSING+=("gpgv")
 if [ "${#MISSING[@]}" -gt 0 ]; then
     echo "test_detection_qemu.sh: missing required tool(s): ${MISSING[*]}"
     echo "  Arch/CachyOS: sudo pacman -S aarch64-linux-gnu-gcc qemu-system-aarch64 cpio curl gnupg"

@@ -48,12 +48,17 @@ if [ ! -f "$AUTOSIGNER_KEY" ]; then
     exit 1
 fi
 
-for cmd in curl gpg gpgv sha256sum awk mktemp; do
+for cmd in curl gpg sha256sum awk mktemp; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "::error::verify-kernel-tarball.sh: missing required tool: $cmd" >&2
         exit 1
     fi
 done
+
+# Fail-closed output contract (see header): no verified tarball, no
+# output file - clear any stale $OUT up front so a later failure can
+# never leave a previous artifact behind for a caller to extract.
+rm -f "$OUT"
 
 MAJOR="$(echo "$VERSION" | cut -d. -f1)"
 TARBALL_BASENAME="linux-${VERSION}.tar.xz"
@@ -70,8 +75,6 @@ if ! gpg --batch --homedir "$GNUPGHOME" --list-keys --with-colons \
     echo "::error::verify-kernel-tarball.sh: vendored key does not match pinned fingerprint $AUTOSIGNER_FPR (key rotated? replace the file and the pin together)" >&2
     exit 1
 fi
-gpg --batch --quiet --homedir "$GNUPGHOME" \
-    --export autosigner@kernel.org > "$TMPDIR/shakeyring.gpg"
 
 # --retry/--retry-all-errors/--http1.1: kernel.org's CDN occasionally
 # resets connections mid-transfer (curl exit 92) - observed directly
@@ -83,22 +86,27 @@ curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
     --connect-timeout 20 -o "$TMPDIR/sha256sums.asc" \
     "$BASE_URL/sha256sums.asc"
 
-# gpgv's exit status alone only says "a valid signature from the
-# keyring exists somewhere" - require both GOODSIG and VALIDSIG in
-# the status output, same threshold kernel.org's own helper uses, so
-# a revoked/expired signing key fails closed here too.
-VERIFY_OUT="$(gpgv --keyring="$TMPDIR/shakeyring.gpg" --status-fd=1 \
-    "$TMPDIR/sha256sums.asc" 2>"$TMPDIR/gpgv.err" || true)"
-if ! printf '%s\n' "$VERIFY_OUT" | grep -q '^\[GNUPG:\] GOODSIG' || \
-   ! printf '%s\n' "$VERIFY_OUT" | grep -q '^\[GNUPG:\] VALIDSIG'; then
-    echo "::error::verify-kernel-tarball.sh: PGP verification of sha256sums.asc failed (not signed by pinned autosigner key)" >&2
-    cat "$TMPDIR/gpgv.err" >&2 || true
+# Verify in the isolated homedir - it holds only the pinned key, so no
+# second key for this identity can slip onto the verification keyring.
+# gpg rather than gpgv: gpgv never checks expiration or revocation, so
+# a signature from an expired/revoked autosigner would still read as
+# valid. Require a VALIDSIG bound to the pinned primary fingerprint
+# and reject any expiry/revocation marker outright. The plaintext is
+# written out by gpg itself, so the hash lookup below reads the
+# signature-checked bytes, not the downloaded file a second time.
+VERIFY_OUT="$(gpg --batch --homedir "$GNUPGHOME" --status-fd=1 \
+    --output "$TMPDIR/sha256sums.verified" --verify \
+    "$TMPDIR/sha256sums.asc" 2>"$TMPDIR/gpg.err" || true)"
+if ! printf '%s\n' "$VERIFY_OUT" | grep -q "^\[GNUPG:\] VALIDSIG $AUTOSIGNER_FPR" || \
+   printf '%s\n' "$VERIFY_OUT" | grep -q -E '^\[GNUPG:\] (EXPKEYSIG|EXPSIG|REVKEYSIG|KEYEXPIRED|KEYREVOKED)'; then
+    echo "::error::verify-kernel-tarball.sh: PGP verification of sha256sums.asc failed (no valid signature from pinned autosigner key)" >&2
+    cat "$TMPDIR/gpg.err" >&2 || true
     exit 1
 fi
 
 # Exact-field match, not substring grep: adjacent sums entries like
 # linux-6.12.107.tar.xz.sign must never collide with the tarball row.
-EXPECTED="$(awk -v f="$TARBALL_BASENAME" '$2 == f {print $1}' "$TMPDIR/sha256sums.asc")"
+EXPECTED="$(awk -v f="$TARBALL_BASENAME" '$2 == f {print $1}' "$TMPDIR/sha256sums.verified")"
 if [ -z "$EXPECTED" ]; then
     echo "::error::verify-kernel-tarball.sh: no sha256 entry for $TARBALL_BASENAME in sha256sums.asc" >&2
     exit 1
