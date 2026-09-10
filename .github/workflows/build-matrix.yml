@@ -93,35 +93,29 @@ jobs:
           # reason v6 was bumped from v5, see below). v8: bumped again
           # for the arm64 port - a v7 cache entry holds an x86_64 tree
           # built on the old ubuntu-latest (x86_64) runner and must
-          # never be served to this job's arm64 runner.
-          key: kernel-tree-v8-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
+          # never be served to this job's arm64 runner. v9: bumped for
+          # PGP verification of sha256sums.asc (issue #6 follow-up) -
+          # pre-v9 cache entries were populated from tarballs checked
+          # against an unverified sums file, so rebuild once through
+          # the verified path. The verification inputs are hashed into
+          # the key itself, so later helper/key changes invalidate the
+          # cache instead of reusing a tree built under a previous
+          # policy (same as qemu-boot's hashFiles).
+          key: kernel-tree-v9-${{ matrix.kernel_version }}-${{ matrix.toolchain }}-${{
+            hashFiles('.github/scripts/verify-kernel-tarball.sh',
+              '.github/scripts/kernel-autosigner.asc') }}
 
       - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
-          MAJOR="$(echo "${{ matrix.kernel_version }}" | cut -d. -f1)"
           SRCDIR="linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}"
           TARBALL="linux-${{ matrix.kernel_version }}.tar.xz"
-          curl -fL -o "$TARBALL" \
-            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${{ matrix.kernel_version }}.tar.xz"
-          # kernel.org publishes a PGP-signed sha256sums.asc per major
-          # series alongside the tarballs - verify against it before
-          # extracting, so a substituted mirror artifact fails loudly
-          # instead of being silently compiled (issue #6).
-          curl -fL -o sha256sums.asc \
-            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc"
-          EXPECTED="$(awk -v f="$TARBALL" '$2 == f {print $1}' sha256sums.asc)"
-          if [ -z "$EXPECTED" ]; then
-            echo "::error::no sha256 entry for $TARBALL in sha256sums.asc"
-            exit 1
-          fi
-          ACTUAL="$(sha256sum "$TARBALL" | awk '{print $1}')"
-          if [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "::error::sha256 mismatch for $TARBALL"
-            exit 1
-          fi
-          rm -f sha256sums.asc
+          # Full cryptographic verification (issue #6): PGP-verifies
+          # sha256sums.asc against kernel.org's pinned checksum-autosigner
+          # key before trusting any hash from it, then sha256-verifies
+          # the tarball - see verify-kernel-tarball.sh for the flow.
+          .github/scripts/verify-kernel-tarball.sh "${{ matrix.kernel_version }}" "$TARBALL"
           mkdir -p "$SRCDIR"
           tar -xf "$TARBALL" -C "$SRCDIR" --strip-components=1
           rm "$TARBALL"

@@ -32,10 +32,11 @@ command -v qemu-system-aarch64 >/dev/null 2>&1 || MISSING+=("qemu-system-aarch64
 command -v curl >/dev/null 2>&1 || MISSING+=("curl")
 command -v cpio >/dev/null 2>&1 || MISSING+=("cpio")
 command -v sha256sum >/dev/null 2>&1 || MISSING+=("sha256sum")
+command -v gpg >/dev/null 2>&1 || MISSING+=("gpg")
 if [ "${#MISSING[@]}" -gt 0 ]; then
     echo "test_detection_qemu.sh: missing required tool(s): ${MISSING[*]}"
-    echo "  Arch/CachyOS: sudo pacman -S aarch64-linux-gnu-gcc qemu-system-aarch64 cpio curl"
-    echo "  Debian/Ubuntu: sudo apt install gcc-aarch64-linux-gnu qemu-system-arm cpio curl"
+    echo "  Arch/CachyOS: sudo pacman -S aarch64-linux-gnu-gcc qemu-system-aarch64 cpio curl gnupg"
+    echo "  Debian/Ubuntu: sudo apt install gcc-aarch64-linux-gnu qemu-system-arm cpio curl gnupg"
     exit 1
 fi
 
@@ -54,12 +55,13 @@ if [ -z "$KERNEL_VERSION" ]; then
 fi
 
 KDIR="$CACHE_ROOT/linux-$KERNEL_VERSION"
-# Keyed on this script's own hash, not just the kernel version - same
-# reasoning as qemu-boot-test.yml's cache key including
+# Keyed on this script's hash plus the kernel download/verify helper files -
+# same reasoning as qemu-boot-test.yml's cache key including
 # hashFiles(workflow file): editing the scripts/config enables below
-# must invalidate the cache, or it'll keep serving a kernel tree built
-# with the old config forever.
-SELF_HASH="$(sha256sum "$0" | awk '{print $1}')"
+# or the verification logic must invalidate the cache, or it'll keep
+# serving a kernel tree built with the old config (or verified the old
+# way) forever.
+SELF_HASH="$(cat "$0" "$REPO_ROOT/.github/scripts/verify-kernel-tarball.sh" "$REPO_ROOT/.github/scripts/kernel-autosigner.asc" | sha256sum | awk '{print $1}')"
 STAMP="$KDIR/.hyprav-cache-stamp"
 
 if [ -f "$KDIR/arch/arm64/boot/Image" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$SELF_HASH" ]; then
@@ -68,29 +70,11 @@ else
     echo "test_detection_qemu.sh: (re)building arm64 $KERNEL_VERSION kernel - this takes several minutes but is cached at $KDIR for next time"
     rm -rf "$KDIR"
     mkdir -p "$CACHE_ROOT"
-    MAJOR="$(echo "$KERNEL_VERSION" | cut -d. -f1)"
     TARBALL="$CACHE_ROOT/linux-$KERNEL_VERSION.tar.xz"
-    SUMS="$CACHE_ROOT/sha256sums-v${MAJOR}.asc"
-    curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
-        --connect-timeout 20 -o "$TARBALL" \
-        "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz" || exit 1
-    # Same verification as .github/workflows/qemu-boot-test.yml: kernel.org
-    # publishes a PGP-signed sha256sums.asc per major series - check the
-    # tarball against it before extracting (issue #6).
-    curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
-        --connect-timeout 20 -o "$SUMS" \
-        "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc" || exit 1
-    EXPECTED="$(awk -v f="linux-${KERNEL_VERSION}.tar.xz" '$2 == f {print $1}' "$SUMS")"
-    if [ -z "$EXPECTED" ]; then
-        echo "test_detection_qemu.sh: no sha256 entry for linux-${KERNEL_VERSION}.tar.xz in $SUMS" >&2
-        exit 1
-    fi
-    ACTUAL="$(sha256sum "$TARBALL" | awk '{print $1}')"
-    if [ "$EXPECTED" != "$ACTUAL" ]; then
-        echo "test_detection_qemu.sh: sha256 mismatch for $TARBALL" >&2
-        exit 1
-    fi
-    rm -f "$SUMS"
+    # Same verification as .github/workflows/qemu-boot-test.yml (issue
+    # #6): PGP-verified sums plus sha256, via the shared helper so the
+    # logic can't drift between CI and this script.
+    "$REPO_ROOT/.github/scripts/verify-kernel-tarball.sh" "$KERNEL_VERSION" "$TARBALL" || exit 1
     mkdir -p "$KDIR"
     tar -xf "$TARBALL" -C "$KDIR" --strip-components=1 || exit 1
     rm -f "$TARBALL"
