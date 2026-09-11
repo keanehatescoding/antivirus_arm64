@@ -61,6 +61,7 @@
  */
 
 #include <crypto/hash.h>
+#include <linux/capability.h>
 #include <linux/crypto.h>
 #include <linux/dcache.h>
 #include <linux/fcntl.h>
@@ -848,6 +849,18 @@ static int daemon_policy_proc_open(struct inode *inode, struct file *file) {
 static ssize_t daemon_policy_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
   char kbuf[32];
   size_t len;
+
+  /* DAC mode (0644) alone only checks UID 0, not the capability that
+   * UID actually holds - any root process, even one that dropped
+   * CAP_SYS_ADMIN, could otherwise flip the fail-open/fail-closed
+   * policy. Same gap as sig/trust/protect had (upstream #89, local
+   * #10): those handlers gate on capable(CAP_SYS_ADMIN) alongside
+   * their 0600 modes, and the netlink channel gates the equivalent
+   * operation behind GENL_ADMIN_PERM - this handler needs the same
+   * bar. Reads stay world-readable deliberately (unprivileged
+   * `avctl policy get` and the GUI's read path depend on it). */
+  if (!capable(CAP_SYS_ADMIN))
+    return -EPERM;
 
   if (*ppos != 0)
     return -EINVAL;
