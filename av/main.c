@@ -1169,11 +1169,15 @@ out:
  * well-positioned attacker to exploit - it's deterministically
  * reproducible by any process whose exec's pathname argument has
  * simply never been touched before, e.g. a freshly execve()'d static
- * binary whose entire body is "exec this literal path, nothing else
- * first" (exactly what cold_launcher.c is, and 100% reliable in
- * testing). A real shell essentially never hits this by accident -
- * too much prior memory activity for anything to still be a cold page
- * by the time it calls execve() - but a deliberately minimal launcher
+ * binary whose entire body is "exec a pathname from a page nothing
+ * has faulted in, nothing else first" (exactly what
+ * cold_launcher.c is - mmap'd file-backed pathname page plus
+ * MADV_DONTNEED, not just a fresh .rodata literal, since
+ * fault-around pulls the latter in alongside .text - and 100%
+ * reliable in testing). A real shell essentially never hits this by
+ * accident - too much prior memory activity for anything to still be
+ * a cold page by the time it calls execve() - but a deliberately
+ * minimal launcher
  * doesn't need to work hard to trigger it on purpose.
  *
  * Considered and NOT done here:

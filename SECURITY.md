@@ -82,12 +82,12 @@ not oversights. A *new* way to defeat one of them is still very welcome:
   exec'd pathname is captured relative to the exec itself. Three fixes were
   considered and rejected; full writeup in the comment above
   `handler_pre()` in `av/main.c`, and design options in issue #2 /
-  discussion #33. `tests/qemu-boot/cold_launcher.c` exercises it on every
-  CI run but does **not** currently reproduce it — every kernel in the
-  matrix detects and kills the cold exec, most likely because the
-  launcher is too small for its pathname page to still be cold by the
-  time it `execve()`s. That case now gates on the detection it actually
-  observes, so the discrepancy can't go unnoticed again.
+  discussion #33. `tests/qemu-boot/cold_launcher.c` reproduces the
+  cold-page half of it on every CI run: it execve()s from a pathname
+  page it guarantees is cold (fresh file-backed mapping, never
+  faulted, `MADV_DONTNEED`'d before exec) so the kprobe handler's
+  atomic copy genuinely sees a non-resident page, and the case gates
+  on the bypass it observes.
 - **arm64 only.** The module hooks `__arm64_sys_execve` by symbol name and
   will not build or load on x86_64.
 
