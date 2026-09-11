@@ -39,7 +39,7 @@ static DEFINE_SPINLOCK(daemon_lock);
  * daemon death: every scan request keeps trying to unicast to a dead
  * portid until genlmsg_unicast() itself starts failing (fast, since
  * the kernel's own netlink core already knows that portid is gone -
- * no hang, no wait for DAEMON_TIMEOUT_MS), but the registration state
+ * no hang, no wait for daemon_timeout_ms), but the registration state
  * stays stale and misleading (e.g. to a future av_sigtable_count()-
  * style status readout) until a new daemon happens to register and
  * overwrite it. Checked against NETLINK_GENERIC specifically since

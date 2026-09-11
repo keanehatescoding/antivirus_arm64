@@ -152,7 +152,7 @@ echo
 echo "Note on interpreting these numbers:"
 echo "- execve overhead includes the FULL detection pipeline: hashing"
 echo "  (MD5+SHA1+SHA256), signature lookup, and - if no signature"
-echo "  match - waiting up to DAEMON_TIMEOUT_MS (12000ms) for avd. If"
+echo "  match - waiting up to daemon_timeout_ms (12000ms default) for avd. If"
 echo "  avd is NOT running, expect a LARGE per-op number here, since"
 echo "  every single execve is paying the full netlink timeout. Run"
 echo "  this with avd running (registered) for a realistic reading."

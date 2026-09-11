@@ -25,7 +25,7 @@
  *     (stubbed as always-clean until the real YARA/heuristic logic
  *     lands in avd - see docs/netlink-protocol.md and
  *     userspace/avd/avd.c). Fail-open if no daemon is connected or it
- *     doesn't respond within DAEMON_TIMEOUT_MS.
+ *     doesn't respond within daemon_timeout_ms.
  *
  * v0.8.0 changes: behavioral heuristics (behavior.c), back on the
  * kernel side after several userspace-only milestones. Three new
@@ -94,8 +94,21 @@
                         * see HOOKED_SYSCALL_NAME above; the x86_64            \
                         * equivalent (unsupported by this build) is            \
                         * __x64_sys_execveat. */
-#define READ_CHUNK_SIZE 4096
-#define MAX_HASH_FILE_SIZE                                                     \
+/* Hash read chunk size - a load-time module param rather than a
+ * compile-time constant, so operators can tune hashing throughput
+ * without rebuilding (issue #14). Validated in av_init(): out of range
+ * falls back to the default with a warning. Bounded above because this
+ * is a single kmalloc() - large high-order allocations fail under
+ * memory pressure - and below because sub-1KB chunks just multiply
+ * kernel_read() loop iterations for no benefit. */
+#define READ_CHUNK_SIZE_DEFAULT 4096
+#define READ_CHUNK_SIZE_MIN 1024
+#define READ_CHUNK_SIZE_MAX 65536
+static int read_chunk_size = READ_CHUNK_SIZE_DEFAULT;
+module_param(read_chunk_size, int, 0444);
+MODULE_PARM_DESC(read_chunk_size,
+                 "hash_file_multi() read chunk size in bytes (default 4096, within [1024, 65536], otherwise reset to the default at load)");
+#define MAX_HASH_FILE_SIZE_DEFAULT                                             \
   (256 * 1024 * 1024) /* 256 MB cap on what                                    \
                        * hash_file_multi() will read - without                 \
                        * it, execve of a multi-GB binary hashes                \
@@ -107,8 +120,19 @@
                        * a FIFO with no writer. Neither is                     \
                        * fatal on its own, but both tie up a                   \
                        * workqueue thread indefinitely; see                    \
-                       * the S_ISREG/i_size checks below. */
-#define DAEMON_TIMEOUT_MS                                                      \
+                       * the S_ISREG/i_size checks below.                      \
+                       *                                                       \
+                       * Same load-time-tunable contract as                     \
+                       * read_chunk_size above (issue #14): set                 \
+                       * at insmod/modprobe.d time, validated                   \
+                       * in av_init(). */
+#define MAX_HASH_FILE_SIZE_MIN (1 * 1024 * 1024)
+#define MAX_HASH_FILE_SIZE_MAX (1024 * 1024 * 1024)
+static int max_hash_file_size = MAX_HASH_FILE_SIZE_DEFAULT;
+module_param(max_hash_file_size, int, 0444);
+MODULE_PARM_DESC(max_hash_file_size,
+                 "max bytes hash_file_multi() will read, in bytes (default 268435456 = 256MB, within [1MB, 1GB], otherwise reset to the default at load)");
+#define DAEMON_TIMEOUT_MS_DEFAULT                                              \
   12000 /* fail-open if the daemon doesn't answer                              \
          * in time - see docs/netlink-protocol.md                              \
          * for the fail-open vs fail-closed                                    \
@@ -127,7 +151,22 @@
          * than matching it exactly, so a scan                                 \
          * that legitimately takes close to 10s                                \
          * still gets to deliver its verdict                                   \
-         * instead of racing this timeout. */
+         * instead of racing this timeout.                                     \
+         *                                                                     \
+         * Same load-time-tunable contract as                                   \
+         * read_chunk_size above (issue #14): set                               \
+         * at insmod/modprobe.d time, validated                                 \
+         * in av_init(). Lowering this below                                   \
+         * avd's own scan budget reintroduces                                   \
+         * the verdict-race above by                                            \
+         * construction - only do so                                            \
+         * deliberately. */
+#define DAEMON_TIMEOUT_MS_MIN 1000
+#define DAEMON_TIMEOUT_MS_MAX 120000
+static int daemon_timeout_ms = DAEMON_TIMEOUT_MS_DEFAULT;
+module_param(daemon_timeout_ms, int, 0444);
+MODULE_PARM_DESC(daemon_timeout_ms,
+                 "ms to wait for avd's verdict before failing open (default 12000, within [1000, 120000], otherwise reset to the default at load)");
 
 static struct kprobe kp_execve = {
     .symbol_name = HOOKED_SYSCALL_NAME,
@@ -174,10 +213,22 @@ static struct workqueue_struct *av_wq;
  * a handful of dropped behavioral events under extreme, sustained
  * load is a far smaller risk than exhausting atomic memory
  * system-wide, which affects every other kernel subsystem too. */
-#define AV_MAX_INFLIGHT_WORK 4096
+#define AV_MAX_INFLIGHT_WORK_DEFAULT 4096
+#define AV_MAX_INFLIGHT_WORK_MIN 1024
+#define AV_MAX_INFLIGHT_WORK_MAX 65536
+/* Same load-time-tunable contract as read_chunk_size above (issue #14):
+ * set at insmod/modprobe.d time, validated in av_init(). The lower
+ * bound keeps this strictly above AV_EXEC_RESERVED_WORK below - at or
+ * below it the non-exec cap (full budget minus the exec reservation)
+ * would be zero or negative and every openat/unlink/rename event would
+ * be dropped unconditionally. */
+static int av_max_inflight_work = AV_MAX_INFLIGHT_WORK_DEFAULT;
+module_param(av_max_inflight_work, int, 0444);
+MODULE_PARM_DESC(av_max_inflight_work,
+                 "max in-flight kprobe work allocations before handlers fail open (default 4096, within [1024, 65536] and above AV_EXEC_RESERVED_WORK (512), otherwise reset to the default at load)");
 /* Slots reserved exclusively for execve/execveat: openat/unlink/
  * unlinkat/rename/renameat/renameat2 are capped at
- * (AV_MAX_INFLIGHT_WORK - AV_EXEC_RESERVED_WORK) via
+ * (av_max_inflight_work - AV_EXEC_RESERVED_WORK) via
  * av_work_admit_nonexec() below, so a burst of those (e.g. `rm -rf`
  * on a big tree) can never fully starve exec detection - exec always
  * has this much headroom to itself, on top of whatever the non-exec
@@ -231,7 +282,7 @@ static inline bool av_work_admit_capped(unsigned int cap) {
  * whether the *_pre handler bails out early afterward (validation
  * failure) or the work item runs to completion on the workqueue. */
 static inline bool av_work_admit(void) {
-  return av_work_admit_capped(AV_MAX_INFLIGHT_WORK);
+  return av_work_admit_capped((unsigned int)av_max_inflight_work);
 }
 
 /* Same contract as av_work_admit(), for the non-exec hooks (openat/
@@ -239,7 +290,8 @@ static inline bool av_work_admit(void) {
  * full budget so those always leave AV_EXEC_RESERVED_WORK slots for
  * exec detection. */
 static inline bool av_work_admit_nonexec(void) {
-  return av_work_admit_capped(AV_MAX_INFLIGHT_WORK - AV_EXEC_RESERVED_WORK);
+  return av_work_admit_capped((unsigned int)(av_max_inflight_work -
+                                             AV_EXEC_RESERVED_WORK));
 }
 
 static inline void av_work_release(void) {
@@ -599,7 +651,7 @@ static int hash_file_multi(const char *path, const struct path *pwd,
   };
   void *buf = NULL;
   loff_t pos = 0;
-  ssize_t n;
+  ssize_t n = 0;
   int ret = 0;
   int i;
 
@@ -614,8 +666,8 @@ static int hash_file_multi(const char *path, const struct path *pwd,
   if (IS_ERR(f))
     return PTR_ERR(f);
 
-  /* Only hash regular files, and only up to MAX_HASH_FILE_SIZE - see
-   * the macro comment. A FIFO/device/socket reaching here means the
+  /* Only hash regular files, and only up to max_hash_file_size - see
+   * the param comment. A FIFO/device/socket reaching here means the
    * execve() that triggered this work already failed for the caller
    * (you can't exec a FIFO), but av_work_fn() queued the work before
    * that failure was knowable, so we still have to guard against it
@@ -624,7 +676,7 @@ static int hash_file_multi(const char *path, const struct path *pwd,
     ret = -EINVAL;
     goto out;
   }
-  if (i_size_read(file_inode(f)) > MAX_HASH_FILE_SIZE) {
+  if (i_size_read(file_inode(f)) > max_hash_file_size) {
     ret = -EFBIG;
     goto out;
   }
@@ -671,25 +723,30 @@ static int hash_file_multi(const char *path, const struct path *pwd,
       goto out;
   }
 
-  buf = kmalloc(READ_CHUNK_SIZE, GFP_KERNEL);
+  buf = kmalloc(read_chunk_size, GFP_KERNEL);
   if (!buf) {
     ret = -ENOMEM;
     goto out;
   }
 
-  while ((n = kernel_read(f, buf, READ_CHUNK_SIZE, &pos)) > 0) {
-    /* The i_size_read() check above only bounds the size at open
-     * time - a file that keeps growing while this loop reads it
-     * (e.g. a shell script appending to itself; ETXTBSY only
-     * protects an exec'd interpreter's own image, not a script file
-     * it's reading) would otherwise let kernel_read() keep consuming
-     * data forever, pinning this worker thread indefinitely. `pos`
-     * is kernel_read()'s own running byte count, so re-checking it
-     * against the same cap here catches that case the same way. */
-    if (pos > MAX_HASH_FILE_SIZE) {
-      ret = -EFBIG;
-      goto out;
-    }
+  /* Never read past max_hash_file_size: each iteration is capped to
+   * the remaining budget, so a file that grows mid-hash (e.g. a shell
+   * script appending to itself; ETXTBSY only protects an exec'd
+   * interpreter's own image, not a script file it's reading) is cut
+   * off at the cap instead of letting one more full-sized
+   * kernel_read() pull up to read_chunk_size bytes past it - and those
+   * over-budget bytes never enter the digest. When the budget is
+   * exhausted, the inode size is re-checked: over cap means the file
+   * genuinely outgrew it while hashing (-EFBIG, same as the open-time
+   * check); at or under cap means the reads simply reached EOF
+   * exactly at the boundary and hashing completes normally. */
+  while (pos < (loff_t)max_hash_file_size) {
+    size_t to_read = (size_t)((loff_t)max_hash_file_size - pos);
+    if (to_read > (size_t)read_chunk_size)
+      to_read = (size_t)read_chunk_size;
+    n = kernel_read(f, buf, to_read, &pos);
+    if (n <= 0)
+      break;
     for (i = 0; i < 3; i++) {
       if (!ctx[i].active)
         continue;
@@ -701,6 +758,11 @@ static int hash_file_multi(const char *path, const struct path *pwd,
      * file can spin ~16k iterations without sleeping - yield
      * periodically so a CONFIG_PREEMPT_NONE kernel stays responsive. */
     cond_resched();
+  }
+  if (pos >= (loff_t)max_hash_file_size &&
+      i_size_read(file_inode(f)) > (loff_t)max_hash_file_size) {
+    ret = -EFBIG;
+    goto out;
   }
   if (n < 0) {
     ret = n;
@@ -731,7 +793,7 @@ out:
  *
  * See docs/netlink-protocol.md's fail-open/fail-closed discussion:
  * when av_netlink_scan_request() below returns non-zero (no daemon
- * registered, or it didn't answer within DAEMON_TIMEOUT_MS), the
+   * registered, or it didn't answer within daemon_timeout_ms), the
  * original design always failed open (let the exec proceed, log it
  * as such) on the reasoning that avd crashing/restarting shouldn't
  * itself become a denial-of-service against every unsigned exec on
@@ -753,7 +815,7 @@ out:
  * exec's work item is processed - the process sees the policy as of
  * *verdict* time, not launch time. In practice this window is short
  * (no daemon means av_netlink_scan_request() fails fast, not after
- * the full DAEMON_TIMEOUT_MS), but it's not zero, especially under
+   * the full daemon_timeout_ms), but it's not zero, especially under
  * workqueue backlog. This isn't scoped to some OTHER process either -
  * it includes whatever shell/process issued the flip itself, if that
  * shell's own earlier exec's work item is still pending. Arguably
@@ -1030,7 +1092,7 @@ static void av_work_fn(struct work_struct *w) {
 
     nl_ret = av_netlink_scan_request(
         abs_path, digest.sha256, pid_nr(aw->target_pid), &verdict, rule_name,
-        sizeof(rule_name), DAEMON_TIMEOUT_MS);
+        sizeof(rule_name), (unsigned int)daemon_timeout_ms);
     if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
       snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
       av_kill(aw->target_pid, abs_path, "daemon", reason, &ident);
@@ -1864,6 +1926,46 @@ static int __init av_init(void) {
             av_wq_max_active, AV_WQ_MAX_ACTIVE_MIN, AV_WQ_MAX_ACTIVE_MAX,
             AV_WQ_MAX_ACTIVE_DEFAULT);
     av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
+  }
+  /* Load-time tunable validation (issue #14) - same reset-to-default
+   * with-a-warning contract as av_wq_max_active above, so a typo in
+   * modprobe.d can never load the module with a nonsensical (or
+   * memory-unsafe) knob: a non-positive read chunk, a hash cap the
+   * workqueue would chase forever, or an inflight budget at/below the
+   * exec reservation that would drop every non-exec event. */
+  if (read_chunk_size < READ_CHUNK_SIZE_MIN ||
+      read_chunk_size > READ_CHUNK_SIZE_MAX) {
+    pr_warn("kernel-av: read_chunk_size=%d out of range [%d,%d], "
+            "using default %d\n",
+            read_chunk_size, READ_CHUNK_SIZE_MIN, READ_CHUNK_SIZE_MAX,
+            READ_CHUNK_SIZE_DEFAULT);
+    read_chunk_size = READ_CHUNK_SIZE_DEFAULT;
+  }
+  if (max_hash_file_size < MAX_HASH_FILE_SIZE_MIN ||
+      max_hash_file_size > MAX_HASH_FILE_SIZE_MAX) {
+    pr_warn("kernel-av: max_hash_file_size=%d out of range [%d,%d], "
+            "using default %d\n",
+            max_hash_file_size, MAX_HASH_FILE_SIZE_MIN,
+            MAX_HASH_FILE_SIZE_MAX, MAX_HASH_FILE_SIZE_DEFAULT);
+    max_hash_file_size = MAX_HASH_FILE_SIZE_DEFAULT;
+  }
+  if (daemon_timeout_ms < DAEMON_TIMEOUT_MS_MIN ||
+      daemon_timeout_ms > DAEMON_TIMEOUT_MS_MAX) {
+    pr_warn("kernel-av: daemon_timeout_ms=%d out of range [%d,%d], "
+            "using default %d\n",
+            daemon_timeout_ms, DAEMON_TIMEOUT_MS_MIN, DAEMON_TIMEOUT_MS_MAX,
+            DAEMON_TIMEOUT_MS_DEFAULT);
+    daemon_timeout_ms = DAEMON_TIMEOUT_MS_DEFAULT;
+  }
+  if (av_max_inflight_work < AV_MAX_INFLIGHT_WORK_MIN ||
+      av_max_inflight_work > AV_MAX_INFLIGHT_WORK_MAX ||
+      av_max_inflight_work <= AV_EXEC_RESERVED_WORK) {
+    pr_warn("kernel-av: av_max_inflight_work=%d out of range [%d,%d] "
+            "or not above AV_EXEC_RESERVED_WORK (%d), using default %d\n",
+            av_max_inflight_work, AV_MAX_INFLIGHT_WORK_MIN,
+            AV_MAX_INFLIGHT_WORK_MAX, AV_EXEC_RESERVED_WORK,
+            AV_MAX_INFLIGHT_WORK_DEFAULT);
+    av_max_inflight_work = AV_MAX_INFLIGHT_WORK_DEFAULT;
   }
   av_wq = alloc_workqueue("kernel_av_wq", WQ_UNBOUND, av_wq_max_active);
   if (!av_wq) {
