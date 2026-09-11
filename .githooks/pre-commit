@@ -105,7 +105,9 @@ for f in "${STAGED[@]}"; do
             # model - exactly how test.yar's weight=100 override=true went
             # unnoticed before it was quarantined to tests/ (upstream #99).
             # Private building blocks never reach avd's scorer (skipped in
-            # yara_callback), and fixtures under tests/ deliberately use
+            # yara_callback); `global` rules do score, so they are linted
+            # like normal rules. Fixtures under tests/ deliberately use
+            # weight=100 + override - both are exempt.
             case "$f" in
                 rules/*)
                     echo "  - yara weight lint: $f"
@@ -118,12 +120,42 @@ for f in "${STAGED[@]}"; do
                         }
                         {
                             line = $0
-                            sub(/\/\/.*$/, "", line)
-                            gsub(/\/\*.*\*\//, "", line)
-                            if (line ~ /^[ \t]*(private[ \t]+)?rule[ \t]+[A-Za-z_]/) {
+                            # Stateful /* ... */ tracking: a `weight = ...`
+                            # line inside a multiline comment must not count.
+                            # A `//` opening before any `/*` is a line comment
+                            # (so `// /*` never opens a block); `//` inside an
+                            # already-open block is just comment text.
+                            if (in_block) {
+                                if (index(line, "*/") == 0)
+                                    next
+                                line = substr(line, index(line, "*/") + 2)
+                                in_block = 0
+                            }
+                            p_line = index(line, "//")
+                            p_blk = index(line, "/*")
+                            if (p_line > 0 && (p_blk == 0 || p_line < p_blk))
+                                line = substr(line, 1, p_line - 1)
+                            while ((p_open = index(line, "/*")) > 0) {
+                                p_end = index(substr(line, p_open + 2), "*/")
+                                if (p_end > 0)
+                                    line = substr(line, 1, p_open - 1) substr(line, p_open + p_end + 3)
+                                else {
+                                    line = substr(line, 1, p_open - 1)
+                                    in_block = 1
+                                    break
+                                }
+                            }
+                            if (line ~ /^[ \t]*((private|global)[ \t]+)*rule[ \t]+[A-Za-z_]/) {
                                 rest = line
                                 sub(/^[ \t]*/, "", rest)
-                                is_private = sub(/^private[ \t]+/, "", rest)
+                                # `global` rules score like normal rules - only
+                                # `private` building blocks are exempt.
+                                is_private = 0
+                                while (rest ~ /^(private|global)[ \t]+/) {
+                                    if (rest ~ /^private[ \t]+/)
+                                        is_private = 1
+                                    sub(/^(private|global)[ \t]+/, "", rest)
+                                }
                                 sub(/^rule[ \t]+/, "", rest)
                                 if (match(rest, /[^A-Za-z0-9_]/))
                                     rule_name = substr(rest, 1, RSTART - 1)
