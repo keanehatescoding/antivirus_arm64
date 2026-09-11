@@ -97,6 +97,113 @@ for f in "${STAGED[@]}"; do
                 echo "  ! yara CLI not installed - skipping rule syntax check for $f"
                 echo "    (sudo pacman -S yara  /  apt install yara)"
             fi
+            # Weight lint, production rules only: avd.c sums every matched
+            # rule's `weight` meta and convicts at >= 100
+            # (MALICIOUS_SCORE_THRESHOLD), so a production rule without a
+            # weight scores a silent 0 (dead on arrival) while weight >= 100
+            # lets a single rule convict alone, bypassing the combination
+            # model - exactly how test.yar's weight=100 override=true went
+            # unnoticed before it was quarantined to tests/ (upstream #99).
+            # Private building blocks never reach avd's scorer (skipped in
+            # yara_callback); `global` rules do score, so they are linted
+            # like normal rules. Fixtures under tests/ deliberately use
+            # weight=100 + override - both are exempt.
+            case "$f" in
+                rules/*)
+                    echo "  - yara weight lint: $f"
+                    awk '
+                        function fail(msg) { print FILENAME": "msg > "/dev/stderr"; bad = 1 }
+                        function close_rule() {
+                            if (!is_private && !has_weight)
+                                fail("rule " rule_name ": missing `weight` meta (avd.c scores it a silent 0)")
+                            in_rule = 0; in_meta = 0
+                        }
+                        {
+                            line = $0
+                            # Stateful /* ... */ tracking: a `weight = ...`
+                            # line inside a multiline comment must not count.
+                            # A `//` opening before any `/*` is a line comment
+                            # (so `// /*` never opens a block); `//` inside an
+                            # already-open block is just comment text.
+                            if (in_block) {
+                                if (index(line, "*/") == 0)
+                                    next
+                                line = substr(line, index(line, "*/") + 2)
+                                in_block = 0
+                            }
+                            p_line = index(line, "//")
+                            p_blk = index(line, "/*")
+                            if (p_line > 0 && (p_blk == 0 || p_line < p_blk))
+                                line = substr(line, 1, p_line - 1)
+                            while ((p_open = index(line, "/*")) > 0) {
+                                p_end = index(substr(line, p_open + 2), "*/")
+                                if (p_end > 0)
+                                    line = substr(line, 1, p_open - 1) substr(line, p_open + p_end + 3)
+                                else {
+                                    line = substr(line, 1, p_open - 1)
+                                    in_block = 1
+                                    break
+                                }
+                            }
+                            if (line ~ /^[ \t]*((private|global)[ \t]+)*rule[ \t]+[A-Za-z_]/) {
+                                rest = line
+                                sub(/^[ \t]*/, "", rest)
+                                # `global` rules score like normal rules - only
+                                # `private` building blocks are exempt.
+                                is_private = 0
+                                while (rest ~ /^(private|global)[ \t]+/) {
+                                    if (rest ~ /^private[ \t]+/)
+                                        is_private = 1
+                                    sub(/^(private|global)[ \t]+/, "", rest)
+                                }
+                                sub(/^rule[ \t]+/, "", rest)
+                                if (match(rest, /[^A-Za-z0-9_]/))
+                                    rule_name = substr(rest, 1, RSTART - 1)
+                                else
+                                    rule_name = rest
+                                in_rule = 1; in_meta = 0; has_weight = 0
+                                header_line = NR
+                                # A single-line rule carries everything after
+                                # the `{` on this same line - reprocess the
+                                # remainder below instead of skipping it.
+                                if (line ~ /{/)
+                                    sub(/^[^{]*{/, "", line)
+                                else
+                                    next
+                            } else if (!in_rule) {
+                                next
+                            }
+                            if (in_rule && line ~ /^[ \t]*meta[ \t]*:/) {
+                                in_meta = 1
+                                # Keep anything after `meta:` on the same line -
+                                # single-line rules put entries there.
+                                sub(/^[^:]*:/, "", line)
+                            }
+                            if (in_rule && line ~ /^[ \t]*(strings|condition)[ \t]*:/)
+                                in_meta = 0
+                            if (in_rule && in_meta && !is_private && line ~ /^[ \t]*weight[ \t]*=/) {
+                                rest = line
+                                sub(/^.*weight[ \t]*=[ \t]*/, "", rest)
+                                sub(/[ \t;].*$/, "", rest)
+                                # `+ 0` forces a numeric comparison: without it
+                                # awk compares numeric-looking strings
+                                # lexicographically ("100" <= "99").
+                                if (rest ~ /^-?[0-9]+$/ && (rest + 0) >= 1 && (rest + 0) <= 99)
+                                    has_weight = 1
+                                else {
+                                    fail("rule " rule_name ": weight must be an integer 1-99 (got `" rest "`); >= 100 convicts alone at MALICIOUS_SCORE_THRESHOLD")
+                                    has_weight = 1
+                                }
+                            }
+                            # Rule end: `}` on its own line (repo style), or
+                            # anywhere on a single-line rule.
+                            if (in_rule && (line ~ /^[ \t]*}[ \t]*$/ || (NR == header_line && line ~ /}/)))
+                                close_rule()
+                        }
+                        END { exit (bad ? 1 : 0) }
+                    ' "$f" || FAIL=1
+                    ;;
+            esac
             ;;
         tests/*.sh|.githooks/*)
             if command -v shellcheck >/dev/null 2>&1; then
