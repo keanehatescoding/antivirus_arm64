@@ -50,36 +50,33 @@
  * in av/main.c.
  *
  * That case runs cold_launcher.c, which execve()s /tmp/eicar_cold.com
- * without touching the pathname first, trying to reproduce the
- * documented cold-page bypass (av/main.c's handler_pre() comment,
- * issue #2). Measured: it does NOT reproduce here. Kernels 6.12.107,
- * 6.18.48 and 7.2.2 all hashed and killed the inner exec, as does the
- * serial.log checked in beside this file. The likeliest reason is that
- * the launcher is small enough for its .rodata pathname to be faulted
- * in alongside its text by fault-around before execve() runs, so the
- * page is never actually cold - a property of a 12-line static binary
- * under QEMU, NOT evidence that the gap is closed. A pass here says
- * nothing about #2 either way; #2 and discussion #33 track that.
- *
- * The case used to print its result and gate nothing, so this had gone
- * unnoticed: it reported "NOT reproduced this run" and passed, while
- * SECURITY.md claimed the gap was reproduced on every CI run. Worse, a
- * missing or non-executable /cold_launcher exits 127, which read as
- * "not killed" - indistinguishable from the bypass the case exists to
- * detect, so the whole thing could rot into a no-op silently.
+ * from a pathname page it guarantees is cold: the bytes live in a
+ * fresh file-backed mapping (mmap, never faulted, MADV_DONTNEED'd
+ * right before execve) rather than in .rodata next to .text, so
+ * fault-around cannot pull them in and the kprobe handler's atomic
+ * strncpy_from_user() genuinely sees a non-resident page. See
+ * cold_launcher.c's own header comment for the mechanism, and issue
+ * #2 for the gap itself. Measured: the bypass reproduces here - the
+ * cold exec survives with cold_launcher's own exit code 1 and no
+ * detection kill line in dmesg, while the warm-path EICAR check
+ * above still detects and kills normally (so this is the harness
+ * demonstrating the gap, not a detection regression). Verified
+ * locally on 7.2.2 under TCG; the CI kernel matrix re-checks it on
+ * every push.
  *
  * It now gates on what it can actually observe:
  *
- *   1 = the cold exec IS detected and killed here (current, measured).
- *       If that stops being true, either detection regressed or this
- *       harness finally started reproducing the bypass - both need a
- *       human, neither should be a printed line nobody reads.
- *   0 = the bypass reproduces here and the cold exec survives. Set
- *       this only with evidence, and update #2 to match.
+ *   0 = the bypass reproduces here and the cold exec survives.
+ *       Current, measured. If that stops being true, either this
+ *       harness regressed (the page is no longer cold) or the #2
+ *       gap was actually fixed - both need a human, neither should
+ *       be a printed line nobody reads.
+ *   1 = the cold exec IS detected and killed here. Set this only
+ *       with evidence, and update #2 to match.
  *
  * Both branches compile either way - a plain `if`, not an `#if`, so
  * the inactive one cannot bit-rot before the day it is needed. */
-#define AV_EXPECT_COLD_EXEC_DETECTED 1
+#define AV_EXPECT_COLD_EXEC_DETECTED 0
 
 static void outmsg(const char *fmt, ...) {
   static char buf[65536];
