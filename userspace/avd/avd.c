@@ -607,6 +607,22 @@ static int load_fuzzy_corpus(const char *path) {
     if (!parse_corpus_line(line, &hash_part, &name_part, "fuzzy"))
       continue;
 
+    /* Reject hashes libfuzzy itself cannot parse now, at load, rather
+     * than carrying them as dead entries that can never match (see
+     * check_fuzzy_corpus(): fuzzy_compare() just scores them -1
+     * forever, silently). Self-compare is the oracle - a valid
+     * signature scores 100 against itself, a malformed one errors -
+     * so this uses the library's own parser, not a reimplemented
+     * format check that could drift out of sync with what the
+     * matcher actually accepts. */
+    if (fuzzy_compare(hash_part, hash_part) < 0) {
+      fprintf(stderr,
+              "avd: skipping malformed fuzzy corpus line "
+              "(unparseable hash): %s\n",
+              name_part);
+      continue;
+    }
+
     if (fuzzy_corpus_count == capacity) {
       struct fuzzy_corpus_entry *grown;
 
@@ -937,6 +953,20 @@ static int load_tlsh_corpus(const char *path) {
               "avd: skipping TLSH corpus line with an oversized hash "
               "(%zu chars, max %zu): %s\n",
               strlen(hash_part), hash_maxlen, name_part);
+      continue;
+    }
+    /* Same load-time rejection as load_fuzzy_corpus() above, using
+     * av_tlsh_diff()'s own tlsh_from_hex() parse as the oracle - a
+     * valid digest diffs 0 against itself, anything else is -1.
+     * Without this, a short-but-not-oversized garbage entry loads
+     * fine and is then re-skipped on every single scan by
+     * check_tlsh_corpus()'s `diff < 0` continue instead of being
+     * rejected once here with a clear warning. */
+    if (av_tlsh_diff(hash_part, hash_part) < 0) {
+      fprintf(stderr,
+              "avd: skipping malformed TLSH corpus line "
+              "(unparseable hash): %s\n",
+              name_part);
       continue;
     }
 
