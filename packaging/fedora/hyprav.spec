@@ -225,6 +225,6 @@ dkms remove -m hyprav-av -v %{version} --all || :
 %{_datadir}/applications/av-gui.desktop
 
 %changelog
-* Tue Aug 25 2026 Your Name <you@example.com> - 0.9.0.129.gc2051d7-1
+* Tue Aug 25 2026 keanehatescoding <keanembae@gmail.com> - 0.9.0.129.gc2051d7-1
 - Initial packaging: hyprav-dkms (av.ko kernel module), hyprav
   (avd daemon + avctl CLI), hyprav-gui (GTK4 console).

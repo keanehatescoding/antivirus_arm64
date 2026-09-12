@@ -98,8 +98,9 @@ jobs:
       - name: lintian (packaging metadata regression check)
         # Issue #13: nothing caught packaging-metadata regressions
         # automatically. --fail-on error keeps this green on warnings
-        # (e.g. the placeholder-maintainer findings, item 1, which need
-        # the owner's real identity) while errors break the build.
+        # while errors break the build (the placeholder-maintainer
+        # warning from item 1 is gone now that the files below carry
+        # the real identity).
         run: |
           set -euxo pipefail
           apt-get install -y -qq --no-install-recommends lintian
@@ -415,8 +416,7 @@ jobs:
         # accurate technical terms to dodge a spellchecker would be
         # worse), no-binary (hyprav-dkms ships DKMS *source* by design,
         # like its deb/arch siblings). Any OTHER error fails the build;
-        # warnings stay informational (placeholder-maintainer style
-        # findings until item 1 is resolved by the owner).
+        # warnings stay informational.
         # Note %check above already ran inside `rpmbuild -bb`, so this
         # step only lints metadata, it doesn't re-run tests.
         run: |
