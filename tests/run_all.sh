@@ -52,6 +52,11 @@ echo
 echo "### test_avd_sigroute.sh (SIGINT/SIGTERM routing to avd main thread) ###"
 # Same no-root-needed reasoning as test_sha256.sh above.
 "$REPO_ROOT/tests/test_avd_sigroute.sh" || FAIL=1
+echo
+echo "### test_regression_10_14.sh (static checks pinning the #10/#14 fixes) ###"
+# Same no-root-needed reasoning as test_sha256.sh above - pure
+# source-level greps, no module, no VM.
+"$REPO_ROOT/tests/test_regression_10_14.sh" || FAIL=1
 
 echo
 echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
