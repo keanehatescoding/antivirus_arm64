@@ -40,6 +40,8 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define EICAR                                                                \
@@ -90,21 +92,79 @@ static void outmsg(const char *fmt, ...) {
     return;
   if ((size_t)n >= sizeof(buf))
     n = sizeof(buf) - 1;
-  write(1, buf, (size_t)n);
+
+  /* A short write here used to be silently discarded, which on a tty
+   * under load loses the tail of a message (and the dmesg dumps below
+   * are the largest writes this program makes). Loop until the whole
+   * buffer is handed to the kernel; drain_console() is what then gets
+   * it out of the UART. */
+  {
+    size_t remaining = (size_t)n;
+    const char *p = buf;
+
+    while (remaining > 0) {
+      ssize_t w = write(1, p, remaining);
+      if (w < 0) {
+        if (errno == EINTR)
+          continue;
+        return; /* nothing useful left to do - this IS the error path */
+      }
+      if (w == 0)
+        return;
+      p += w;
+      remaining -= (size_t)w;
+    }
+  }
+}
+
+/* write(2) returning means the bytes reached the tty's output queue,
+ * NOT that the UART has shifted them out. reboot(RB_POWER_OFF)
+ * discards whatever is still sitting in the pl011 TX FIFO, so a
+ * message written immediately before poweroff can be lost outright -
+ * which is exactly how a fully-passing run lost its "QEMU_TEST: PASS"
+ * line on the 6.12.107 leg of PR #44 while the identical commit passed
+ * on the push run of the same workflow two minutes earlier - every
+ * assertion had already printed, the verdict was the only thing
+ * missing. Kernel printks survive this because the console write path
+ * polls the UART directly instead of queueing, which is why
+ * "reboot: Power down" still made it into that log and PASS did not.
+ *
+ * sync() does not help: it flushes filesystems, not ttys. tcdrain()
+ * is the call that blocks until the output has actually been
+ * transmitted. The nanosleep() after it is a cheap backstop for the
+ * case where fd 1 is not a tty at all (tcdrain -> ENOTTY), so a
+ * future harness that redirects output somewhere else does not
+ * silently regress to losing its verdict. */
+static void drain_console(void) {
+  while (tcdrain(1) != 0) {
+    if (errno == EINTR)
+      continue;
+    break;
+  }
+  {
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000L};
+    nanosleep(&ts, NULL);
+  }
+}
+
+/* Single exit path for every verdict in this file - drain first, then
+ * sync, then power off. Nothing here should call reboot() directly. */
+static void poweroff_now(void) {
+  drain_console();
+  sync();
+  reboot(RB_POWER_OFF);
 }
 
 static void die(const char *msg) __attribute__((noreturn));
 static void die(const char *msg) {
   outmsg("QEMU_TEST: FAIL: %s: %s\n", msg, strerror(errno));
-  sync();
-  reboot(RB_POWER_OFF);
+  poweroff_now();
   _exit(1);
 }
 
 static void pass_and_poweroff(void) {
   outmsg("QEMU_TEST: PASS\n");
-  sync();
-  reboot(RB_POWER_OFF);
+  poweroff_now();
   _exit(0);
 }
 
@@ -270,14 +330,14 @@ int main(int argc, char *const argv[]) {
     if (killed) {
       outmsg("QEMU_TEST: FAIL: clean-marker exec was killed (false "
              "positive)\n");
-      reboot(RB_POWER_OFF);
+      poweroff_now();
       return 1;
     }
     if (!exited || code != 42) {
       outmsg("QEMU_TEST: FAIL: clean-marker exec exited unexpectedly "
              "(exited=%d code=%d)\n",
              exited, code);
-      reboot(RB_POWER_OFF);
+      poweroff_now();
       return 1;
     }
   }
@@ -296,7 +356,7 @@ int main(int argc, char *const argv[]) {
              "(exited=%d code=%d)\n",
              exited, code);
       outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
-      reboot(RB_POWER_OFF);
+      poweroff_now();
       return 1;
     }
 
@@ -308,7 +368,7 @@ int main(int argc, char *const argv[]) {
         outmsg("QEMU_TEST: FAIL: EICAR was killed but dmesg is missing the "
                "expected structured detection line\n");
         outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", log);
-        reboot(RB_POWER_OFF);
+        poweroff_now();
         return 1;
       }
     }
@@ -349,7 +409,7 @@ int main(int argc, char *const argv[]) {
              "the av/main.c gap it is aimed at.\n",
              exited, code);
       outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
-      reboot(RB_POWER_OFF);
+      poweroff_now();
       return 1;
     }
 
@@ -379,7 +439,7 @@ int main(int argc, char *const argv[]) {
                  "to silence by flipping the toggle.\n",
                  killed, detected, exited, code);
           outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", log);
-          reboot(RB_POWER_OFF);
+          poweroff_now();
           return 1;
         }
         outmsg("QEMU_TEST: cold exec detected and killed - note this "
@@ -397,7 +457,7 @@ int main(int argc, char *const argv[]) {
                  "and SECURITY.md to match.\n",
                  killed, detected);
           outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", log);
-          reboot(RB_POWER_OFF);
+          poweroff_now();
           return 1;
         }
         outmsg("QEMU_TEST: cold-pathname bypass reproduced as documented "

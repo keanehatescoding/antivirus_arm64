@@ -246,16 +246,36 @@ jobs:
           cat serial.log || true
           echo "::endgroup::"
 
-          # init prints its final PASS/FAIL line and syncs BEFORE calling
-          # reboot(RB_POWER_OFF) - on a kernel without ACPI poweroff
-          # support that just halts the CPU rather than actually
-          # terminating QEMU, which is why the command above is allowed
-          # to end via the `timeout` wrapper instead of a clean exit;
-          # the log has already captured everything that matters by
-          # then. What actually gates pass/fail is the marker text
-          # below, not QEMU's own exit code.
+          # init prints its final PASS/FAIL line, drains the console
+          # (tcdrain - see init.c's drain_console(), sync() alone does
+          # NOT flush a tty) and only then calls reboot(RB_POWER_OFF) -
+          # on a kernel without ACPI poweroff support that just halts
+          # the CPU rather than actually terminating QEMU, which is why
+          # the command above is allowed to end via the `timeout`
+          # wrapper instead of a clean exit; the log has already
+          # captured everything that matters by then. What actually
+          # gates pass/fail is the marker text below, not QEMU's own
+          # exit code.
           if ! grep -q "QEMU_TEST: PASS" serial.log; then
-            echo "::error::QEMU_TEST: PASS marker not found - see log above"
+            # Distinguish a real test failure from a truncated log. init
+            # prints exactly one terminal marker, so "neither PASS nor
+            # FAIL" means the verdict never made it out of the guest -
+            # historically a UART FIFO discarded at poweroff, which made
+            # a passing run look like a failing one (same commit, one
+            # leg, not reproducible on rerun). Do not paper over this by
+            # retrying: it means drain_console() stopped working.
+            if grep -q "QEMU_TEST: FAIL" serial.log; then
+              echo "::error::QEMU_TEST: FAIL reported by init - see log above"
+            elif grep -q "QEMU_TEST: init started" serial.log; then
+              echo "::error::serial log ends with no QEMU_TEST verdict - init" \
+                   "booted but neither PASS nor FAIL reached the log." \
+                   "Suspect console output lost at poweroff (init.c" \
+                   "drain_console) or a guest hang before the verdict;" \
+                   "this is a harness defect, not a detection result."
+            else
+              echo "::error::init never started - boot failed before the" \
+                   "test ran; see log above"
+            fi
             exit 1
           fi
 
