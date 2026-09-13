@@ -184,6 +184,35 @@ else
     fail "queue overflow is not surfaced - execs can pass unchecked in silence"
 fi
 
+# A responder thread must never drive the scan pipeline's drain flag
+# itself. shutting_down retires every scan worker and makes
+# enqueue_scan_task() drop each later kernel request, but it does not
+# touch `running`, so the main thread stays parked in
+# nl_recvmsgs_default(): avd would sit there alive and registered,
+# holding the module's single daemon slot (which av_nl_register_doit()
+# will not hand to a replacement - -EBUSY, the #10 fix) while answering
+# nothing. Silent, and unrecoverable without a manual kill, so it is
+# pinned here rather than left to review.
+if grep -q 'shutting_down *=' <<<"$MAIN_BODY"; then
+    fail "a responder thread assigns shutting_down - kills scanning while avd stays up"
+else
+    pass "responders never set the scan pipeline's drain flag themselves"
+fi
+if grep -q 'kill(getpid()' <<<"$MAIN_BODY"; then
+    pass "an unrecoverable gate failure signals the process to shut down"
+else
+    fail "no process-directed signal - an unrecoverable gate failure cannot reach main()"
+fi
+# raise() is pthread_kill() on the calling thread, and main() blocks
+# SIGINT/SIGTERM before spawning any thread so that only the main
+# thread can receive them - so a raised signal would sit pending in the
+# responder forever and shut nothing down.
+if grep -qE '\<raise\(' <<<"$MAIN_BODY"; then
+    fail "raise() from a responder: SIGINT/SIGTERM are blocked there, so it never lands"
+else
+    pass "termination is process-directed, not raised on a thread that blocks it"
+fi
+
 STOP_BODY="$(extract_c_func "$AVD" fanexec_stop | strip_c_comments)"
 # Closing the fanotify fd releases every still-pending permission event
 # as allowed, so it must not happen while a responder still holds one.

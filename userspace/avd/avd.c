@@ -2166,6 +2166,20 @@ static int fanexec_threads = AVD_FANEXEC_THREADS_DEFAULT;
 static pthread_t *fanexec_tids;
 static int fanexec_tids_started;
 
+/* Set by a responder that hits an unrecoverable gate failure. Separate
+ * from `shutting_down` on purpose: `shutting_down` is the *scan
+ * pipeline's* drain flag, and a responder setting it directly retires
+ * every scan worker and makes enqueue_scan_task() drop each later
+ * kernel request, while the main thread stays parked in
+ * nl_recvmsgs_default() with `running` still 1. That leaves avd alive
+ * and registered - holding the module's single daemon slot, which
+ * av_nl_register_doit() refuses to hand to a replacement (-EBUSY, the
+ * #10 fix) - while answering nothing at all. This flag stops only the
+ * responders; terminating the process is the main thread's job, via
+ * the ordinary signal path below. sig_atomic_t because it is also
+ * read after the signal it raises. */
+static volatile sig_atomic_t fanexec_aborted;
+
 /* Counters are reported at shutdown rather than per-event: an exec
  * gate on a busy mount is a hot path, and a line per allowed exec
  * would be its own denial of service. Guarded by their own lock -
@@ -2300,7 +2314,7 @@ static void *fanexec_main(void *arg) {
     return NULL;
   }
 
-  while (!shutting_down) {
+  while (!shutting_down && !fanexec_aborted) {
     struct pollfd pfd = {.fd = fanexec_fd, .events = POLLIN, .revents = 0};
     const struct fanotify_event_metadata *md;
     ssize_t len;
@@ -2329,9 +2343,37 @@ static void *fanexec_main(void *arg) {
       if (md->vers != FANOTIFY_METADATA_VERSION) {
         fprintf(stderr,
                 "avd: fanotify: ABI mismatch (kernel v%u, built against v%u) - "
-                "disabling the exec gate\n",
+                "terminating (the exec gate was requested and cannot run)\n",
                 md->vers, FANOTIFY_METADATA_VERSION);
-        shutting_down = true;
+        /* The whole daemon goes down, not just the gate. The operator
+         * asked for exec enforcement; continuing without it is the
+         * silent-degradation failure this gate exists to avoid, and
+         * fanexec_init() already takes that position for a gate that
+         * cannot start. This is the same condition arriving later.
+         *
+         * kill(getpid()), not raise(): raise() is pthread_kill() on
+         * the calling thread, and main() blocks SIGINT/SIGTERM before
+         * spawning anything precisely so only the main thread can
+         * receive them - a raised signal would sit pending in this
+         * responder forever. A process-directed signal is delivered to
+         * the one thread that has it unblocked, whose
+         * nl_recvmsgs_default() then EINTRs out (sa_flags = 0, no
+         * SA_RESTART) and runs the ordinary shutdown sequence: set
+         * `shutting_down` under the queue lock, drain and join the
+         * scan workers, then fanexec_stop(). Deliberately NOT setting
+         * `shutting_down` here - see fanexec_aborted's comment for
+         * what a responder doing that leaves behind.
+         *
+         * md->fd is not closed: a version mismatch means this struct's
+         * layout is exactly what we cannot trust, so there is no field
+         * here safe to read as an fd. The pending permission events go
+         * back to the kernel as allowed when fanexec_stop() closes
+         * fanexec_fd - a fail-open window that AVD_FANOTIFY_FAIL_CLOSED
+         * cannot narrow, because answering an event requires parsing
+         * it. After that the module's own fail-open/fail-closed policy
+         * governs, as it does whenever avd is not running. */
+        fanexec_aborted = 1;
+        kill(getpid(), SIGTERM);
         break;
       }
       if (md->fd == FAN_NOFD) {
@@ -4044,7 +4086,9 @@ int main(int argc, char **argv) {
       unlink(control_sock_path);
     }
     free(workers);
-    exit_code = startup_failed ? 1 : 0;
+    /* fanexec_aborted counts as a failed run for the same reason
+     * startup_failed does: the gate was asked for and did not run. */
+    exit_code = (startup_failed || fanexec_aborted) ? 1 : 0;
   }
 
   nl_socket_free(sock);
