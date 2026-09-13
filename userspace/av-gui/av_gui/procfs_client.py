@@ -1,9 +1,11 @@
 """Reads signatures/trust/protected-paths/policy via `avctl save -`
 (stdout mode - see do_save() in userspace/avctl/avctl.c) rather than
 reading /proc/kernel_av_* directly: this reuses avctl's existing,
-already-tested line format instead of a second parser in Python, and
-works fully unprivileged (avctl save only reads those /proc files, it
-never writes). See docs/avd-socket-protocol.md's note on why the GUI
+already-tested line format instead of a second parser in Python. Note
+this needs root: the IOC entries have been 0600 owner-only reads
+since #32, so a non-root `avctl save -` fails with EACCES (surfaced
+here as ProcfsError) and only the 0644 daemon-policy entry stays
+world-readable. See docs/avd-socket-protocol.md's note on why the GUI
 reuses this format instead of adding a second read protocol.
 """
 import subprocess
@@ -13,9 +15,10 @@ from . import avctl_path, host_exec
 
 class ProcfsError(Exception):
     """Raised when `avctl save -` can't be run or exits non-zero -
-    typically means the kernel module isn't loaded (see avctl's own
-    "is the av module loaded?" hint in its error output, passed
-    through here via stderr)."""
+    either the kernel module isn't loaded (see avctl's own "is the av
+    module loaded?" hint in its error output, passed through here via
+    stderr) or the caller isn't root (the IOC entries are 0600
+    owner-only since #32, so avctl reports a permission hint instead)."""
 
 
 def read_state():

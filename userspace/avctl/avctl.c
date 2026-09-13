@@ -180,17 +180,41 @@ static void usage(const char *prog)
         prog, prog, prog, prog, prog, prog);
 }
 
-static int do_list_generic(const char *path, const char *header_algo)
+/* Every /proc read below goes through here so the failure hint names
+ * the actual failure mode. Since #32 the IOC entries (signatures,
+ * trusted, protected) are 0600 owner-only reads, so an unprivileged
+ * `list`/`save` fails with EACCES on a healthy, loaded module - the
+ * old unconditional "is the module loaded?" hint then sends the
+ * operator down the wrong path (re-running insmod fixes nothing).
+ * errno is captured before fprintf, which is allowed to clobber it. */
+static FILE *open_proc_read(const char *path)
 {
     FILE *f = fopen(path, "r");
-    char line[512];
 
     if (!f) {
-        fprintf(stderr, "avctl: could not open %s: %s\n"
-                         "(is the av module loaded? try: sudo insmod av.ko)\n",
-                path, strerror(errno));
-        return 1;
+        int err = errno;
+
+        if (err == EACCES)
+            fprintf(stderr,
+                    "avctl: could not open %s: %s\n"
+                    "(these entries are readable only by root; re-run as root)\n",
+                    path, strerror(err));
+        else
+            fprintf(stderr,
+                    "avctl: could not open %s: %s\n"
+                    "(is the av module loaded? try: sudo insmod av.ko)\n",
+                    path, strerror(err));
     }
+    return f;
+}
+
+static int do_list_generic(const char *path, const char *header_algo)
+{
+    FILE *f = open_proc_read(path);
+    char line[512];
+
+    if (!f)
+        return 1;
 
     if (header_algo) {
         printf("%-8s %-64s %s\n", header_algo, "HASH", "NAME");
@@ -225,15 +249,11 @@ static int do_trust_list(void)
  * line, not hash/name pairs. */
 static int do_protect_list(void)
 {
-    FILE *f = fopen(PROTECTED_PROC_PATH, "r");
+    FILE *f = open_proc_read(PROTECTED_PROC_PATH);
     char line[PATH_MAX + 8];
 
-    if (!f) {
-        fprintf(stderr, "avctl: could not open %s: %s\n"
-                         "(is the av module loaded? try: sudo insmod av.ko)\n",
-                PROTECTED_PROC_PATH, strerror(errno));
+    if (!f)
         return 1;
-    }
 
     printf("PROTECTED PATH\n");
     while (fgets(line, sizeof(line), f)) {
@@ -311,9 +331,14 @@ static int write_command_to(const char *path, const char *cmd)
 
     if (fd < 0) {
         saved_errno = errno;
-        fprintf(stderr, "avctl: could not open %s: %s\n"
-                         "(is the av module loaded? try: sudo insmod av.ko)\n",
-                path, strerror(saved_errno));
+        if (saved_errno == EACCES || saved_errno == EPERM)
+            fprintf(stderr, "avctl: could not open %s: %s\n"
+                            "(kernel state is writable only by root; re-run as root)\n",
+                    path, strerror(saved_errno));
+        else
+            fprintf(stderr, "avctl: could not open %s: %s\n"
+                            "(is the av module loaded? try: sudo insmod av.ko)\n",
+                    path, strerror(saved_errno));
         return -saved_errno;
     }
 
@@ -382,8 +407,10 @@ static int write_command(const char *cmd)
  * path == "-": writes the same replayable line format straight to
  * stdout instead of a file - used by callers that want machine-
  * parseable current state without a throwaway save file (the GUI's
- * unprivileged periodic refresh of signatures/trust/protected/policy
- * runs plain `avctl save -`, no root needed - see
+ * periodic refresh of signatures/trust/protected/policy runs plain
+ * `avctl save -` as root - the IOC entries have been 0600
+ * owner-only reads since #32, so an unprivileged refresh fails here
+ * with EACCES and the permission hint from open_proc_read() - see
  * docs/avd-socket-protocol.md's note on why this reuses save's
  * existing format rather than adding a second read protocol). No
  * atomic tmp-file+rename dance in this mode: that exists to protect an
@@ -705,14 +732,12 @@ static int do_save(const char *path)
         werr |= fprintf(out, "# kernel-av state dump - replay with: avctl load %s\n", path) < 0;
     }
 
-    in = fopen(PROC_PATH, "r");
+    in = open_proc_read(PROC_PATH);
     if (!in) {
-        fprintf(stderr, "avctl: could not open %s: %s\n"
-                         "(is the av module loaded? try: sudo insmod av.ko)\n",
-                PROC_PATH, strerror(errno));
         save_abort(out, &dest, tmp_path, to_stdout);
         return 1;
     }
+
     while (fgets(line, sizeof(line), in)) {
         char algo[8], hex[65], name[128];
 
@@ -723,14 +748,12 @@ static int do_save(const char *path)
     }
     fclose(in);
 
-    in = fopen(TRUST_PROC_PATH, "r");
+    in = open_proc_read(TRUST_PROC_PATH);
     if (!in) {
-        fprintf(stderr, "avctl: could not open %s: %s\n"
-                         "(is the av module loaded? try: sudo insmod av.ko)\n",
-                TRUST_PROC_PATH, strerror(errno));
         save_abort(out, &dest, tmp_path, to_stdout);
         return 1;
     }
+
     while (fgets(line, sizeof(line), in)) {
         char hex[65], name[128];
 
@@ -741,14 +764,12 @@ static int do_save(const char *path)
     }
     fclose(in);
 
-    in = fopen(PROTECTED_PROC_PATH, "r");
+    in = open_proc_read(PROTECTED_PROC_PATH);
     if (!in) {
-        fprintf(stderr, "avctl: could not open %s: %s\n"
-                         "(is the av module loaded? try: sudo insmod av.ko)\n",
-                PROTECTED_PROC_PATH, strerror(errno));
         save_abort(out, &dest, tmp_path, to_stdout);
         return 1;
     }
+
     while (fgets(line, sizeof(line), in)) {
         size_t len = strlen(line);
 
@@ -761,14 +782,12 @@ static int do_save(const char *path)
     }
     fclose(in);
 
-    in = fopen(POLICY_PROC_PATH, "r");
+    in = open_proc_read(POLICY_PROC_PATH);
     if (!in) {
-        fprintf(stderr, "avctl: could not open %s: %s\n"
-                         "(is the av module loaded? try: sudo insmod av.ko)\n",
-                POLICY_PROC_PATH, strerror(errno));
         save_abort(out, &dest, tmp_path, to_stdout);
         return 1;
     }
+
     if (fgets(line, sizeof(line), in)) {
         size_t len = strlen(line);
 
@@ -1214,15 +1233,12 @@ static int do_policy(int argc, char **argv)
     }
 
     if (!strcmp(argv[2], "get")) {
-        FILE *f = fopen(POLICY_PROC_PATH, "r");
+        FILE *f = open_proc_read(POLICY_PROC_PATH);
         char line[32];
 
-        if (!f) {
-            fprintf(stderr, "avctl: could not open %s: %s\n"
-                             "(is the av module loaded? try: sudo insmod av.ko)\n",
-                    POLICY_PROC_PATH, strerror(errno));
+        if (!f)
             return 1;
-        }
+
         if (fgets(line, sizeof(line), f))
             fputs(line, stdout);
         fclose(f);
