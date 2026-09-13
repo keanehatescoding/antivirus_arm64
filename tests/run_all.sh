@@ -59,6 +59,17 @@ echo "### test_regression_10_14.sh (static checks pinning the #10/#14 fixes) ###
 "$REPO_ROOT/tests/test_regression_10_14.sh" || FAIL=1
 
 echo
+echo "### test_fanotify_exec_gate.sh (avd's exec gate for #2's two gaps) ###"
+# Half static greps (no root) and half a live FAN_OPEN_EXEC_PERM
+# harness (root). It self-elevates the live half via pkexec when this
+# run isn't already root, and is a no-op-with-a-loud-skip on a kernel
+# without CONFIG_FANOTIFY_ACCESS_PERMISSIONS - so it is safe to run
+# unconditionally on every host, unlike the av.ko-dependent suites
+# below. Not gated on $HOST_ARCH: the gate lives in avd, which is not
+# arm64-only.
+"$REPO_ROOT/tests/test_fanotify_exec_gate.sh" || FAIL=1
+
+echo
 echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
 "$REPO_ROOT/tests/test_detection.sh" || FAIL=1
 

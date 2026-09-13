@@ -83,12 +83,14 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/fanotify.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -2090,6 +2092,394 @@ static void *scan_worker_main(void *arg) {
   return NULL;
 }
 
+/* ------------------------------------------------------------------
+ * fanotify exec gate - the #2 exec path, off a self-copied pathname
+ *
+ * Issue #2 tracks two deterministic exec-time gaps, both rooted in one
+ * thing: the exec verdict is computed from a pathname the kernel module
+ * copied itself, instead of from the file object the kernel already
+ * resolved.
+ *
+ *   gap 1 (TOCTOU)     av_work_fn() re-opens the pathname via
+ *                      open_exec_target(), a second and later open than
+ *                      the one execve() actually used. Nothing ties the
+ *                      two to the same inode.
+ *   gap 2 (cold page)  the kprobe pre-handler runs in atomic context
+ *                      and cannot fault in a userspace page, so
+ *                      strncpy_from_user() on a cold pathname returns
+ *                      -EFAULT and the handler allows the exec.
+ *
+ * Discussion #33 works through why neither is fixable where they live:
+ * security_add_hooks() is __init and unexported, so an insmod'd module
+ * can never register the bprm_check_security hook that would close
+ * both. Option C moves the *exec decision only* out of the module and
+ * into this daemon, on top of fanotify FAN_OPEN_EXEC_PERM, which hands
+ * us an open fd to the exact file the kernel is about to execute.
+ *
+ * Both gaps then close by construction rather than by narrowing a
+ * window: nothing is re-opened by path, so there is no second inode to
+ * swap in; and nothing copies a pathname out of userspace, so there is
+ * no -EFAULT to fail open on. That was verified against a real kernel
+ * before this was written rather than argued from the source - see the
+ * spike results in discussion #33, which also demonstrate FAN_DENY
+ * refusing an exec *before* the image runs, unlike av_kill()'s
+ * SIGKILL landing after execve() has already committed.
+ *
+ * This is a split, not a migration, exactly as #33 frames it. The
+ * module keeps its kprobes for everything behavioral - behavior.c's
+ * rapid-write window, protected-path suppression, the openat/unlink/
+ * rename hooks - because fanotify has no equivalent with the same
+ * semantics. Only the exec verdict moves here.
+ *
+ * Deliberately opt-in and off by default (AVD_FANOTIFY_EXEC=1). A
+ * fanotify permission mark suspends every matching exec until this
+ * daemon answers, so switching it on is an operational decision about
+ * a machine, not a packaging default:
+ *
+ *   AVD_FANOTIFY_EXEC=1          enable this gate
+ *   AVD_FANOTIFY_MARK=/:/home    ':'-separated mount points to mark.
+ *                                Required - see fanexec_init(); there
+ *                                is deliberately no default.
+ *   AVD_FANOTIFY_FAIL_CLOSED=1   deny execs this gate could not reach
+ *                                a verdict on (default: allow, matching
+ *                                the module's own default and
+ *                                docs/netlink-protocol.md)
+ *   AVD_FANOTIFY_THREADS=4       responder threads (1..32)
+ *
+ * Needs CAP_SYS_ADMIN and CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y. Note
+ * there is no FAN_CLASS_PERM despite the name suggesting itself -
+ * permission events come from FAN_CLASS_CONTENT.
+ * ------------------------------------------------------------------ */
+
+#define AVD_FANEXEC_THREADS_DEFAULT 4
+#define AVD_FANEXEC_THREADS_MIN 1
+#define AVD_FANEXEC_THREADS_MAX 32
+/* Bounded so a shutdown can never wait longer than this for a
+ * responder thread to notice `shutting_down` - the threads block in
+ * poll(), not read(), for exactly this reason. */
+#define AVD_FANEXEC_POLL_MS 500
+
+static int fanexec_fd = -1;
+static bool fanexec_enabled;
+static bool fanexec_fail_closed;
+static int fanexec_threads = AVD_FANEXEC_THREADS_DEFAULT;
+static pthread_t *fanexec_tids;
+static int fanexec_tids_started;
+
+/* Counters are reported at shutdown rather than per-event: an exec
+ * gate on a busy mount is a hot path, and a line per allowed exec
+ * would be its own denial of service. Guarded by their own lock -
+ * these are written from every responder thread. */
+static pthread_mutex_t fanexec_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long fanexec_allowed;
+static unsigned long fanexec_denied;
+static unsigned long fanexec_overflows;
+static unsigned long fanexec_undecided;
+
+static void fanexec_count(unsigned long *counter) {
+  pthread_mutex_lock(&fanexec_stats_lock);
+  (*counter)++;
+  pthread_mutex_unlock(&fanexec_stats_lock);
+}
+
+/* The pathname is a LOGGING detail here, not the input the verdict is
+ * computed from - that is the whole point of this file. It is
+ * recovered from the fd rather than supplied by anyone, and a failure
+ * to recover it weakens the log line without weakening the decision.
+ *
+ * readlink() on /proc/self/fd/N can come back with a " (deleted)"
+ * suffix if the binary was unlinked between exec and this call; that
+ * is left as-is rather than trimmed, because a caller quarantining
+ * such a file wants to see it, and quarantine_file()'s own identity
+ * recheck already refuses to unlink a path that no longer names the
+ * same inode. */
+static void fanexec_path_of_fd(int fd, char *buf, size_t buflen) {
+  char procpath[64];
+  ssize_t n;
+
+  snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", fd);
+  n = readlink(procpath, buf, buflen - 1);
+  if (n < 0) {
+    snprintf(buf, buflen, "<unresolved fd %d>", fd);
+    return;
+  }
+  buf[n] = '\0';
+}
+
+static void fanexec_respond(int event_fd, __u32 decision) {
+  struct fanotify_response resp;
+
+  memset(&resp, 0, sizeof(resp));
+  resp.fd = event_fd;
+  resp.response = decision;
+  /* A short or failed write leaves the exec suspended until this
+   * daemon exits (at which point the kernel releases it as allowed),
+   * so it is worth saying loudly rather than swallowing. */
+  if (write(fanexec_fd, &resp, sizeof(resp)) != (ssize_t)sizeof(resp))
+    fprintf(stderr, "avd: fanotify: failed to answer a pending exec: %s\n",
+            strerror(errno));
+}
+
+/* The verdict for one FAN_OPEN_EXEC_PERM event. Runs with the exec
+ * suspended, in ordinary sleepable userspace context with no deadline
+ * imposed from the kernel side - which is the substantive difference
+ * from the netlink path, where DAEMON_TIMEOUT_MS bounds the wait and
+ * expiry means "allow". */
+static void fanexec_handle_event(const struct fanotify_event_metadata *md) {
+  char path[PATH_MAX];
+  struct scan_result result;
+  struct stat st;
+  __u32 decision;
+
+  /* Self-filter, first thing. #33 flags listener self-deadlock as a
+   * design item: a daemon that answers events generated by its own
+   * activity can wedge itself on startup. FAN_OPEN_EXEC_PERM only
+   * fires on exec and avd execs nothing today, so this is a guard
+   * against a future change rather than an observed hang - but it is
+   * exactly the kind of guard that is impossible to add calmly after
+   * the fact, because the symptom is an unkillable daemon. */
+  if ((pid_t)md->pid == getpid()) {
+    fanexec_respond(md->fd, FAN_ALLOW);
+    fanexec_count(&fanexec_allowed);
+    return;
+  }
+
+  fanexec_path_of_fd(md->fd, path, sizeof(path));
+
+  /* Non-regular files have no business being exec'd, and perform_scan()
+   * assumes a regular file it can hash. This and the fstat() failure
+   * above it are the two "no verdict reachable" paths that
+   * AVD_FANOTIFY_FAIL_CLOSED governs. */
+  if (fstat(md->fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    decision = fanexec_fail_closed ? FAN_DENY : FAN_ALLOW;
+    fprintf(stderr,
+            "avd: fanotify: no verdict for \"%s\" (not a regular file) - %s\n",
+            path, fanexec_fail_closed ? "denying" : "allowing");
+    fanexec_respond(md->fd, decision);
+    fanexec_count(&fanexec_undecided);
+    return;
+  }
+
+  /* NOTE the fd: this is the kernel's own resolved file object, handed
+   * to us with the event. perform_scan() already does everything
+   * through an fd (YARA, sha256, fuzzy/TLSH, and quarantine via
+   * linkat(AT_EMPTY_PATH)), so the scan pipeline needs no change at
+   * all to be fed from here instead of from handle_scan_request()'s
+   * open(path). That is the entire fix for gap 1: there is no second
+   * open() for anyone to race. */
+  perform_scan(md->fd, path, NULL, md->pid, false, &result);
+
+  if (result.verdict == AV_VERDICT_MALICIOUS) {
+    decision = FAN_DENY;
+    fanexec_count(&fanexec_denied);
+    printf("avd: fanotify exec DENIED pid=%u path=\"%s\" rule=\"%s\"\n",
+           (unsigned)md->pid, path, result.rule_name);
+  } else {
+    decision = FAN_ALLOW;
+    fanexec_count(&fanexec_allowed);
+  }
+
+  fanexec_respond(md->fd, decision);
+}
+
+/* One responder thread. Every thread read()s the same fanotify fd -
+ * the kernel hands each reader a distinct set of events, so this is
+ * the parallelism, with no queue of our own in between. A slow scan
+ * therefore occupies one responder rather than stalling the others,
+ * and the only global limit is fanexec_threads. */
+static void *fanexec_main(void *arg) {
+  /* Sized for a comfortable batch of events; the kernel truncates to
+   * whole records, and FAN_EVENT_OK() below stops at the last complete
+   * one either way. */
+  static const size_t bufsz = 8192;
+  char *buf = malloc(bufsz);
+
+  (void)arg;
+  if (!buf) {
+    fprintf(stderr, "avd: fanotify: responder thread out of memory\n");
+    return NULL;
+  }
+
+  while (!shutting_down) {
+    struct pollfd pfd = {.fd = fanexec_fd, .events = POLLIN, .revents = 0};
+    const struct fanotify_event_metadata *md;
+    ssize_t len;
+    int pret = poll(&pfd, 1, AVD_FANEXEC_POLL_MS);
+
+    if (pret == 0)
+      continue; /* timeout - re-check shutting_down */
+    if (pret < 0) {
+      if (errno == EINTR)
+        continue;
+      fprintf(stderr, "avd: fanotify: poll failed: %s\n", strerror(errno));
+      break;
+    }
+
+    len = read(fanexec_fd, buf, bufsz);
+    if (len <= 0) {
+      if (len < 0 && (errno == EINTR || errno == EAGAIN))
+        continue;
+      if (len < 0)
+        fprintf(stderr, "avd: fanotify: read failed: %s\n", strerror(errno));
+      break;
+    }
+
+    for (md = (const struct fanotify_event_metadata *)buf;
+         FAN_EVENT_OK(md, len); md = FAN_EVENT_NEXT(md, len)) {
+      if (md->vers != FANOTIFY_METADATA_VERSION) {
+        fprintf(stderr,
+                "avd: fanotify: ABI mismatch (kernel v%u, built against v%u) - "
+                "disabling the exec gate\n",
+                md->vers, FANOTIFY_METADATA_VERSION);
+        shutting_down = true;
+        break;
+      }
+      if (md->fd == FAN_NOFD) {
+        /* FAN_Q_OVERFLOW. The execs behind these events were ALREADY
+         * allowed by the kernel - there is no fd to deny and no way to
+         * recover which they were, so AVD_FANOTIFY_FAIL_CLOSED cannot
+         * help here either. This is the one fail-open surface option C
+         * does not remove, flagged as open question 3 in #33 and still
+         * unresolved; log every occurrence rather than counting it
+         * silently, because an attacker who can flood the queue can
+         * use it. */
+        fprintf(stderr,
+                "avd: fanotify: EVENT QUEUE OVERFLOW - execs were allowed "
+                "unchecked (raise fs/fanotify/max_queued_events)\n");
+        fanexec_count(&fanexec_overflows);
+        continue;
+      }
+      fanexec_handle_event(md);
+      close(md->fd);
+    }
+  }
+
+  free(buf);
+  return NULL;
+}
+
+/* Returns 0 when the gate is off (nothing to do) or fully started, -1
+ * when it was asked for and could not be provided. Refusing to start
+ * is deliberate: a daemon that was told to gate execs and silently did
+ * not is worse than one that fails to come up. */
+static int fanexec_init(void) {
+  const char *marks_env;
+  char *marks, *saveptr = NULL, *tok;
+  int marked = 0;
+  int i;
+
+  if (!fanexec_enabled)
+    return 0;
+
+  marks_env = getenv("AVD_FANOTIFY_MARK");
+  if (!marks_env || !marks_env[0]) {
+    fprintf(stderr,
+            "avd: AVD_FANOTIFY_EXEC=1 needs AVD_FANOTIFY_MARK=<mountpoint>[:...]\n"
+            "avd: (no default on purpose - marking a mount suspends every exec\n"
+            "avd:  on it until this daemon answers, so the scope is yours to pick)\n");
+    return -1;
+  }
+
+  /* FAN_CLASS_CONTENT, not a non-existent FAN_CLASS_PERM: permission
+   * events need a content class. FAN_CLASS_NOTIF can watch execs but
+   * can never deny one. */
+  fanexec_fd = fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC,
+                             O_RDONLY | O_LARGEFILE | O_CLOEXEC);
+  if (fanexec_fd < 0) {
+    fprintf(stderr, "avd: fanotify_init failed: %s\n", strerror(errno));
+    if (errno == EPERM)
+      fprintf(stderr, "avd: (permission events need CAP_SYS_ADMIN)\n");
+    if (errno == EINVAL)
+      fprintf(stderr,
+              "avd: (permission events need CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y)\n");
+    return -1;
+  }
+
+  marks = strdup(marks_env);
+  if (!marks) {
+    close(fanexec_fd);
+    fanexec_fd = -1;
+    return -1;
+  }
+  for (tok = strtok_r(marks, ":", &saveptr); tok;
+       tok = strtok_r(NULL, ":", &saveptr)) {
+    if (!tok[0])
+      continue;
+    if (fanotify_mark(fanexec_fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+                      FAN_OPEN_EXEC_PERM, AT_FDCWD, tok) != 0) {
+      fprintf(stderr, "avd: fanotify_mark(\"%s\") failed: %s\n", tok,
+              strerror(errno));
+      if (errno == EINVAL)
+        fprintf(stderr, "avd: (FAN_OPEN_EXEC_PERM needs kernel >= 5.0)\n");
+      continue;
+    }
+    printf("avd: fanotify exec gate watching mount \"%s\"\n", tok);
+    marked++;
+  }
+  free(marks);
+
+  if (marked == 0) {
+    fprintf(stderr, "avd: no mounts could be marked - exec gate not started\n");
+    close(fanexec_fd);
+    fanexec_fd = -1;
+    return -1;
+  }
+
+  fanexec_tids = calloc((size_t)fanexec_threads, sizeof(*fanexec_tids));
+  if (!fanexec_tids) {
+    close(fanexec_fd);
+    fanexec_fd = -1;
+    return -1;
+  }
+  for (i = 0; i < fanexec_threads; i++) {
+    if (pthread_create(&fanexec_tids[i], NULL, fanexec_main, NULL) != 0) {
+      fprintf(stderr, "avd: could not start fanotify responder thread %d\n", i);
+      break;
+    }
+    fanexec_tids_started++;
+  }
+  if (fanexec_tids_started == 0) {
+    fprintf(stderr, "avd: no fanotify responder threads - exec gate not started\n");
+    free(fanexec_tids);
+    fanexec_tids = NULL;
+    close(fanexec_fd);
+    fanexec_fd = -1;
+    return -1;
+  }
+
+  printf("avd: fanotify exec gate active (%d responder thread(s), %s)\n",
+         fanexec_tids_started,
+         fanexec_fail_closed ? "fail-closed" : "fail-open");
+  return 0;
+}
+
+/* Order matters on the way out. The responder threads are joined
+ * BEFORE the fanotify fd is closed, because closing it is what
+ * releases any still-pending permission event (as allowed) - doing
+ * that while a thread is mid-scan would answer an event whose fd that
+ * thread still holds. */
+static void fanexec_stop(void) {
+  int i;
+
+  if (fanexec_fd < 0)
+    return;
+
+  for (i = 0; i < fanexec_tids_started; i++)
+    pthread_join(fanexec_tids[i], NULL);
+  free(fanexec_tids);
+  fanexec_tids = NULL;
+  fanexec_tids_started = 0;
+
+  close(fanexec_fd);
+  fanexec_fd = -1;
+
+  pthread_mutex_lock(&fanexec_stats_lock);
+  printf("avd: fanotify exec gate stopped - %lu allowed, %lu denied, "
+         "%lu undecided, %lu queue overflow(s)\n",
+         fanexec_allowed, fanexec_denied, fanexec_undecided, fanexec_overflows);
+  pthread_mutex_unlock(&fanexec_stats_lock);
+}
+
 /* maxlen bounds are defense-in-depth, not the primary guard - msg_handler()
  * below already rejects anything not from the kernel (nlmsg_get_src()
  * check), and the kernel always sends AV_A_PATH/AV_A_SHA256 well within
@@ -3224,6 +3614,21 @@ static void *control_accept_main(void *arg) {
  * operator who typo'd or miscalculated their own config believing
  * it took effect as written. Unset is the normal case (not a
  * warning) and just returns `default_val`. */
+/* Boolean env switch. Deliberately strict about what counts as "on":
+ * only 1/true/yes/on, case-insensitively. An unset variable, an empty
+ * one, and an unrecognised value all mean off, so a typo in a unit file
+ * leaves a security feature disabled and says nothing - the caller is
+ * expected to make the *enabled* case loud instead, which fanexec_init()
+ * does. */
+static bool avd_env_flag(const char *env_name) {
+  const char *v = getenv(env_name);
+
+  if (!v || !v[0])
+    return false;
+  return !strcasecmp(v, "1") || !strcasecmp(v, "true") ||
+         !strcasecmp(v, "yes") || !strcasecmp(v, "on");
+}
+
 static int parse_tunable_env(const char *env_name, int default_val,
                              int min_val, int max_val) {
   const char *val = getenv(env_name);
@@ -3248,6 +3653,7 @@ static int parse_tunable_env(const char *env_name, int default_val,
 }
 
 int main(int argc, char **argv) {
+  int exit_code = 0;
   const char *rules_dir = DEFAULT_RULES_DIR;
   const char *corpus_file = DEFAULT_CORPUS_FILE;
   const char *tlsh_corpus_file = DEFAULT_TLSH_CORPUS_FILE;
@@ -3318,6 +3724,17 @@ int main(int argc, char **argv) {
                                          AVD_SCAN_QUEUE_MAX_DEFAULT,
                                          AVD_SCAN_QUEUE_MIN,
                                          AVD_SCAN_QUEUE_MAX_MAX);
+
+  /* The fanotify exec gate (issue #2 / discussion #33 option C) - see
+   * the block comment above fanexec_init(). Read here, acted on just
+   * before the receive loop, so a misconfiguration is reported after
+   * the rest of the daemon is known-good rather than during it. */
+  fanexec_enabled = avd_env_flag("AVD_FANOTIFY_EXEC");
+  fanexec_fail_closed = avd_env_flag("AVD_FANOTIFY_FAIL_CLOSED");
+  fanexec_threads = parse_tunable_env("AVD_FANOTIFY_THREADS",
+                                      AVD_FANEXEC_THREADS_DEFAULT,
+                                      AVD_FANEXEC_THREADS_MIN,
+                                      AVD_FANEXEC_THREADS_MAX);
 
   printf("avd: quarantine directory: %s\n", quarantine_dir);
   printf("avd: control socket: %s\n", control_sock_path);
@@ -3451,6 +3868,7 @@ int main(int argc, char **argv) {
     pthread_t *workers = calloc((size_t)avd_scan_threads, sizeof(*workers));
     pthread_t control_thread;
     bool control_started;
+    bool startup_failed = false;
     int i, spawned = 0;
 
     if (!workers) {
@@ -3553,6 +3971,18 @@ int main(int argc, char **argv) {
       }
     }
 
+    /* Last thing before the receive loop: everything else is up, so a
+     * failure here unwinds through the ordinary shutdown path below
+     * instead of needing its own copy of it. fanexec_init() returns 0
+     * when the gate is simply switched off. */
+    if (fanexec_init() != 0) {
+      fprintf(stderr,
+              "avd: fanotify exec gate was requested but could not be "
+              "started - shutting down rather than running unprotected\n");
+      startup_failed = true;
+      running = 0;
+    }
+
     while (running) {
       int ret = nl_recvmsgs_default(sock);
       if (ret < 0 && ret != -NLE_INTR) {
@@ -3571,6 +4001,11 @@ int main(int argc, char **argv) {
 
     for (i = 0; i < spawned; i++)
       pthread_join(workers[i], NULL);
+
+    /* After `shutting_down` is set (the responder threads poll for it)
+     * and after the scan workers are joined, since a responder can be
+     * parked in the same perform_scan() path they are. */
+    fanexec_stop();
 
     if (control_started) {
       /* Closing control_sock_fd out from under control_accept_main()'s
@@ -3609,6 +4044,7 @@ int main(int argc, char **argv) {
       unlink(control_sock_path);
     }
     free(workers);
+    exit_code = startup_failed ? 1 : 0;
   }
 
   nl_socket_free(sock);
@@ -3617,5 +4053,5 @@ int main(int argc, char **argv) {
   yr_finalize();
   free(fuzzy_corpus);
   free(tlsh_corpus);
-  return 0;
+  return exit_code;
 }
