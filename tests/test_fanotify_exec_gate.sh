@@ -116,6 +116,37 @@ else
         pass "fanexec_handle_event() never re-opens a path (no second inode to swap)"
     fi
 
+    # perform_scan() fails OPEN on a YARA timeout, a failed rewind and
+    # a failed hash: the verdict stays CLEAN even though nothing was
+    # concluded. A fail-closed gate that only looks at `verdict` would
+    # therefore allow exactly the execs it was turned on to stop, and
+    # an attacker who can make a scan time out would have a reliable
+    # way to reach that. The handler has to consult the incomplete
+    # flag, not just the verdict.
+    if grep -q 'result.incomplete' <<<"$HANDLE_BODY"; then
+        pass "an incomplete scan is distinguished from a clean one"
+    else
+        fail "handler trusts CLEAN alone - a timed-out scan reads as a pass"
+    fi
+    # Blank lines first: strip_c_comments blanks comment lines rather
+    # than deleting them, so a -A window on the raw body lands inside
+    # the comment instead of on the code under it.
+    HANDLE_CODE="$(grep -v '^[[:space:]]*$' <<<"$HANDLE_BODY")"
+    if grep -A3 'result.incomplete' <<<"$HANDLE_CODE" \
+        | grep -q 'fanexec_fail_closed ? FAN_DENY : FAN_ALLOW'; then
+        pass "AVD_FANOTIFY_FAIL_CLOSED governs incomplete scans, as documented"
+    else
+        fail "incomplete scans ignore AVD_FANOTIFY_FAIL_CLOSED"
+    fi
+    # Both no-verdict paths - "cannot scan this" and "did not finish
+    # scanning" - must consult the flag, not just whichever one was
+    # written first.
+    if [ "$(grep -c 'fanexec_fail_closed ? FAN_DENY : FAN_ALLOW' <<<"$HANDLE_CODE")" -ge 2 ]; then
+        pass "every no-verdict path in the handler honours fail-closed"
+    else
+        fail "only one no-verdict path honours fail-closed - the other silently allows"
+    fi
+
     if grep -q 'getpid()' <<<"$HANDLE_BODY"; then
         pass "self-originated execs are filtered (listener self-deadlock guard)"
     else
@@ -212,6 +243,37 @@ if grep -qE '\<raise\(' <<<"$MAIN_BODY"; then
 else
     pass "termination is process-directed, not raised on a thread that blocks it"
 fi
+
+# The flag is only meaningful if perform_scan() actually raises it on
+# the paths that fail open. Checked against the real function body so
+# that deleting one of these branches shows up here rather than as a
+# quietly-permissive gate.
+SCAN_BODY="$(awk '/^static void perform_scan\(/{in_body=1} in_body{print} in_body && /^}/{exit}' "$AVD" | strip_c_comments)"
+n_incomplete="$(grep -c 'incomplete = true' <<<"$SCAN_BODY" || true)"
+if [ "$n_incomplete" -ge 6 ]; then
+    pass "perform_scan() flags its fail-open paths as incomplete ($n_incomplete sites)"
+else
+    fail "perform_scan() flags only $n_incomplete fail-open path(s) - expected >= 6"
+fi
+# The size gates are policy, not failure: YARA still scans an
+# over-cap file, and treating it as inconclusive would make
+# fail-closed deny every large binary on a marked mount.
+if grep -B3 'incomplete = true' <<<"$SCAN_BODY" | grep -qE 'size_ok|== -2'; then
+    fail "a size gate is flagged incomplete - fail-closed would deny large binaries"
+else
+    pass "size gates are not treated as scan failures"
+fi
+# Every other caller must keep the old fail-open behaviour: the field
+# is additive, and reading it anywhere else would change verdicts on
+# the netlink and on-demand paths.
+for fn in handle_scan_request cmd_scan; do
+    body="$(extract_c_func "$AVD" "$fn" | strip_c_comments)"
+    if [ -n "$body" ] && grep -q 'incomplete' <<<"$body"; then
+        fail "$fn() reads .incomplete - changes fail-open behaviour outside the gate"
+    else
+        pass "$fn() is unchanged by the incomplete flag (still fails open)"
+    fi
+done
 
 STOP_BODY="$(extract_c_func "$AVD" fanexec_stop | strip_c_comments)"
 # Closing the fanotify fd releases every still-pending permission event

@@ -1731,6 +1731,21 @@ struct scan_result {
   int score; /* YARA aggregate score - 0 for a fuzzy/TLSH-only match or
              * a clean result; supplementary info, not authoritative */
   char sha256_hex[65];
+  /* True when a detection layer errored out rather than reaching a
+   * conclusion - YARA never ran or timed out, a hash failed, etc.
+   * `verdict` is still CLEAN in that case, because perform_scan() fails
+   * open by design and every existing caller depends on that. This
+   * field exists so a caller that must NOT fail open can tell "scanned
+   * and found nothing" apart from "did not finish scanning"; ignoring
+   * it preserves the old behaviour exactly.
+   *
+   * Deliberately NOT set by the size gates (issue #3's sha256 cap,
+   * fuzzy_tlsh_size_ok()): those are a policy decision that a file is
+   * too big to hash, not a failure, and YARA still scans it. Treating
+   * them as inconclusive would make fail-closed deny every large
+   * binary on a marked mount, which is a denial of service wearing a
+   * security hat. */
+  bool incomplete;
 };
 
 /*
@@ -1801,11 +1816,20 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
        * snapshot was under it); -1 is a plain I/O error. Either
        * way, proceed without a hash rather than failing the scan
        * over it. */
-      if (sret == -2)
+      if (sret == -2) {
         fprintf(stderr,
                 "avd: skipping sha256 hash - file grew over the %d cap "
                 "during read\n",
                 MAX_FUZZY_TLSH_FILE_SIZE);
+      } else {
+        /* A plain I/O error, not the size policy: the file was
+         * supposed to be hashable and wasn't, so signature matching
+         * could not happen at all. Was silent before; a fail-closed
+         * caller needs to be able to say why it denied. */
+        fprintf(stderr, "avd: sha256 of \"%s\" failed - hash unavailable\n",
+                path);
+        out->incomplete = true;
+      }
       hash = "";
     }
   }
@@ -1813,8 +1837,11 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
          on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
 
-  if (!compiled_rules)
+  if (!compiled_rules) {
+    /* Nothing to scan with - every result here is vacuously clean. */
+    out->incomplete = true;
     goto record;
+  }
 
   /* sha256_fd() above drains through a dup()'d handle, and dup() shares
    * the underlying file offset with the original fd (same open file
@@ -1828,6 +1855,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
     fprintf(stderr, "avd: lseek(\"%s\", SEEK_SET) before YARA scan failed: "
                     "%s - failing open\n",
             path, strerror(errno));
+    out->incomplete = true;
     goto record;
   }
 
@@ -1839,6 +1867,12 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
      * stance on inconclusive information (see docs/netlink-protocol.md). */
     fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
             ret);
+    /* Includes ERROR_SCAN_TIMEOUT. Worth noting for anyone reading
+     * this as a threat model rather than an error path: of all the
+     * inconclusive outcomes here this is the one an attacker has the
+     * most influence over, since the input file's own size and
+     * structure drive how long SCAN_TIMEOUT_SECS has to absorb. */
+    out->incomplete = true;
     goto record;
   }
 
@@ -1911,8 +1945,10 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       quarantine_file(fd, path, out->rule_name, hash);
       goto record;
     }
-    if (fret < 0)
+    if (fret < 0) {
       fprintf(stderr, "avd: fuzzy hash of \"%s\" failed\n", path);
+      out->incomplete = true;
+    }
   }
 
   /* ssdeep didn't match either - try TLSH before declaring clean.
@@ -1938,8 +1974,10 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       quarantine_file(fd, path, out->rule_name, hash);
       goto record;
     }
-    if (tret < 0)
+    if (tret < 0) {
       fprintf(stderr, "avd: TLSH hash of \"%s\" failed\n", path);
+      out->incomplete = true;
+    }
   }
 
 record:
@@ -2143,7 +2181,16 @@ static void *scan_worker_main(void *arg) {
  *   AVD_FANOTIFY_FAIL_CLOSED=1   deny execs this gate could not reach
  *                                a verdict on (default: allow, matching
  *                                the module's own default and
- *                                docs/netlink-protocol.md)
+ *                                docs/netlink-protocol.md). Covers both
+ *                                "cannot scan this" (not a regular
+ *                                file, fstat failed) and "scanned but
+ *                                did not finish" - a YARA timeout, a
+ *                                failed rewind or hash - since
+ *                                perform_scan() reports CLEAN for all
+ *                                of those. It does NOT cover queue
+ *                                overflow, where the kernel has already
+ *                                allowed the exec before we hear about
+ *                                it.
  *   AVD_FANOTIFY_THREADS=4       responder threads (1..32)
  *
  * Needs CAP_SYS_ADMIN and CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y. Note
@@ -2262,8 +2309,10 @@ static void fanexec_handle_event(const struct fanotify_event_metadata *md) {
 
   /* Non-regular files have no business being exec'd, and perform_scan()
    * assumes a regular file it can hash. This and the fstat() failure
-   * above it are the two "no verdict reachable" paths that
-   * AVD_FANOTIFY_FAIL_CLOSED governs. */
+   * beside it are the no-verdict paths reachable *before* scanning;
+   * perform_scan() can also finish without reaching a conclusion (see
+   * struct scan_result's `incomplete`), which is handled below.
+   * AVD_FANOTIFY_FAIL_CLOSED governs all of them alike. */
   if (fstat(md->fd, &st) != 0 || !S_ISREG(st.st_mode)) {
     decision = fanexec_fail_closed ? FAN_DENY : FAN_ALLOW;
     fprintf(stderr,
@@ -2288,6 +2337,21 @@ static void fanexec_handle_event(const struct fanotify_event_metadata *md) {
     fanexec_count(&fanexec_denied);
     printf("avd: fanotify exec DENIED pid=%u path=\"%s\" rule=\"%s\"\n",
            (unsigned)md->pid, path, result.rule_name);
+  } else if (result.incomplete) {
+    /* CLEAN here means "no detection layer convicted", which is not
+     * the same as "this file was scanned". perform_scan() fails open
+     * on a YARA timeout, a failed rewind, a failed hash and so on,
+     * leaving the verdict CLEAN - so without this branch a
+     * fail-closed gate would allow exactly the execs it was turned on
+     * to stop, and an attacker able to make a scan time out would
+     * have a reliable way to reach one. Deny is the whole contract of
+     * AVD_FANOTIFY_FAIL_CLOSED; counted as undecided rather than
+     * denied because nothing was actually detected. */
+    decision = fanexec_fail_closed ? FAN_DENY : FAN_ALLOW;
+    fprintf(stderr,
+            "avd: fanotify: scan of \"%s\" did not complete - %s\n", path,
+            fanexec_fail_closed ? "denying" : "allowing");
+    fanexec_count(&fanexec_undecided);
   } else {
     decision = FAN_ALLOW;
     fanexec_count(&fanexec_allowed);
