@@ -2360,6 +2360,55 @@ static void fanexec_handle_event(const struct fanotify_event_metadata *md) {
   fanexec_respond(md->fd, decision);
 }
 
+/* A responder cannot continue. Takes the whole daemon down, which is a
+ * stronger reaction than it may look like it deserves - the reasoning
+ * matters more than the code:
+ *
+ * A permission-event gate is a chokepoint, not an observer. Every exec
+ * on a marked mount is SUSPENDED by the kernel until someone answers
+ * it, and the kernel imposes no timeout of its own. So a gate that
+ * loses its responders does not degrade to "unprotected" - it wedges
+ * every exec on those mounts indefinitely, and on an
+ * AVD_FANOTIFY_MARK of / that includes the operator's shell and
+ * whatever they would use to recover. Failing loudly and releasing the
+ * mounts beats staying alive in that state.
+ *
+ * Deliberately not "abort only when the last responder exits": EINTR
+ * and EAGAIN are already retried at the call sites, so anything
+ * reaching here is an fd-level failure on a fanotify fd every
+ * responder shares, not something one thread happened to trip over.
+ * Counting survivors would add a race and change nothing.
+ *
+ * The pending events are released as allowed when fanexec_stop()
+ * closes fanexec_fd, so the wedge resolves on the way out; from then
+ * on the module's own fail-open/fail-closed policy governs, exactly as
+ * when avd is not running. AVD_FANOTIFY_FAIL_CLOSED cannot narrow that
+ * window - answering an event requires a responder, which is what we
+ * just lost.
+ *
+ * kill(getpid()), not raise(), and the difference is load-bearing:
+ * raise() is pthread_kill() on the calling thread, and main() blocks
+ * SIGINT/SIGTERM before spawning anything precisely so that only the
+ * main thread can receive them - a signal raised here would sit
+ * pending in this responder forever and shut nothing down. A
+ * process-directed signal is delivered to the one thread that has it
+ * unblocked, whose nl_recvmsgs_default() then EINTRs out (sa_flags =
+ * 0, no SA_RESTART) and runs the ordinary shutdown sequence: set
+ * `shutting_down` under the queue lock, drain and join the scan
+ * workers, then fanexec_stop().
+ *
+ * Deliberately does NOT set `shutting_down` itself - see
+ * fanexec_aborted's comment for what a responder doing that leaves
+ * behind. */
+static void fanexec_abort(const char *why) {
+  fprintf(stderr,
+          "avd: fanotify: %s - terminating (the exec gate was requested "
+          "and cannot keep running)\n",
+          why);
+  fanexec_aborted = 1;
+  kill(getpid(), SIGTERM);
+}
+
 /* One responder thread. Every thread read()s the same fanotify fd -
  * the kernel hands each reader a distinct set of events, so this is
  * the parallelism, with no queue of our own in between. A slow scan
@@ -2374,13 +2423,21 @@ static void *fanexec_main(void *arg) {
 
   (void)arg;
   if (!buf) {
-    fprintf(stderr, "avd: fanotify: responder thread out of memory\n");
+    /* This thread never enters the loop below, so it is one fewer
+     * responder for as long as avd lives - and if it was the only one,
+     * the gate is dead on arrival while the daemon reports itself up.
+     * fanexec_init() refuses to start with zero responders; this is
+     * the same condition arriving a moment later. */
+    fanexec_abort("responder thread out of memory");
     return NULL;
   }
 
   while (!shutting_down && !fanexec_aborted) {
     struct pollfd pfd = {.fd = fanexec_fd, .events = POLLIN, .revents = 0};
     const struct fanotify_event_metadata *md;
+    /* Every abort reason below is assembled here before fanexec_abort()
+     * runs, so nothing it does can disturb the errno being reported. */
+    char why[128];
     ssize_t len;
     int pret = poll(&pfd, 1, AVD_FANEXEC_POLL_MS);
 
@@ -2389,7 +2446,9 @@ static void *fanexec_main(void *arg) {
     if (pret < 0) {
       if (errno == EINTR)
         continue;
-      fprintf(stderr, "avd: fanotify: poll failed: %s\n", strerror(errno));
+      snprintf(why, sizeof(why), "poll on the fanotify fd failed: %s",
+               strerror(errno));
+      fanexec_abort(why);
       break;
     }
 
@@ -2397,47 +2456,33 @@ static void *fanexec_main(void *arg) {
     if (len <= 0) {
       if (len < 0 && (errno == EINTR || errno == EAGAIN))
         continue;
+      /* len == 0 is not a normal outcome on a fanotify fd (poll() just
+       * said it was readable), so it gets the same treatment as an
+       * error rather than being quietly retried into a spin - and it
+       * carries no errno worth printing, unlike the error case. */
       if (len < 0)
-        fprintf(stderr, "avd: fanotify: read failed: %s\n", strerror(errno));
+        snprintf(why, sizeof(why), "read from the fanotify fd failed: %s",
+                 strerror(errno));
+      else
+        snprintf(why, sizeof(why), "unexpected EOF on the fanotify fd");
+      fanexec_abort(why);
       break;
     }
 
     for (md = (const struct fanotify_event_metadata *)buf;
          FAN_EVENT_OK(md, len); md = FAN_EVENT_NEXT(md, len)) {
       if (md->vers != FANOTIFY_METADATA_VERSION) {
-        fprintf(stderr,
-                "avd: fanotify: ABI mismatch (kernel v%u, built against v%u) - "
-                "terminating (the exec gate was requested and cannot run)\n",
-                md->vers, FANOTIFY_METADATA_VERSION);
-        /* The whole daemon goes down, not just the gate. The operator
-         * asked for exec enforcement; continuing without it is the
-         * silent-degradation failure this gate exists to avoid, and
-         * fanexec_init() already takes that position for a gate that
-         * cannot start. This is the same condition arriving later.
-         *
-         * kill(getpid()), not raise(): raise() is pthread_kill() on
-         * the calling thread, and main() blocks SIGINT/SIGTERM before
-         * spawning anything precisely so only the main thread can
-         * receive them - a raised signal would sit pending in this
-         * responder forever. A process-directed signal is delivered to
-         * the one thread that has it unblocked, whose
-         * nl_recvmsgs_default() then EINTRs out (sa_flags = 0, no
-         * SA_RESTART) and runs the ordinary shutdown sequence: set
-         * `shutting_down` under the queue lock, drain and join the
-         * scan workers, then fanexec_stop(). Deliberately NOT setting
-         * `shutting_down` here - see fanexec_aborted's comment for
-         * what a responder doing that leaves behind.
-         *
-         * md->fd is not closed: a version mismatch means this struct's
-         * layout is exactly what we cannot trust, so there is no field
-         * here safe to read as an fd. The pending permission events go
-         * back to the kernel as allowed when fanexec_stop() closes
-         * fanexec_fd - a fail-open window that AVD_FANOTIFY_FAIL_CLOSED
-         * cannot narrow, because answering an event requires parsing
-         * it. After that the module's own fail-open/fail-closed policy
-         * governs, as it does whenever avd is not running. */
-        fanexec_aborted = 1;
-        kill(getpid(), SIGTERM);
+        snprintf(why, sizeof(why),
+                 "ABI mismatch (kernel v%u, built against v%u)", md->vers,
+                 FANOTIFY_METADATA_VERSION);
+        /* Specific to this branch: md->fd is NOT closed on the way
+         * out. A version mismatch means this struct's layout is
+         * exactly what cannot be trusted, so no field in it is safe to
+         * read as an fd - including the one that would normally be
+         * closed here. fanexec_abort()'s comment covers the rest (why
+         * the daemon goes down, and how the pending events are
+         * released). */
+        fanexec_abort(why);
         break;
       }
       if (md->fd == FAN_NOFD) {

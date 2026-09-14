@@ -215,6 +215,33 @@ else
     fail "queue overflow is not surfaced - execs can pass unchecked in silence"
 fi
 
+# The shared abort path every unrecoverable responder failure routes
+# through. Checked as its own function because a responder that exits
+# without it is not merely one fewer scanner: a permission-event gate
+# is a chokepoint, every exec on a marked mount is suspended by the
+# kernel until someone answers it, and the kernel imposes no timeout of
+# its own. Lose the last responder quietly and those mounts wedge
+# indefinitely while avd still reports itself up.
+ABORT_BODY="$(extract_c_func "$AVD" fanexec_abort | strip_c_comments)"
+if [ -z "$ABORT_BODY" ]; then
+    fail "fanexec_abort() not found - responders have no shared abort path"
+else
+    if grep -q 'fanexec_aborted = 1' <<<"$ABORT_BODY"; then
+        pass "the abort path retires the other responders too"
+    else
+        fail "fanexec_abort() no longer sets fanexec_aborted - the other responders keep spinning"
+    fi
+    if grep -q 'kill(getpid()' <<<"$ABORT_BODY"; then
+        pass "an unrecoverable gate failure signals the process to shut down"
+    else
+        fail "no process-directed signal - an unrecoverable gate failure cannot reach main()"
+    fi
+fi
+
+# Both bodies, because either one could reintroduce these.
+RESPONDER_BODY="$MAIN_BODY
+$ABORT_BODY"
+
 # A responder thread must never drive the scan pipeline's drain flag
 # itself. shutting_down retires every scan worker and makes
 # enqueue_scan_task() drop each later kernel request, but it does not
@@ -224,24 +251,30 @@ fi
 # will not hand to a replacement - -EBUSY, the #10 fix) while answering
 # nothing. Silent, and unrecoverable without a manual kill, so it is
 # pinned here rather than left to review.
-if grep -q 'shutting_down *=' <<<"$MAIN_BODY"; then
+if grep -q 'shutting_down *=' <<<"$RESPONDER_BODY"; then
     fail "a responder thread assigns shutting_down - kills scanning while avd stays up"
 else
     pass "responders never set the scan pipeline's drain flag themselves"
-fi
-if grep -q 'kill(getpid()' <<<"$MAIN_BODY"; then
-    pass "an unrecoverable gate failure signals the process to shut down"
-else
-    fail "no process-directed signal - an unrecoverable gate failure cannot reach main()"
 fi
 # raise() is pthread_kill() on the calling thread, and main() blocks
 # SIGINT/SIGTERM before spawning any thread so that only the main
 # thread can receive them - so a raised signal would sit pending in the
 # responder forever and shut nothing down.
-if grep -qE '\<raise\(' <<<"$MAIN_BODY"; then
+if grep -qE '\<raise\(' <<<"$RESPONDER_BODY"; then
     fail "raise() from a responder: SIGINT/SIGTERM are blocked there, so it never lands"
 else
     pass "termination is process-directed, not raised on a thread that blocks it"
+fi
+# The four ways a responder stops being one: the buffer it needs before
+# entering the loop, poll(), read()/EOF, and an ABI mismatch. Counted
+# rather than eyeballed because a route deleted here does not look like
+# a bug at the call site - it looks like an ordinary `break`, and the
+# wedge above is what it actually is.
+n_abort="$(grep -c 'fanexec_abort(' <<<"$MAIN_BODY" || true)"
+if [ "$n_abort" -ge 4 ]; then
+    pass "every unrecoverable responder exit routes through the abort path ($n_abort sites)"
+else
+    fail "fanexec_main() routes only $n_abort failure(s) through fanexec_abort() - expected >= 4"
 fi
 
 # The flag is only meaningful if perform_scan() actually raises it on
