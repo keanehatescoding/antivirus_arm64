@@ -238,9 +238,32 @@ else
     fi
 fi
 
-# Both bodies, because either one could reintroduce these.
+# An answer that never reaches the kernel is the same wedge as a
+# responder that stops reading, arriving one exec at a time: the event
+# stays pending, the exec stays suspended, and the kernel imposes no
+# timeout. So the write side has to reach the same abort - and it has
+# to keep EINTR out of that, since retrying a signal as though the exec
+# were unanswerable would take the daemon down for nothing.
+RESPOND_BODY="$(extract_c_func "$AVD" fanexec_respond | strip_c_comments)"
+if [ -z "$RESPOND_BODY" ]; then
+    fail "fanexec_respond() not found - the gate cannot answer anything"
+else
+    if grep -q 'fanexec_abort(' <<<"$RESPOND_BODY"; then
+        pass "an undeliverable verdict routes through the abort path"
+    else
+        fail "fanexec_respond() only reports a failed answer - the exec stays suspended"
+    fi
+    if grep -q 'errno == EINTR' <<<"$RESPOND_BODY"; then
+        pass "an interrupted response is retried, not treated as unanswerable"
+    else
+        fail "fanexec_respond() does not retry EINTR - a signal would kill the daemon"
+    fi
+fi
+
+# All three bodies, because any one of them could reintroduce these.
 RESPONDER_BODY="$MAIN_BODY
-$ABORT_BODY"
+$ABORT_BODY
+$RESPOND_BODY"
 
 # A responder thread must never drive the scan pipeline's drain flag
 # itself. shutting_down retires every scan worker and makes
