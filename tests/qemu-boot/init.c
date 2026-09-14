@@ -693,6 +693,32 @@ int main(int argc, char *const argv[]) {
     }
     outmsg("QEMU_TEST: gate baseline established (ungated exec = ENOEXEC)\n");
 
+    /* avd walks a path's parents all the way to "/" and refuses any
+     * directory an unprivileged uid controls, so a "/" that is not
+     * root-owned makes it decline its quarantine dir - and then a
+     * conviction denies the exec but leaves the file in place, which
+     * looks exactly like a quarantine bug further down. The initramfs
+     * is built with `cpio -R root:root` for this reason; check the
+     * result here so that if that ever regresses, the failure names
+     * the archive instead of blaming perform_scan(). Not repaired
+     * with a chown: a guest rootfs owned by the CI runner's uid is
+     * wrong for every other check in this file too, and hiding it
+     * here would leave the next one to rediscover it. */
+    if (stat("/", &st) != 0) {
+      outmsg("QEMU_TEST: FAIL: cannot stat / to check its ownership\n");
+      poweroff_now();
+      return 1;
+    }
+    if (st.st_uid != 0) {
+      outmsg("QEMU_TEST: FAIL: / is owned by uid %d, not root - the "
+             "initramfs was packed without `cpio -R root:root`, so avd "
+             "will refuse its quarantine dir and this case cannot mean "
+             "anything\n",
+             (int)st.st_uid);
+      poweroff_now();
+      return 1;
+    }
+
     /* avd's stdout goes to a pipe, not the console, so the lines it
      * prints can be asserted on rather than merely eyeballed in the
      * serial log. Its stderr is left pointing at the console, where it
