@@ -169,12 +169,89 @@ precisely: the implementation bug is gone; the inherent limitation of
 finite counting-based rate limiting is not, and isn't something this
 design can fully close.
 
+## 5. Pathname games vs. the exec hook — and what actually closes them
+
+The first four findings are all about *what* gets scanned. This one is
+about *which file* gets scanned, and it defeats every layer above at
+once: if the verdict is computed against the wrong bytes, the quality of
+the analysis applied to them is irrelevant.
+
+`av/main.c`'s kprobe handler reads the exec'd pathname out of userspace
+with `strncpy_from_user()` and `av_work_fn()` later re-opens that
+pathname. Both halves of that are evadable, and issue #2 tracks both:
+
+- **Cold pathname page.** The pre-handler runs in atomic context and
+  cannot sleep to fault a page in, so a pathname on a genuinely
+  non-resident page returns `-EFAULT` and the handler allows the exec
+  without scanning anything. `tests/qemu-boot/cold_launcher.c`
+  reproduces this on every CI run. Note the measured nuance: a plain
+  `.rodata` string literal did *not* reproduce it — fault-around pulls
+  the literal's page in alongside `.text`. Coldness has to be
+  constructed (file-backed `MAP_PRIVATE` mapping, `MADV_DONTNEED`,
+  never touched), which is a real constraint on an attacker but not a
+  meaningful one.
+- **TOCTOU on the re-open.** `open_exec_target()` is a second, later
+  open of the same name. Swapping what that name resolves to between
+  the kernel's own resolution and ours means the verdict describes a
+  file that is not the one executing.
+
+Unlike findings #1, #2 and #4, this one is **not** an inherent limit of
+the technique — it is an artifact of *where the hook sits*. The verdict
+is derived from a pathname the module copied itself rather than from the
+file object the kernel had already resolved. Given the resolved file,
+neither evasion has anything to work with: there is no pathname copy to
+leave cold, and no second lookup to race.
+
+Reaching that file object from a loadable module turns out to be
+impossible, which is the genuinely interesting constraint here:
+`security_add_hooks()` is `__init` and unexported, and the active LSM
+set is fixed at boot by `CONFIG_LSM=`/`lsm=`, so an `insmod`'d module
+can never register `bprm_check_security` no matter how it is written.
+The fix therefore has to leave the module — discussion #33 weighs an
+in-tree LSM (correct, unshippable), a BPF LSM (needs `lsm=...,bpf` at
+boot), and fanotify `FAN_OPEN_EXEC_PERM` in `avd`, which is what
+shipped.
+
+Verified side by side in `tests/fanotify_exec_gate.c`: with a target
+whose content reads `SPIKE-PAYLOAD-MALICIOUS` and a rename-swap
+performed while the exec is suspended awaiting a verdict, the
+kernel-supplied event fd names the inode that is actually executing
+while re-opening the pathname sees the decoy — the two disagree, and
+the fd-derived `FAN_DENY` is what the kernel enforces. The cold-pathname
+launcher is likewise delivered and blocked, because no pathname was
+copied in atomic context for it to defeat.
+
+**Worth being precise about the residual risk**, since this is the one
+finding here with a fix rather than an acceptance: the gate is off
+unless `AVD_FANOTIFY_EXEC=1`, covers only the mounts named in
+`AVD_FANOTIFY_MARK`, and the kprobe path it sits beside is unchanged
+and still has both gaps. Its own remaining fail-open surface is queue
+overflow (`FAN_Q_OVERFLOW`), where events are dropped and the execs
+behind them proceed unchecked — logged loudly rather than silently
+tolerated, but a real ceiling set by `fs/fanotify/max_queued_events`.
+
+One methodological note that generalizes past this finding: because a
+permission event *suspends* the exec until the listener answers, the
+swap window is open for as long as the test wants it. The TOCTOU here
+is normally a race to demonstrate; against a permission-event listener
+it is deterministic, which is what makes it usable as a regression
+guard rather than a flaky one.
+
 ## Overall takeaways for the report
 
 - Every individual detection layer has a known, demonstrable evasion.
   This is expected and honest — no single technique here is claimed to
   be unbeatable, and presenting them as if they were would be the
   wrong takeaway.
+- Finding #5 is the sharpest version of the "we ran out of scope" vs.
+  "this is as good as this approach gets" distinction below, and it
+  lands on a third answer neither phrase covers: *this is as good as
+  this approach gets, so the approach had to move*. The evasion was not
+  a limit of the scanning at all — it was a limit of where the hook
+  could sit, and a loadable module provably cannot sit anywhere better.
+  That is worth separating from #1/#2/#4's genuinely inherent limits,
+  because it is the one case where the right answer was to change the
+  mechanism rather than accept the finding.
 - The one deliberately-designed defense (layering independent checks)
   held up under direct testing (finding #3) — evading entropy analysis
   did not evade the structural analysis running alongside it.

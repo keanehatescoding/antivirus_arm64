@@ -89,8 +89,8 @@ builds.
 tests/run_all.sh
 ```
 
-Runs the six automated test scripts (two standalone, four needing a VM
-and root). See the wiki's **Testing** page for what each one checks and for
+Runs every automated test script (most standalone; the module-dependent
+ones need a VM and root, and skip loudly elsewhere). See the wiki's **Testing** page for what each one checks and for
 manual, step-by-step walkthroughs of every detection layer (signatures,
 YARA, ELF analysis, entropy, fuzzy hashing, behavioral heuristics,
 quarantine/TOCTOU). The EICAR antivirus test file — a standard, harmless

@@ -165,6 +165,29 @@ by watching your own shell die.
   caveat above the Commands table for a real, if narrow, hazard this
   introduces (a flip to fail-closed can retroactively catch an
   already-in-flight exec, including the flipping shell's own).
+- **The exec verdict this channel carries is computed from a pathname,
+  not from the file the kernel resolved.** Everything above is about
+  who may speak on this channel and what happens when nobody answers;
+  this is about the request itself being answerable for the wrong file.
+  The kprobe pre-handler copies the pathname with
+  `strncpy_from_user()` (which cannot fault in a cold page from atomic
+  context) and `av_work_fn()` re-opens that name later (a second lookup
+  to race). Issue #2 tracks both halves; `docs/evasion-findings.md` #5
+  has the full writeup. **Not fixable on this channel**, and not
+  fixable in the module at all: `security_add_hooks()` is `__init` and
+  unexported, so an `insmod`'d module can never register
+  `bprm_check_security` to get at the resolved file. **Addressed
+  alongside it, not on it:** `avd` can additionally run a fanotify
+  `FAN_OPEN_EXEC_PERM` gate that scans the kernel-supplied event fd
+  directly, which sidesteps this channel entirely for execs on the
+  mounts it covers. Opt-in and off by default -
+  `AVD_FANOTIFY_EXEC=1`, `AVD_FANOTIFY_MARK=/:/home` (required, no
+  default), optionally `AVD_FANOTIFY_FAIL_CLOSED=1` and
+  `AVD_FANOTIFY_THREADS=N`. The kprobe path is unchanged and still has
+  both gaps, so this narrows the exposure rather than removing it. See
+  discussion #33 for why fanotify over an LSM, and
+  `tests/test_fanotify_exec_gate.sh` for what is and isn't covered by
+  tests.
 - **Kernel netlink API surface is version-sensitive**, same caveat as
   the syscall-wrapper kprobe hooking — `genl_family` struct layout has
   changed across kernel versions (notably where `.policy` lives). This
