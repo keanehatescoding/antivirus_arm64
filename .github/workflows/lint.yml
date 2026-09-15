@@ -62,6 +62,65 @@ jobs:
           cppcheck --quiet --enable=warning,style --inline-suppr \
             --error-exitcode=1 userspace/avctl/
 
+      - name: reject strerror(errno) next to pthread_ calls
+        run: |
+          set -euo pipefail
+          # Issue #50: the pthread_* family returns its error number and
+          # leaves errno alone, so strerror(errno) next to one prints
+          # whatever was stale (usually "Success"). cppcheck does not flag
+          # this, and its scope here excludes userspace/avd/ where every
+          # past site lived. Deliberately narrow mechanical rule:
+          # strerror(errno) in code within 10 lines after a pthread_ call
+          # (the fixed sites sat 3-5 lines below their call). Scoped to
+          # tracked sources via git ls-files, so untracked vendored trees
+          # (tests/qemu-boot/.kernel-cache/) holding this pattern upstream
+          # are not flagged. Comments are stripped before matching so the
+          # explanatory "strerror(rc), not strerror(errno)" notes do not
+          # read as violations. Verified non-vacuous by mutation:
+          # reintroducing strerror(errno) at one fixed site fails this
+          # step naming file:line.
+          mapfile -t CFILES < <(git ls-files '*.c' '*.h')
+          awk -v window=10 '
+          FNR == 1 { in_block = 0; last_pthread = -1000000 }
+          {
+            rest = $0
+            code = ""
+            while (rest != "") {
+              if (in_block) {
+                end = index(rest, "*/")
+                if (end == 0) { rest = "" }
+                else { rest = substr(rest, end + 2); in_block = 0 }
+              } else {
+                p_line = index(rest, "//")
+                p_blk = index(rest, "/*")
+                if (p_line > 0 && (p_blk == 0 || p_line < p_blk)) {
+                  code = code substr(rest, 1, p_line - 1)
+                  rest = ""
+                } else if (p_blk > 0) {
+                  code = code substr(rest, 1, p_blk - 1)
+                  rest = substr(rest, p_blk + 2)
+                  in_block = 1
+                } else {
+                  code = code rest
+                  rest = ""
+                }
+              }
+            }
+            if (match(code, /pthread_[A-Za-z_]+[ \t]*\(/)) {
+              last_pthread = FNR
+            }
+            if (match(code, /strerror[ \t]*\([ \t]*errno[ \t]*\)/)) {
+              if (FNR - last_pthread <= window) {
+                printf "%s:%d: strerror(errno) within %d lines after a pthread_ call " \
+                  "(line %d); pthread_* returns its error, use strerror(<rc>)\n", \
+                  FILENAME, FNR, window, last_pthread
+                bad = 1
+              }
+            }
+          }
+          END { exit (bad ? 1 : 0) }
+          ' "${CFILES[@]}"
+
       - name: yamllint tracked workflows and packaging metadata
         run: |
           # Scoped to tracked YAML only: bare `yamllint .` would also
