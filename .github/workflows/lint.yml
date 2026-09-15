@@ -121,7 +121,10 @@ jobs:
               last_pthread = FNR
             }
             if (match(code, /strerror[ \t]*\([ \t]*errno[ \t]*\)/)) {
-              if (FNR - last_pthread <= window) {
+              # last_pthread > 0: never flag without a producer in this
+              # file (the sentinel alone already excludes it
+              # arithmetically, this states the invariant explicitly).
+              if (last_pthread > 0 && FNR - last_pthread <= window) {
                 printf "%s:%d: strerror(errno) within %d lines after a pthread_ call " \
                   "(line %d); pthread_* returns its error, use strerror(<rc>)\n", \
                   FILENAME, FNR, window, last_pthread
