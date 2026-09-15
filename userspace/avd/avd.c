@@ -2304,8 +2304,8 @@ static void fanexec_path_of_fd(int fd, char *buf, size_t buflen) {
  * main thread can receive them - a signal raised here would sit
  * pending in this responder forever and shut nothing down. A
  * process-directed signal is delivered to the one thread that has it
- * unblocked, whose nl_recvmsgs_default() then EINTRs out (sa_flags =
- * 0, no SA_RESTART) and runs the ordinary shutdown sequence: set
+ * unblocked, whose receive loop then observes `running == 0` on its
+ * next poll timeout and runs the ordinary shutdown sequence: set
  * `shutting_down` under the queue lock, drain and join the scan
  * workers, then fanexec_stop().
  *
@@ -2407,7 +2407,22 @@ static void fanexec_handle_event(const struct fanotify_event_metadata *md) {
    * beside it are the no-verdict paths reachable *before* scanning;
    * perform_scan() can also finish without reaching a conclusion (see
    * struct scan_result's `incomplete`), which is handled below.
-   * AVD_FANOTIFY_FAIL_CLOSED governs all of them alike. */
+   * AVD_FANOTIFY_FAIL_CLOSED governs all of them alike.
+   *
+   * The S_ISREG half of this is unreachable via execve() on a current
+   * kernel and is kept anyway. may_open() rejects a directory, fifo,
+   * socket or device with EACCES when acc_mode has MAY_EXEC, and that
+   * happens in path_openat() before vfs_open() reaches
+   * do_dentry_open(), which is where the fanotify permission hook
+   * fires - so no FAN_OPEN_EXEC_PERM is ever generated for one. (The
+   * check used to live in do_open_execat(); 633fb6ac3980 "exec: move
+   * S_ISREG() check earlier" moved it, and the comment left behind
+   * there now calls "all non-regular files error out before we get
+   * here" an invariant.) It stays because the fstat() failure beside
+   * it is genuinely reachable, because this branch is what makes that
+   * one fail-closed, and because a guard costing one fstat() on a path
+   * that already does a full scan is not worth trading for a
+   * dependency on that invariant holding. */
   if (fstat(md->fd, &st) != 0 || !S_ISREG(st.st_mode)) {
     decision = fanexec_fail_closed ? FAN_DENY : FAN_ALLOW;
     fprintf(stderr,

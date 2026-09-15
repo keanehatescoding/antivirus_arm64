@@ -332,8 +332,16 @@ static void exec_expect_failure(const char *path, int *exec_errno,
 /* waitpid() with a deadline, so a daemon that does not shut down is a
  * reported failure rather than a hung job that reads as infrastructure
  * flake. Returns 1 if it exited on its own, 0 if it had to be
- * SIGKILLed. */
-static int wait_for_exit(pid_t pid, int timeout_ms, int *exit_code) {
+ * SIGKILLed.
+ *
+ * *term_sig reports how it died, and is separate from *exit_code on
+ * purpose: a daemon that segfaults on the way out is reaped exactly
+ * like one that returned 0, so a caller reading only the return value
+ * would call a crash a clean shutdown. Collapsing both into a single
+ * -1 would still not distinguish "crashed" from "exited 1", and this
+ * is a test whose diagnostic is the whole product. */
+static int wait_for_exit(pid_t pid, int timeout_ms, int *exit_code,
+                         int *term_sig) {
   int waited = 0;
   int status;
 
@@ -342,6 +350,7 @@ static int wait_for_exit(pid_t pid, int timeout_ms, int *exit_code) {
 
     if (r == pid) {
       *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+      *term_sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
       return 1;
     }
     if (r < 0)
@@ -358,6 +367,7 @@ static int wait_for_exit(pid_t pid, int timeout_ms, int *exit_code) {
   kill(pid, SIGKILL);
   waitpid(pid, &status, 0);
   *exit_code = -1;
+  *term_sig = SIGKILL;
   return 0;
 }
 
@@ -426,11 +436,11 @@ static char *drain_pipe(int fd) {
  * SIGTERM rather than SIGKILL because exit() is what flushes the
  * buffered stdout these branches are trying to print. */
 static void stop_avd(pid_t pid) {
-  int code;
+  int code, sig;
 
   if (kill(pid, SIGTERM) != 0)
     die("kill(avd, SIGTERM)");
-  (void)wait_for_exit(pid, 15000, &code);
+  (void)wait_for_exit(pid, 15000, &code, &sig);
 }
 
 int main(int argc, char *const argv[]) {
@@ -716,7 +726,7 @@ int main(int argc, char *const argv[]) {
      * and padding this file's content is the wrong fix. */
     const char *clean_content = "nothing in this file is interesting\n";
     const int deadline_ms = 60000;
-    int err, killed, code;
+    int err, killed, code, sig;
     int last_err = -1, last_killed = 0;
     int waited = 0, denied = 0;
     pid_t avd_pid;
@@ -914,7 +924,7 @@ int main(int argc, char *const argv[]) {
      * is a real assertion here and not a formality. */
     if (kill(avd_pid, SIGTERM) != 0)
       die("kill(avd, SIGTERM)");
-    if (!wait_for_exit(avd_pid, 15000, &code)) {
+    if (!wait_for_exit(avd_pid, 15000, &code, &sig)) {
       outmsg("QEMU_TEST: FAIL: avd did not exit within 15s of SIGTERM and "
              "had to be SIGKILLed - the gate's shutdown path is stuck, "
              "which is the state that strands suspended execs\n");
@@ -925,6 +935,31 @@ int main(int argc, char *const argv[]) {
       outmsg("QEMU_TEST: --- avd stdout (empty if SIGKILLed - see "
              "stderr on the console above) ---\n%s\n",
              drain_pipe(pipefd[0]));
+      poweroff_now();
+      return 1;
+    }
+
+    /* Reaped is not the same as shut down cleanly. avd returns 1 from
+     * main() when startup failed or when fanexec_abort() fired - an
+     * unrecoverable gate failure that SIGTERMs the process itself - so
+     * a gate that collapsed and tore itself down would be reaped here
+     * exactly like a healthy one, and without this the case would go
+     * on to report a clean shutdown. A signal means it crashed on the
+     * way out instead, which is the same story with a worse ending:
+     * either way the responders never joined and the mark's release is
+     * the kernel's doing rather than avd's. */
+    if (sig != 0 || code != 0) {
+      if (sig != 0)
+        outmsg("QEMU_TEST: FAIL: avd was killed by signal %d during "
+               "shutdown rather than exiting - the teardown path "
+               "crashed\n",
+               sig);
+      else
+        outmsg("QEMU_TEST: FAIL: avd exited %d on SIGTERM, not 0 - main() "
+               "returns 1 for a failed startup or a fanexec_abort(), so "
+               "the gate did not simply stop, it gave up\n",
+               code);
+      outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(pipefd[0]));
       poweroff_now();
       return 1;
     }
