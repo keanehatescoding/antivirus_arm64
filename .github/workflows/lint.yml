@@ -62,6 +62,79 @@ jobs:
           cppcheck --quiet --enable=warning,style --inline-suppr \
             --error-exitcode=1 userspace/avctl/
 
+      - name: reject strerror(errno) next to pthread_ calls
+        run: |
+          set -euo pipefail
+          # Issue #50: the pthread_* family returns its error number and
+          # leaves errno alone, so strerror(errno) next to one prints
+          # whatever was stale (usually "Success"). cppcheck does not flag
+          # this, and its scope here excludes userspace/avd/ where every
+          # past site lived. Deliberately narrow mechanical rule:
+          # strerror(errno) in code within 10 lines after a pthread_ call
+          # (the fixed sites sat 3-5 lines below their call). Scoped to
+          # tracked sources via git ls-files, so untracked vendored trees
+          # (tests/qemu-boot/.kernel-cache/) holding this pattern upstream
+          # are not flagged. Comments are stripped before matching so the
+          # explanatory "strerror(rc), not strerror(errno)" notes do not
+          # read as violations; stripping tracks string/character literals
+          # and backslash escapes so a "//" or "/*" inside "..." or '...'
+          # neither truncates code nor opens a comment (literal contents
+          # are dropped, so a strerror(errno) mentioned only inside a
+          # message string cannot read as a violation either).
+          # reintroducing strerror(errno) at one fixed site fails this
+          # step naming file:line.
+          mapfile -t CFILES < <(git ls-files '*.c' '*.h')
+          awk -v window=10 '
+          FNR == 1 { in_block = 0; in_str = 0; in_chr = 0; last_pthread = -1000000 }
+          {
+            # Char-by-char strip: comment delimiters only count outside
+            # "..." / '...' (with backslash escapes honoured), and literal
+            # contents never reach code. in_block/in_str/in_chr carry
+            # across lines for /* ... */ and backslash-newline continuations.
+            line = $0
+            n = length(line)
+            code = ""
+            i = 1
+            while (i <= n) {
+              two = substr(line, i, 2)
+              if (in_block) {
+                if (two == "*/") { in_block = 0; i += 2 }
+                else { i++ }
+              } else if (in_str || in_chr) {
+                if (substr(line, i, 1) == "\\") { i += 2 }
+                else if (in_str && substr(line, i, 1) == "\"") { in_str = 0; i++ }
+                else if (in_chr && substr(line, i, 1) == "\047") { in_chr = 0; i++ }
+                else { i++ }
+              } else if (two == "//") {
+                break
+              } else if (two == "/*") {
+                in_block = 1
+                i += 2
+              } else {
+                c = substr(line, i, 1)
+                if (c == "\"") { in_str = 1; i++ }
+                else if (c == "\047") { in_chr = 1; i++ }
+                else { code = code c; i++ }
+              }
+            }
+            if (match(code, /pthread_[A-Za-z_]+[ \t]*\(/)) {
+              last_pthread = FNR
+            }
+            if (match(code, /strerror[ \t]*\([ \t]*errno[ \t]*\)/)) {
+              # last_pthread > 0: never flag without a producer in this
+              # file (the sentinel alone already excludes it
+              # arithmetically, this states the invariant explicitly).
+              if (last_pthread > 0 && FNR - last_pthread <= window) {
+                printf "%s:%d: strerror(errno) within %d lines after a pthread_ call " \
+                  "(line %d); pthread_* returns its error, use strerror(<rc>)\n", \
+                  FILENAME, FNR, window, last_pthread
+                bad = 1
+              }
+            }
+          }
+          END { exit (bad ? 1 : 0) }
+          ' "${CFILES[@]}"
+
       - name: yamllint tracked workflows and packaging metadata
         run: |
           # Scoped to tracked YAML only: bare `yamllint .` would also
