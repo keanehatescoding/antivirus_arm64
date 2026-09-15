@@ -207,6 +207,19 @@ else
     fi
 fi
 
+# Not gate code, but the gate is what makes it critical. libnl retries
+# EINTR inside its own recvmsg(), so a signal cannot break
+# nl_recvmsgs_default() out and a handler setting running = 0 has
+# nothing to wake the loop. avd then waits for the next netlink message
+# to notice it was asked to stop - never, on a quiet system - and with
+# the gate on it holds the mark the whole time, suspending every exec
+# on the marked mount. The loop must poll with a timeout instead.
+if grep -q 'AVD_NL_POLL_MS' "$AVD"; then
+    pass "the netlink receive loop re-checks running on a timer"
+else
+    fail "main()'s netlink loop no longer polls - libnl swallows EINTR, so SIGTERM would not be noticed until the next message and the gate would hold its mark meanwhile"
+fi
+
 section "#2: the gate stays off unless it is asked for, and fails loudly"
 
 if grep -q 'fanexec_enabled = avd_env_flag("AVD_FANOTIFY_EXEC")' "$AVD"; then

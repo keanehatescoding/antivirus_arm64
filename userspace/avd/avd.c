@@ -2206,6 +2206,11 @@ static void *scan_worker_main(void *arg) {
  * poll(), not read(), for exactly this reason. */
 #define AVD_FANEXEC_POLL_MS 500
 
+/* Same idea for the main netlink receive loop, and for a sharper
+ * reason: libnl retries EINTR internally, so a signal cannot break
+ * nl_recvmsgs_default() out at all. See that loop in main(). */
+#define AVD_NL_POLL_MS 500
+
 static int fanexec_fd = -1;
 static bool fanexec_enabled;
 static bool fanexec_fail_closed;
@@ -2623,20 +2628,25 @@ static int fanexec_init(void) {
     fanexec_fd = -1;
     return -1;
   }
-  /* Responders must not be able to receive SIGINT/SIGTERM. main()
-   * blocks both before spawning any thread precisely so termination
-   * lands on the one thread parked in the EINTR-able
-   * nl_recvmsgs_default() loop - but it unblocks them again in the
-   * main thread just before that loop, and fanexec_init() is called
-   * AFTER that point. Threads inherit their creator's mask, so
+  /* Responders should not receive SIGINT/SIGTERM. main() blocks both
+   * before spawning any thread precisely so termination lands on the
+   * thread that drives shutdown - but it unblocks them again in the
+   * main thread just before its receive loop, and fanexec_init() is
+   * called AFTER that point. Threads inherit their creator's mask, so
    * spawning responders here would hand each of them SIGTERM
-   * unblocked; the kernel could then deliver a process-directed
-   * SIGTERM to a responder, where handle_sigint() sets `running = 0`
-   * while main stays blocked in nl_recvmsgs_default() with nothing to
-   * wake it. avd would ignore SIGTERM entirely, and since the mount
-   * is still marked, every exec on it stays suspended - the exact
-   * wedge the gate is supposed to avoid. Caught by the #48 QEMU case,
-   * which SIGTERMs a live gate and waits for the exit.
+   * unblocked, and the kernel could then run handle_sigint() on a
+   * responder: on that responder's stack, while it is holding an
+   * unanswered FAN_OPEN_EXEC_PERM event.
+   *
+   * main()'s loop polls, so `running = 0` set from a responder is
+   * still noticed within one poll interval - this is not, by itself,
+   * a hang today. It was one back when that loop sat in
+   * nl_recvmsgs_default() with nothing able to wake it: avd would
+   * ignore SIGTERM entirely while the mount stayed marked, suspending
+   * every exec on it. Both this and the loop were found by the #48
+   * QEMU case, which SIGTERMs a live gate and waits for the exit; the
+   * poll fixed the hang, and this keeps the signal off the threads
+   * answering the kernel.
    *
    * Blocked here around the pthread_create() loop and restored after,
    * rather than by reordering main(): this way fanexec_init() is
@@ -3983,9 +3993,16 @@ int main(int argc, char **argv) {
 
   /* sigaction(), not signal(): signal()'s semantics vary across libc
    * versions (restart vs EINTR, handler persistence), while sigaction()
-   * pins exactly what we need - persistent handler, no SA_RESTART so a
-   * blocking accept()/recv() EINTRs out promptly and the shutdown path
-   * observes `running == 0` instead of hanging past it. */
+   * pins exactly what we need - a persistent handler, and no
+   * SA_RESTART so a blocking accept() EINTRs out promptly.
+   *
+   * No SA_RESTART is necessary but NOT sufficient for the netlink
+   * receive loop, and this comment used to claim otherwise: libnl
+   * retries EINTR inside its own recvmsg(), so the signal never
+   * reaches nl_recvmsgs_default()'s caller no matter how the handler
+   * is installed. That loop polls with a timeout for this reason -
+   * see main(). The handler's job is only to set `running = 0`; what
+   * guarantees anyone notices is the poll timeout. */
   {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -3999,18 +4016,26 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-  /* Route SIGINT/SIGTERM to the main thread's nl_recvmsgs_default()
-   * loop below. All threads inherit their creator's signal mask, so a
-   * process-directed SIGINT/SIGTERM arriving with the mask unblocked
-   * could run handle_sigint() on a worker or control thread instead:
-   * `running` would go to 0 there while the main thread stayed blocked
-   * in nl_recvmsgs_default() with nothing to EINTR it out, hanging
-   * shutdown. Blocking both signals here (before any pthread_create())
-   * makes every subsequently spawned thread inherit them blocked; the
-   * main thread unblocks them again just before entering the receive
-   * loop, so termination is always delivered to the one thread whose
-   * blocking call EINTRs out (sa_flags = 0, no SA_RESTART) and drives
-   * the shutdown sequence. */
+  /* Deliver SIGINT/SIGTERM to the main thread. All threads inherit
+   * their creator's signal mask, so leaving both unblocked while
+   * spawning workers lets the kernel run handle_sigint() on whichever
+   * thread it picks for a process-directed signal - on that thread's
+   * stack, in the middle of whatever it was doing.
+   *
+   * Be honest about how much this now carries: the receive loop below
+   * polls on a timer, so `running = 0` set from any thread is noticed
+   * within one poll interval either way. This was load-bearing before
+   * that loop learned to poll - main sat inside
+   * nl_recvmsgs_default(), which libnl will not let a signal
+   * interrupt, so a handler that ran on any other thread was simply
+   * lost - and it is now hardening: keeping delivery on one known
+   * thread, and off threads mid-scan or mid-verdict.
+   *
+   * Blocking both here (before any pthread_create()) makes every
+   * subsequently spawned thread inherit them blocked; the main thread
+   * unblocks them again just before entering the receive loop. Note
+   * that fanexec_init() runs AFTER that unblock and so re-blocks
+   * around its own pthread_create() calls - see there. */
   {
     sigset_t block;
     sigemptyset(&block);
@@ -4223,8 +4248,43 @@ int main(int argc, char **argv) {
       running = 0;
     }
 
+    /* poll() first, then receive. nl_recvmsgs_default() cannot be
+     * relied on to return when a signal arrives: libnl retries EINTR
+     * inside its own recvmsg() (verified against libnl 3.12.0 - a
+     * SIGALRM during nl_recvmsgs_default() never brought it back),
+     * so a handler that sets `running = 0` has no way to wake this
+     * loop. avd would then sit in recvmsg until the NEXT netlink
+     * message happened to arrive, which on a quiet system is never.
+     *
+     * With the exec gate on, that is not merely a slow shutdown: the
+     * mount stays marked while avd refuses to exit, so every exec on
+     * it stays suspended. Caught by the #48 QEMU case, which SIGTERMs
+     * a live gate and waits for the exit.
+     *
+     * Polling the fd with a timeout re-checks `running` on a timer,
+     * the same shape the fanotify responders already use. The socket
+     * deliberately stays blocking rather than being switched to
+     * non-blocking: this loop is the only reader, so POLLIN means the
+     * following receive has data waiting, and the send path
+     * (send_verdict() and friends) keeps its existing semantics
+     * instead of having to grow EAGAIN handling. */
     while (running) {
-      int ret = nl_recvmsgs_default(sock);
+      struct pollfd nlpfd = {
+          .fd = nl_socket_get_fd(sock), .events = POLLIN, .revents = 0};
+      int pret = poll(&nlpfd, 1, AVD_NL_POLL_MS);
+      int ret;
+
+      if (pret < 0) {
+        if (errno == EINTR)
+          continue;
+        fprintf(stderr, "avd: poll on the netlink socket failed: %s\n",
+                strerror(errno));
+        break;
+      }
+      if (pret == 0)
+        continue; /* timeout - re-check `running` */
+
+      ret = nl_recvmsgs_default(sock);
       if (ret < 0 && ret != -NLE_INTR) {
         fprintf(stderr, "avd: nl_recvmsgs_default error: %s\n",
                 nl_geterror(ret));
