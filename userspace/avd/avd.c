@@ -2655,15 +2655,21 @@ static int fanexec_init(void) {
    * silently broke once. */
   {
     sigset_t block, prev;
+    int rc;
 
     sigemptyset(&block);
     sigaddset(&block, SIGINT);
     sigaddset(&block, SIGTERM);
-    if (pthread_sigmask(SIG_BLOCK, &block, &prev) != 0) {
+    /* strerror(rc), not strerror(errno): pthread_sigmask() returns the
+     * error number and leaves errno alone, unlike sigprocmask(). Using
+     * errno here would print whatever was stale - usually "Success" -
+     * in exactly the case this message exists to explain. */
+    rc = pthread_sigmask(SIG_BLOCK, &block, &prev);
+    if (rc != 0) {
       fprintf(stderr,
               "avd: could not block termination signals before starting "
               "responders: %s\n",
-              strerror(errno));
+              strerror(rc));
       free(fanexec_tids);
       fanexec_tids = NULL;
       close(fanexec_fd);
@@ -2682,11 +2688,12 @@ static int fanexec_init(void) {
 
     /* Restore before returning either way - the caller is the main
      * thread and it needs these deliverable again. */
-    if (pthread_sigmask(SIG_SETMASK, &prev, NULL) != 0)
+    rc = pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    if (rc != 0)
       fprintf(stderr,
               "avd: warning: could not restore the signal mask after "
               "starting responders: %s\n",
-              strerror(errno));
+              strerror(rc));
   }
   if (fanexec_tids_started == 0) {
     fprintf(stderr, "avd: no fanotify responder threads - exec gate not started\n");
@@ -4038,12 +4045,16 @@ int main(int argc, char **argv) {
    * around its own pthread_create() calls - see there. */
   {
     sigset_t block;
+    int rc;
     sigemptyset(&block);
     sigaddset(&block, SIGINT);
     sigaddset(&block, SIGTERM);
-    if (pthread_sigmask(SIG_BLOCK, &block, NULL) != 0) {
+    /* strerror(rc): pthread_sigmask() returns the error number rather
+     * than setting errno - see fanexec_init(). */
+    rc = pthread_sigmask(SIG_BLOCK, &block, NULL);
+    if (rc != 0) {
       fprintf(stderr, "avd: failed to block SIGINT/SIGTERM: %s\n",
-              strerror(errno));
+              strerror(rc));
       return 1;
     }
   }
@@ -4186,20 +4197,23 @@ int main(int argc, char **argv) {
     }
 
     /* Main thread only: unblock the termination signals blocked above
-     * so they are delivered here - the one thread parked in the
-     * EINTR-able nl_recvmsgs_default() loop - rather than on a worker
-     * or control thread that could never wake that loop up. Workers and
-     * the control accept thread (plus every per-connection thread it
-     * spawns) keep the inherited blocked mask for the life of the
-     * process. On the unlikely pthread_sigmask() failure, abort startup
-     * rather than run with undeliverable termination signals. */
+     * so they are delivered here - the thread that drives shutdown -
+     * rather than on a worker or control thread, on whose stack we do
+     * not want a handler running. (Delivery elsewhere is no longer a
+     * hang: the receive loop polls `running` on a timer because libnl
+     * will not let a signal interrupt nl_recvmsgs_default() at all.)
+     * Workers and the control accept thread (plus every per-connection
+     * thread it spawns) keep the inherited blocked mask for the life
+     * of the process. On the unlikely pthread_sigmask() failure, abort
+     * startup rather than run with undeliverable termination
+     * signals. */
     {
       sigset_t unblock;
       sigemptyset(&unblock);
       sigaddset(&unblock, SIGINT);
       sigaddset(&unblock, SIGTERM);
-      if (pthread_sigmask(SIG_UNBLOCK, &unblock, NULL) != 0) {
-        int unblock_err = errno;
+      int unblock_err = pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
+      if (unblock_err != 0) {
         fprintf(stderr, "avd: failed to unblock SIGINT/SIGTERM in main: %s\n",
                 strerror(unblock_err));
         pthread_mutex_lock(&queue_lock);

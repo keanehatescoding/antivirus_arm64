@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/reboot.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -360,22 +361,50 @@ static int wait_for_exit(pid_t pid, int timeout_ms, int *exit_code) {
   return 0;
 }
 
-/* Drains whatever avd left on the pipe. Called only after avd has
- * exited, and that ordering is load-bearing: avd never calls setvbuf()
- * or fflush(), so its stdout is fully buffered the moment it is a pipe
- * rather than a tty, and the lines this asserts on do not leave its
- * buffer until exit flushes them. Reading earlier would see nothing
- * and prove nothing.
+/* Drains whatever avd left on the pipe. Every caller must have reaped
+ * avd first, and that ordering is load-bearing: avd never calls
+ * setvbuf() or fflush(), so its stdout is fully buffered the moment it
+ * is a pipe rather than a tty, and the lines this asserts on do not
+ * leave its buffer until exit flushes them. Reading earlier would see
+ * nothing and prove nothing.
  *
  * This is also why readiness below is polled by behaviour instead of
  * by watching for the "gate active" line: that line is sitting in
- * avd's buffer for as long as it would be useful. */
+ * avd's buffer for as long as it would be useful.
+ *
+ * The poll() timeout is not how that ordering is enforced - stop_avd()
+ * is - but it bounds the damage if some future branch forgets. This
+ * pipe has no O_NONBLOCK and init closes its own write end at fork, so
+ * EOF requires avd to be gone; draining while it still lives used to
+ * block here forever, and since the branches that print avd's stdout
+ * are the ones diagnosing a broken gate, a real regression surfaced as
+ * a hung job killed by the workflow's outer timeout rather than as the
+ * FAIL it should be. A truncated diagnostic is a bad result; an
+ * inconclusive run is a worse one. */
+#define DRAIN_TIMEOUT_MS 5000
+
 static char *drain_pipe(int fd) {
   static char buf[32768];
   size_t used = 0;
 
   for (;;) {
-    ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    int pret = poll(&pfd, 1, DRAIN_TIMEOUT_MS);
+    ssize_t n;
+
+    if (pret < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    if (pret == 0) {
+      outmsg("QEMU_TEST: WARN: drain_pipe() timed out with avd's write "
+             "end still open - it was not reaped before draining; the "
+             "output below may be short\n");
+      break;
+    }
+
+    n = read(fd, buf + used, sizeof(buf) - 1 - used);
     if (n < 0) {
       if (errno == EINTR)
         continue;
@@ -389,6 +418,19 @@ static char *drain_pipe(int fd) {
   }
   buf[used] = '\0';
   return buf;
+}
+
+/* SIGTERM, then reap - SIGKILLing after 15s if it comes to that.
+ * Needed before draining on any branch that bails out with avd still
+ * running: EOF on the pipe requires avd's write end to close, and
+ * SIGTERM rather than SIGKILL because exit() is what flushes the
+ * buffered stdout these branches are trying to print. */
+static void stop_avd(pid_t pid) {
+  int code;
+
+  if (kill(pid, SIGTERM) != 0)
+    die("kill(avd, SIGTERM)");
+  (void)wait_for_exit(pid, 15000, &code);
 }
 
 int main(int argc, char *const argv[]) {
@@ -829,6 +871,7 @@ int main(int argc, char *const argv[]) {
              "avd and its rules are fine and it is specifically the "
              "fanotify gate that did not engage.\n",
              malicious, deadline_ms, last_err, last_killed, ENOEXEC);
+      stop_avd(avd_pid); /* avd is still up here - see drain_pipe() */
       outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(pipefd[0]));
       poweroff_now();
       return 1;
@@ -845,6 +888,7 @@ int main(int argc, char *const argv[]) {
              "(errno=%d killed=%d, expected ENOEXEC %d) - it is denying "
              "on something other than the verdict\n",
              err, killed, ENOEXEC);
+      stop_avd(avd_pid); /* avd is still up here - see drain_pipe() */
       outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(pipefd[0]));
       poweroff_now();
       return 1;
