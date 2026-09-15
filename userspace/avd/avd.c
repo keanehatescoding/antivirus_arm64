@@ -2678,9 +2678,11 @@ static int fanexec_init(void) {
     }
 
     for (i = 0; i < fanexec_threads; i++) {
-      if (pthread_create(&fanexec_tids[i], NULL, fanexec_main, NULL) != 0) {
-        fprintf(stderr, "avd: could not start fanotify responder thread %d\n",
-                i);
+      rc = pthread_create(&fanexec_tids[i], NULL, fanexec_main, NULL);
+      if (rc != 0) {
+        fprintf(stderr,
+                "avd: could not start fanotify responder thread %d: %s\n", i,
+                strerror(rc));
         break;
       }
       fanexec_tids_started++;
@@ -4155,9 +4157,12 @@ int main(int argc, char **argv) {
     }
 
     for (i = 0; i < avd_scan_threads; i++) {
-      if (pthread_create(&workers[i], NULL, scan_worker_main, NULL) != 0) {
+      /* strerror(rc): pthread_create() returns the error number and
+       * leaves errno alone, like the rest of the pthread_ family. */
+      int rc = pthread_create(&workers[i], NULL, scan_worker_main, NULL);
+      if (rc != 0) {
         fprintf(stderr, "avd: pthread_create failed for worker %d: %s\n", i,
-                strerror(errno));
+                strerror(rc));
         break;
       }
       spawned++;
@@ -4180,10 +4185,10 @@ int main(int argc, char **argv) {
      * rather than refusing to start entirely. */
     control_started = (start_control_socket() == 0);
     if (control_started) {
-      if (pthread_create(&control_thread, NULL, control_accept_main, NULL) !=
-          0) {
+      int rc = pthread_create(&control_thread, NULL, control_accept_main, NULL);
+      if (rc != 0) {
         fprintf(stderr, "avd: pthread_create failed for control socket: %s\n",
-                strerror(errno));
+                strerror(rc));
         close(control_sock_fd);
         control_sock_fd = -1;
         unlink(control_sock_path);
