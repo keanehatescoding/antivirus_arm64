@@ -76,34 +76,45 @@ jobs:
           # (tests/qemu-boot/.kernel-cache/) holding this pattern upstream
           # are not flagged. Comments are stripped before matching so the
           # explanatory "strerror(rc), not strerror(errno)" notes do not
-          # read as violations. Verified non-vacuous by mutation:
+          # read as violations; stripping tracks string/character literals
+          # and backslash escapes so a "//" or "/*" inside "..." or '...'
+          # neither truncates code nor opens a comment (literal contents
+          # are dropped, so a strerror(errno) mentioned only inside a
+          # message string cannot read as a violation either).
           # reintroducing strerror(errno) at one fixed site fails this
           # step naming file:line.
           mapfile -t CFILES < <(git ls-files '*.c' '*.h')
           awk -v window=10 '
-          FNR == 1 { in_block = 0; last_pthread = -1000000 }
+          FNR == 1 { in_block = 0; in_str = 0; in_chr = 0; last_pthread = -1000000 }
           {
-            rest = $0
+            # Char-by-char strip: comment delimiters only count outside
+            # "..." / '...' (with backslash escapes honoured), and literal
+            # contents never reach code. in_block/in_str/in_chr carry
+            # across lines for /* ... */ and backslash-newline continuations.
+            line = $0
+            n = length(line)
             code = ""
-            while (rest != "") {
+            i = 1
+            while (i <= n) {
+              two = substr(line, i, 2)
               if (in_block) {
-                end = index(rest, "*/")
-                if (end == 0) { rest = "" }
-                else { rest = substr(rest, end + 2); in_block = 0 }
+                if (two == "*/") { in_block = 0; i += 2 }
+                else { i++ }
+              } else if (in_str || in_chr) {
+                if (substr(line, i, 1) == "\\") { i += 2 }
+                else if (in_str && substr(line, i, 1) == "\"") { in_str = 0; i++ }
+                else if (in_chr && substr(line, i, 1) == "\047") { in_chr = 0; i++ }
+                else { i++ }
+              } else if (two == "//") {
+                break
+              } else if (two == "/*") {
+                in_block = 1
+                i += 2
               } else {
-                p_line = index(rest, "//")
-                p_blk = index(rest, "/*")
-                if (p_line > 0 && (p_blk == 0 || p_line < p_blk)) {
-                  code = code substr(rest, 1, p_line - 1)
-                  rest = ""
-                } else if (p_blk > 0) {
-                  code = code substr(rest, 1, p_blk - 1)
-                  rest = substr(rest, p_blk + 2)
-                  in_block = 1
-                } else {
-                  code = code rest
-                  rest = ""
-                }
+                c = substr(line, i, 1)
+                if (c == "\"") { in_str = 1; i++ }
+                else if (c == "\047") { in_chr = 1; i++ }
+                else { code = code c; i++ }
               }
             }
             if (match(code, /pthread_[A-Za-z_]+[ \t]*\(/)) {
