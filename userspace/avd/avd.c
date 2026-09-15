@@ -2206,6 +2206,11 @@ static void *scan_worker_main(void *arg) {
  * poll(), not read(), for exactly this reason. */
 #define AVD_FANEXEC_POLL_MS 500
 
+/* Same idea for the main netlink receive loop, and for a sharper
+ * reason: libnl retries EINTR internally, so a signal cannot break
+ * nl_recvmsgs_default() out at all. See that loop in main(). */
+#define AVD_NL_POLL_MS 500
+
 static int fanexec_fd = -1;
 static bool fanexec_enabled;
 static bool fanexec_fail_closed;
@@ -2299,8 +2304,8 @@ static void fanexec_path_of_fd(int fd, char *buf, size_t buflen) {
  * main thread can receive them - a signal raised here would sit
  * pending in this responder forever and shut nothing down. A
  * process-directed signal is delivered to the one thread that has it
- * unblocked, whose nl_recvmsgs_default() then EINTRs out (sa_flags =
- * 0, no SA_RESTART) and runs the ordinary shutdown sequence: set
+ * unblocked, whose receive loop then observes `running == 0` on its
+ * next poll timeout and runs the ordinary shutdown sequence: set
  * `shutting_down` under the queue lock, drain and join the scan
  * workers, then fanexec_stop().
  *
@@ -2402,7 +2407,22 @@ static void fanexec_handle_event(const struct fanotify_event_metadata *md) {
    * beside it are the no-verdict paths reachable *before* scanning;
    * perform_scan() can also finish without reaching a conclusion (see
    * struct scan_result's `incomplete`), which is handled below.
-   * AVD_FANOTIFY_FAIL_CLOSED governs all of them alike. */
+   * AVD_FANOTIFY_FAIL_CLOSED governs all of them alike.
+   *
+   * The S_ISREG half of this is unreachable via execve() on a current
+   * kernel and is kept anyway. may_open() rejects a directory, fifo,
+   * socket or device with EACCES when acc_mode has MAY_EXEC, and that
+   * happens in path_openat() before vfs_open() reaches
+   * do_dentry_open(), which is where the fanotify permission hook
+   * fires - so no FAN_OPEN_EXEC_PERM is ever generated for one. (The
+   * check used to live in do_open_execat(); 633fb6ac3980 "exec: move
+   * S_ISREG() check earlier" moved it, and the comment left behind
+   * there now calls "all non-regular files error out before we get
+   * here" an invariant.) It stays because the fstat() failure beside
+   * it is genuinely reachable, because this branch is what makes that
+   * one fail-closed, and because a guard costing one fstat() on a path
+   * that already does a full scan is not worth trading for a
+   * dependency on that invariant holding. */
   if (fstat(md->fd, &st) != 0 || !S_ISREG(st.st_mode)) {
     decision = fanexec_fail_closed ? FAN_DENY : FAN_ALLOW;
     fprintf(stderr,
@@ -2623,12 +2643,74 @@ static int fanexec_init(void) {
     fanexec_fd = -1;
     return -1;
   }
-  for (i = 0; i < fanexec_threads; i++) {
-    if (pthread_create(&fanexec_tids[i], NULL, fanexec_main, NULL) != 0) {
-      fprintf(stderr, "avd: could not start fanotify responder thread %d\n", i);
-      break;
+  /* Responders should not receive SIGINT/SIGTERM. main() blocks both
+   * before spawning any thread precisely so termination lands on the
+   * thread that drives shutdown - but it unblocks them again in the
+   * main thread just before its receive loop, and fanexec_init() is
+   * called AFTER that point. Threads inherit their creator's mask, so
+   * spawning responders here would hand each of them SIGTERM
+   * unblocked, and the kernel could then run handle_sigint() on a
+   * responder: on that responder's stack, while it is holding an
+   * unanswered FAN_OPEN_EXEC_PERM event.
+   *
+   * main()'s loop polls, so `running = 0` set from a responder is
+   * still noticed within one poll interval - this is not, by itself,
+   * a hang today. It was one back when that loop sat in
+   * nl_recvmsgs_default() with nothing able to wake it: avd would
+   * ignore SIGTERM entirely while the mount stayed marked, suspending
+   * every exec on it. Both this and the loop were found by the #48
+   * QEMU case, which SIGTERMs a live gate and waits for the exit; the
+   * poll fixed the hang, and this keeps the signal off the threads
+   * answering the kernel.
+   *
+   * Blocked here around the pthread_create() loop and restored after,
+   * rather than by reordering main(): this way fanexec_init() is
+   * correct wherever it is called from, instead of depending on a
+   * call-site ordering that nothing enforces and that already
+   * silently broke once. */
+  {
+    sigset_t block, prev;
+    int rc;
+
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    /* strerror(rc), not strerror(errno): pthread_sigmask() returns the
+     * error number and leaves errno alone, unlike sigprocmask(). Using
+     * errno here would print whatever was stale - usually "Success" -
+     * in exactly the case this message exists to explain. */
+    rc = pthread_sigmask(SIG_BLOCK, &block, &prev);
+    if (rc != 0) {
+      fprintf(stderr,
+              "avd: could not block termination signals before starting "
+              "responders: %s\n",
+              strerror(rc));
+      free(fanexec_tids);
+      fanexec_tids = NULL;
+      close(fanexec_fd);
+      fanexec_fd = -1;
+      return -1;
     }
-    fanexec_tids_started++;
+
+    for (i = 0; i < fanexec_threads; i++) {
+      rc = pthread_create(&fanexec_tids[i], NULL, fanexec_main, NULL);
+      if (rc != 0) {
+        fprintf(stderr,
+                "avd: could not start fanotify responder thread %d: %s\n", i,
+                strerror(rc));
+        break;
+      }
+      fanexec_tids_started++;
+    }
+
+    /* Restore before returning either way - the caller is the main
+     * thread and it needs these deliverable again. */
+    rc = pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    if (rc != 0)
+      fprintf(stderr,
+              "avd: warning: could not restore the signal mask after "
+              "starting responders: %s\n",
+              strerror(rc));
   }
   if (fanexec_tids_started == 0) {
     fprintf(stderr, "avd: no fanotify responder threads - exec gate not started\n");
@@ -3935,9 +4017,16 @@ int main(int argc, char **argv) {
 
   /* sigaction(), not signal(): signal()'s semantics vary across libc
    * versions (restart vs EINTR, handler persistence), while sigaction()
-   * pins exactly what we need - persistent handler, no SA_RESTART so a
-   * blocking accept()/recv() EINTRs out promptly and the shutdown path
-   * observes `running == 0` instead of hanging past it. */
+   * pins exactly what we need - a persistent handler, and no
+   * SA_RESTART so a blocking accept() EINTRs out promptly.
+   *
+   * No SA_RESTART is necessary but NOT sufficient for the netlink
+   * receive loop, and this comment used to claim otherwise: libnl
+   * retries EINTR inside its own recvmsg(), so the signal never
+   * reaches nl_recvmsgs_default()'s caller no matter how the handler
+   * is installed. That loop polls with a timeout for this reason -
+   * see main(). The handler's job is only to set `running = 0`; what
+   * guarantees anyone notices is the poll timeout. */
   {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -3951,26 +4040,38 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-  /* Route SIGINT/SIGTERM to the main thread's nl_recvmsgs_default()
-   * loop below. All threads inherit their creator's signal mask, so a
-   * process-directed SIGINT/SIGTERM arriving with the mask unblocked
-   * could run handle_sigint() on a worker or control thread instead:
-   * `running` would go to 0 there while the main thread stayed blocked
-   * in nl_recvmsgs_default() with nothing to EINTR it out, hanging
-   * shutdown. Blocking both signals here (before any pthread_create())
-   * makes every subsequently spawned thread inherit them blocked; the
-   * main thread unblocks them again just before entering the receive
-   * loop, so termination is always delivered to the one thread whose
-   * blocking call EINTRs out (sa_flags = 0, no SA_RESTART) and drives
-   * the shutdown sequence. */
+  /* Deliver SIGINT/SIGTERM to the main thread. All threads inherit
+   * their creator's signal mask, so leaving both unblocked while
+   * spawning workers lets the kernel run handle_sigint() on whichever
+   * thread it picks for a process-directed signal - on that thread's
+   * stack, in the middle of whatever it was doing.
+   *
+   * Be honest about how much this now carries: the receive loop below
+   * polls on a timer, so `running = 0` set from any thread is noticed
+   * within one poll interval either way. This was load-bearing before
+   * that loop learned to poll - main sat inside
+   * nl_recvmsgs_default(), which libnl will not let a signal
+   * interrupt, so a handler that ran on any other thread was simply
+   * lost - and it is now hardening: keeping delivery on one known
+   * thread, and off threads mid-scan or mid-verdict.
+   *
+   * Blocking both here (before any pthread_create()) makes every
+   * subsequently spawned thread inherit them blocked; the main thread
+   * unblocks them again just before entering the receive loop. Note
+   * that fanexec_init() runs AFTER that unblock and so re-blocks
+   * around its own pthread_create() calls - see there. */
   {
     sigset_t block;
+    int rc;
     sigemptyset(&block);
     sigaddset(&block, SIGINT);
     sigaddset(&block, SIGTERM);
-    if (pthread_sigmask(SIG_BLOCK, &block, NULL) != 0) {
+    /* strerror(rc): pthread_sigmask() returns the error number rather
+     * than setting errno - see fanexec_init(). */
+    rc = pthread_sigmask(SIG_BLOCK, &block, NULL);
+    if (rc != 0) {
       fprintf(stderr, "avd: failed to block SIGINT/SIGTERM: %s\n",
-              strerror(errno));
+              strerror(rc));
       return 1;
     }
   }
@@ -4071,9 +4172,12 @@ int main(int argc, char **argv) {
     }
 
     for (i = 0; i < avd_scan_threads; i++) {
-      if (pthread_create(&workers[i], NULL, scan_worker_main, NULL) != 0) {
+      /* strerror(rc): pthread_create() returns the error number and
+       * leaves errno alone, like the rest of the pthread_ family. */
+      int rc = pthread_create(&workers[i], NULL, scan_worker_main, NULL);
+      if (rc != 0) {
         fprintf(stderr, "avd: pthread_create failed for worker %d: %s\n", i,
-                strerror(errno));
+                strerror(rc));
         break;
       }
       spawned++;
@@ -4096,10 +4200,10 @@ int main(int argc, char **argv) {
      * rather than refusing to start entirely. */
     control_started = (start_control_socket() == 0);
     if (control_started) {
-      if (pthread_create(&control_thread, NULL, control_accept_main, NULL) !=
-          0) {
+      int rc = pthread_create(&control_thread, NULL, control_accept_main, NULL);
+      if (rc != 0) {
         fprintf(stderr, "avd: pthread_create failed for control socket: %s\n",
-                strerror(errno));
+                strerror(rc));
         close(control_sock_fd);
         control_sock_fd = -1;
         unlink(control_sock_path);
@@ -4113,20 +4217,23 @@ int main(int argc, char **argv) {
     }
 
     /* Main thread only: unblock the termination signals blocked above
-     * so they are delivered here - the one thread parked in the
-     * EINTR-able nl_recvmsgs_default() loop - rather than on a worker
-     * or control thread that could never wake that loop up. Workers and
-     * the control accept thread (plus every per-connection thread it
-     * spawns) keep the inherited blocked mask for the life of the
-     * process. On the unlikely pthread_sigmask() failure, abort startup
-     * rather than run with undeliverable termination signals. */
+     * so they are delivered here - the thread that drives shutdown -
+     * rather than on a worker or control thread, on whose stack we do
+     * not want a handler running. (Delivery elsewhere is no longer a
+     * hang: the receive loop polls `running` on a timer because libnl
+     * will not let a signal interrupt nl_recvmsgs_default() at all.)
+     * Workers and the control accept thread (plus every per-connection
+     * thread it spawns) keep the inherited blocked mask for the life
+     * of the process. On the unlikely pthread_sigmask() failure, abort
+     * startup rather than run with undeliverable termination
+     * signals. */
     {
       sigset_t unblock;
       sigemptyset(&unblock);
       sigaddset(&unblock, SIGINT);
       sigaddset(&unblock, SIGTERM);
-      if (pthread_sigmask(SIG_UNBLOCK, &unblock, NULL) != 0) {
-        int unblock_err = errno;
+      int unblock_err = pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
+      if (unblock_err != 0) {
         fprintf(stderr, "avd: failed to unblock SIGINT/SIGTERM in main: %s\n",
                 strerror(unblock_err));
         pthread_mutex_lock(&queue_lock);
@@ -4175,8 +4282,43 @@ int main(int argc, char **argv) {
       running = 0;
     }
 
+    /* poll() first, then receive. nl_recvmsgs_default() cannot be
+     * relied on to return when a signal arrives: libnl retries EINTR
+     * inside its own recvmsg() (verified against libnl 3.12.0 - a
+     * SIGALRM during nl_recvmsgs_default() never brought it back),
+     * so a handler that sets `running = 0` has no way to wake this
+     * loop. avd would then sit in recvmsg until the NEXT netlink
+     * message happened to arrive, which on a quiet system is never.
+     *
+     * With the exec gate on, that is not merely a slow shutdown: the
+     * mount stays marked while avd refuses to exit, so every exec on
+     * it stays suspended. Caught by the #48 QEMU case, which SIGTERMs
+     * a live gate and waits for the exit.
+     *
+     * Polling the fd with a timeout re-checks `running` on a timer,
+     * the same shape the fanotify responders already use. The socket
+     * deliberately stays blocking rather than being switched to
+     * non-blocking: this loop is the only reader, so POLLIN means the
+     * following receive has data waiting, and the send path
+     * (send_verdict() and friends) keeps its existing semantics
+     * instead of having to grow EAGAIN handling. */
     while (running) {
-      int ret = nl_recvmsgs_default(sock);
+      struct pollfd nlpfd = {
+          .fd = nl_socket_get_fd(sock), .events = POLLIN, .revents = 0};
+      int pret = poll(&nlpfd, 1, AVD_NL_POLL_MS);
+      int ret;
+
+      if (pret < 0) {
+        if (errno == EINTR)
+          continue;
+        fprintf(stderr, "avd: poll on the netlink socket failed: %s\n",
+                strerror(errno));
+        break;
+      }
+      if (pret == 0)
+        continue; /* timeout - re-check `running` */
+
+      ret = nl_recvmsgs_default(sock);
       if (ret < 0 && ret != -NLE_INTR) {
         fprintf(stderr, "avd: nl_recvmsgs_default error: %s\n",
                 nl_geterror(ret));

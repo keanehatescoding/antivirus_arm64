@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/reboot.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -263,6 +265,184 @@ static char *read_kernel_log(void) {
   return buf;
 }
 
+/* ---- #48: helpers for the fanotify exec gate integration case ---- */
+
+/* Both gate cases below are deliberately NON-ELF files, and that is
+ * the whole trick that makes this attributable to avd.
+ *
+ * execve() on a non-ELF file can never succeed, so the question is
+ * never "did it run" - it is only WHICH error it failed with:
+ *
+ *   ENOEXEC - the exec was allowed through and the kernel's binfmt
+ *             layer then rejected the file as not an executable
+ *             format. This is the ungated outcome.
+ *   EPERM   - FAN_OPEN_EXEC_PERM was answered FAN_DENY. open_exec()
+ *             refuses before binfmt is ever consulted.
+ *
+ * The clean file and the malicious file are the same shape, on the
+ * same mount, exec'd by the same call. The only variable between them
+ * is the bytes avd scanned, so a difference in errno can only have
+ * come from avd's verdict. That is a tighter control than asserting a
+ * kill, which av.ko's own netlink path could also produce.
+ *
+ * `*killed` is reported separately rather than folded into the errno,
+ * because av.ko's kprobe path sees these execs too and its kill is
+ * workqueue-deferred: a SIGKILL landing here means the netlink path
+ * got there first, which is a different (and still interesting)
+ * outcome from the gate's synchronous refusal - not something to
+ * quietly average together. */
+static void exec_expect_failure(const char *path, int *exec_errno,
+                                int *killed) {
+  pid_t pid = fork();
+  int status;
+
+  if (pid < 0)
+    die("fork");
+
+  if (pid == 0) {
+    char *const argv[] = {(char *)path, NULL};
+
+    /* Same cold-pathname touch run_and_wait() explains at length -
+     * this case is about avd's gate, not about reproducing av.ko's
+     * kprobe EFAULT gap, so the pathname page is faulted in first to
+     * keep that variable out of the result. */
+    {
+      volatile char touch = path[0];
+      (void)touch;
+    }
+
+    execv(path, argv);
+
+    /* Deliberately NO usleep() before _exit(), unlike run_and_wait():
+     * there the sleep gives the deferred kill time to land, because a
+     * kill is what that check wants to observe. Here the errno IS the
+     * observation, so this exits immediately to carry it back before
+     * av.ko's workqueue can turn the result into a SIGKILL and
+     * destroy it. */
+    _exit(errno);
+  }
+
+  if (waitpid(pid, &status, 0) < 0)
+    die("waitpid");
+
+  *killed = WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+  *exec_errno = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* waitpid() with a deadline, so a daemon that does not shut down is a
+ * reported failure rather than a hung job that reads as infrastructure
+ * flake. Returns 1 if it exited on its own, 0 if it had to be
+ * SIGKILLed.
+ *
+ * *term_sig reports how it died, and is separate from *exit_code on
+ * purpose: a daemon that segfaults on the way out is reaped exactly
+ * like one that returned 0, so a caller reading only the return value
+ * would call a crash a clean shutdown. Collapsing both into a single
+ * -1 would still not distinguish "crashed" from "exited 1", and this
+ * is a test whose diagnostic is the whole product. */
+static int wait_for_exit(pid_t pid, int timeout_ms, int *exit_code,
+                         int *term_sig) {
+  int waited = 0;
+  int status;
+
+  for (;;) {
+    pid_t r = waitpid(pid, &status, WNOHANG);
+
+    if (r == pid) {
+      *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+      *term_sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+      return 1;
+    }
+    if (r < 0)
+      die("waitpid(daemon)");
+    if (waited >= timeout_ms)
+      break;
+    {
+      struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
+      nanosleep(&ts, NULL);
+    }
+    waited += 50;
+  }
+
+  kill(pid, SIGKILL);
+  waitpid(pid, &status, 0);
+  *exit_code = -1;
+  *term_sig = SIGKILL;
+  return 0;
+}
+
+/* Drains whatever avd left on the pipe. Every caller must have reaped
+ * avd first, and that ordering is load-bearing: avd never calls
+ * setvbuf() or fflush(), so its stdout is fully buffered the moment it
+ * is a pipe rather than a tty, and the lines this asserts on do not
+ * leave its buffer until exit flushes them. Reading earlier would see
+ * nothing and prove nothing.
+ *
+ * This is also why readiness below is polled by behaviour instead of
+ * by watching for the "gate active" line: that line is sitting in
+ * avd's buffer for as long as it would be useful.
+ *
+ * The poll() timeout is not how that ordering is enforced - stop_avd()
+ * is - but it bounds the damage if some future branch forgets. This
+ * pipe has no O_NONBLOCK and init closes its own write end at fork, so
+ * EOF requires avd to be gone; draining while it still lives used to
+ * block here forever, and since the branches that print avd's stdout
+ * are the ones diagnosing a broken gate, a real regression surfaced as
+ * a hung job killed by the workflow's outer timeout rather than as the
+ * FAIL it should be. A truncated diagnostic is a bad result; an
+ * inconclusive run is a worse one. */
+#define DRAIN_TIMEOUT_MS 5000
+
+static char *drain_pipe(int fd) {
+  static char buf[32768];
+  size_t used = 0;
+
+  for (;;) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    int pret = poll(&pfd, 1, DRAIN_TIMEOUT_MS);
+    ssize_t n;
+
+    if (pret < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    if (pret == 0) {
+      outmsg("QEMU_TEST: WARN: drain_pipe() timed out with avd's write "
+             "end still open - it was not reaped before draining; the "
+             "output below may be short\n");
+      break;
+    }
+
+    n = read(fd, buf + used, sizeof(buf) - 1 - used);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    if (n == 0)
+      break;
+    used += (size_t)n;
+    if (used >= sizeof(buf) - 1)
+      break;
+  }
+  buf[used] = '\0';
+  return buf;
+}
+
+/* SIGTERM, then reap - SIGKILLing after 15s if it comes to that.
+ * Needed before draining on any branch that bails out with avd still
+ * running: EOF on the pipe requires avd's write end to close, and
+ * SIGTERM rather than SIGKILL because exit() is what flushes the
+ * buffered stdout these branches are trying to print. */
+static void stop_avd(pid_t pid) {
+  int code, sig;
+
+  if (kill(pid, SIGTERM) != 0)
+    die("kill(avd, SIGTERM)");
+  (void)wait_for_exit(pid, 15000, &code, &sig);
+}
+
 int main(int argc, char *const argv[]) {
   if (argc > 1 && !strcmp(argv[1], "--clean-marker")) {
     _exit(42);
@@ -465,6 +645,369 @@ int main(int argc, char *const argv[]) {
                exited, code);
       }
     }
+  }
+
+  /* ---- #48: the fanotify exec gate, end to end through avd itself ----
+   *
+   * tests/test_fanotify_exec_gate.sh already covers this in two halves
+   * that never meet: static greps pinning the integration's shape, and
+   * tests/fanotify_exec_gate.c driving the raw fanotify mechanism with
+   * avd's own flags but a hardcoded content check standing in for the
+   * verdict. Neither half ever starts avd, so the seam between them -
+   * a real avd, marking a real mount, answering FAN_OPEN_EXEC_PERM
+   * with a verdict that actually came out of perform_scan() - was
+   * unproven until here. That is the whole reason this case exists in
+   * the one job that has a real kernel with av.ko loaded.
+   *
+   * The signal it reads is an errno, not a kill: both samples are
+   * non-ELF, so execve() can never succeed on either and the only
+   * variable left is WHICH failure comes back. FAN_OPEN_EXEC_PERM is
+   * answered inside open_exec(), before any binfmt handler is
+   * consulted, so a denied exec fails EPERM while an allowed one runs
+   * on and fails ENOEXEC at binfmt_elf. Verified directly against a
+   * live kernel rather than assumed: a standalone FAN_CLASS_CONTENT
+   * mark on a tmpfs answering FAN_ALLOW then FAN_DENY for the same
+   * non-ELF file gave errno 8 (ENOEXEC) and errno 1 (EPERM)
+   * respectively. Reading an errno is tighter than asserting a kill,
+   * because av.ko's netlink path can produce a kill too and that
+   * would not be attributable to the gate.
+   *
+   * It runs LAST on purpose. It is the only case in this file that
+   * leaves a daemon running, and marking /tmp gates every exec on that
+   * mount for as long as avd lives - so anything added after this must
+   * account for both. */
+  if (access("/avd", X_OK) != 0) {
+    /* Two harnesses boot this init: the CI job, which stages avd and
+     * its whole ldd closure, rules and corpus into the initramfs, and
+     * tests/test_detection_qemu.sh, which stages only init,
+     * cold_launcher and av.ko because it exists to exercise the
+     * kernel module and deliberately carries none of avd's build
+     * dependencies. Skipping here rather than failing keeps the local
+     * harness meaningful instead of red for a reason that has nothing
+     * to do with what it tests.
+     *
+     * A skip is only safe because it cannot happen unnoticed where it
+     * matters: the CI job greps the serial log for this case's PASS
+     * marker and fails the build if it is absent, so a silently
+     * skipped gate case there is already an error. */
+    outmsg("QEMU_TEST: SKIP: /avd not staged in this initramfs - the "
+           "fanotify exec gate case needs the daemon (CI stages it; the "
+           "local av.ko harness does not)\n");
+  } else {
+    const char *malicious = "/tmp/gate_malicious";
+    const char *clean = "/tmp/gate_clean";
+    /* Matches tests/fixtures/test.yar's
+     * Suspicious_Shell_Reverse_Shell_String (weight=100, override=true),
+     * which that file's own header explains is a test fixture that must
+     * never reach a production rules dir.
+     *
+     * Deliberately NOT the EICAR string the checks above use: EICAR's
+     * SHA-256 is in av.ko's own signature table, so an EICAR file would
+     * be convicted by the kernel's netlink path as well, and a denied
+     * exec could no longer be attributed to the gate. This content is
+     * invisible to av.ko and convicted only by avd's YARA pass.
+     *
+     * No `#!` on either file, and that matters: a shebang would make
+     * binfmt_script the thing that handles the exec, and it would fail
+     * with ENOENT looking for an interpreter that does not exist in
+     * this initramfs. Without one, a non-ELF file reaches binfmt_elf
+     * and fails ENOEXEC, which is the ungated outcome this case reads
+     * as its baseline. */
+    const char *malicious_content = "/bin/sh -i\n";
+    /* Measured, not assumed: the clean sample is not rule-free, it is
+     * under-threshold. Any non-ELF file trivially satisfies
+     * elf_analysis.yar's Entry_Point_Outside_Text (there is no .text
+     * section for an entry point to fall inside), so BOTH samples here
+     * carry its weight of 30. Conviction is
+     * `override_matched || score >= MALICIOUS_SCORE_THRESHOLD` (100),
+     * so 30 is CLEAN with room to spare, and what separates the two
+     * files is the fixture rule's override, not the score. If a future
+     * rule starts matching plain text, this case is what notices -
+     * and padding this file's content is the wrong fix. */
+    const char *clean_content = "nothing in this file is interesting\n";
+    const int deadline_ms = 60000;
+    int err, killed, code, sig;
+    int last_err = -1, last_killed = 0;
+    int waited = 0, denied = 0;
+    pid_t avd_pid;
+    int pipefd[2];
+    char *avd_out;
+    struct stat st;
+
+    write_file(malicious, malicious_content);
+    write_file(clean, clean_content);
+
+    /* Baseline, before avd exists. This is the vacuity guard for
+     * everything below: it establishes that ENOEXEC is what an
+     * ungated exec of these files looks like on this mount, so the
+     * EPERM asserted later cannot be something ambient that was
+     * always true. Both files, because the two must be
+     * indistinguishable until avd is the thing telling them apart. */
+    exec_expect_failure(malicious, &err, &killed);
+    if (killed || err != ENOEXEC) {
+      outmsg("QEMU_TEST: FAIL: gate baseline is broken - ungated exec of "
+             "%s gave errno=%d killed=%d, expected ENOEXEC (%d). Without "
+             "this the EPERM checked below would prove nothing.\n",
+             malicious, err, killed, ENOEXEC);
+      poweroff_now();
+      return 1;
+    }
+    exec_expect_failure(clean, &err, &killed);
+    if (killed || err != ENOEXEC) {
+      outmsg("QEMU_TEST: FAIL: gate baseline is broken - ungated exec of "
+             "%s gave errno=%d killed=%d, expected ENOEXEC (%d)\n",
+             clean, err, killed, ENOEXEC);
+      poweroff_now();
+      return 1;
+    }
+    outmsg("QEMU_TEST: gate baseline established (ungated exec = ENOEXEC)\n");
+
+    /* avd walks a path's parents all the way to "/" and refuses any
+     * directory an unprivileged uid controls, so a "/" that is not
+     * root-owned makes it decline its quarantine dir - and then a
+     * conviction denies the exec but leaves the file in place, which
+     * looks exactly like a quarantine bug further down. The initramfs
+     * is built with `cpio -R root:root` for this reason; check the
+     * result here so that if that ever regresses, the failure names
+     * the archive instead of blaming perform_scan(). Not repaired
+     * with a chown: a guest rootfs owned by the CI runner's uid is
+     * wrong for every other check in this file too, and hiding it
+     * here would leave the next one to rediscover it. */
+    if (stat("/", &st) != 0) {
+      outmsg("QEMU_TEST: FAIL: cannot stat / to check its ownership\n");
+      poweroff_now();
+      return 1;
+    }
+    if (st.st_uid != 0) {
+      outmsg("QEMU_TEST: FAIL: / is owned by uid %d, not root - the "
+             "initramfs was packed without `cpio -R root:root`, so avd "
+             "will refuse its quarantine dir and this case cannot mean "
+             "anything\n",
+             (int)st.st_uid);
+      poweroff_now();
+      return 1;
+    }
+
+    /* avd's stdout goes to a pipe, not the console, so the lines it
+     * prints can be asserted on rather than merely eyeballed in the
+     * serial log. Its stderr is left pointing at the console, where it
+     * is unbuffered and shows up live - which is what a failing run
+     * needs. See drain_pipe() for why the pipe is only read at the
+     * end. */
+    if (pipe(pipefd) != 0)
+      die("pipe for avd stdout");
+
+    avd_pid = fork();
+    if (avd_pid < 0)
+      die("fork avd");
+    if (avd_pid == 0) {
+      char *const av_argv[] = {(char *)"/avd", NULL};
+
+      close(pipefd[0]);
+      if (dup2(pipefd[1], 1) < 0)
+        _exit(120);
+      close(pipefd[1]);
+
+      /* Every path avd needs, named explicitly - none of the compiled-in
+       * defaults (/etc/hyprav/...) exist in this initramfs. */
+      setenv("AVD_RULES_DIR", "/av-rules", 1);
+      setenv("AVD_CORPUS_FILE", "/av-corpus/fuzzy_hashes.txt", 1);
+      setenv("AVD_TLSH_CORPUS_FILE", "/av-corpus/tlsh_hashes.txt", 1);
+      setenv("AVD_QUARANTINE_DIR", "/tmp/av-quarantine", 1);
+      setenv("AVD_SOCK_PATH", "/tmp/avd.sock", 1);
+      /* This initramfs has no /etc/ld.so.cache - the workflow copies
+       * avd's library closure in at the absolute paths ldd reported
+       * and nothing ever runs ldconfig. The loader would then be
+       * relying purely on its built-in default search path, which does
+       * cover Debian/Ubuntu's multiarch directories but is exactly the
+       * kind of implicit dependency that turns into a bare "error
+       * while loading shared libraries" with no other clue. Naming the
+       * directories outright costs nothing and keeps the failure mode
+       * out of the picture. */
+      setenv("LD_LIBRARY_PATH",
+             "/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu",
+             1);
+      /* The gate itself. /tmp is a tmpfs mounted by this init, so the
+       * blast radius of marking it is exactly the files staged here -
+       * notably NOT the rootfs holding /init and /avd. */
+      setenv("AVD_FANOTIFY_EXEC", "1", 1);
+      setenv("AVD_FANOTIFY_MARK", "/tmp", 1);
+
+      execv("/avd", av_argv);
+      _exit(121);
+    }
+    close(pipefd[1]);
+
+    /* Readiness is polled by behaviour rather than by watching for
+     * avd's "gate active" line, because that line is block-buffered
+     * inside avd for as long as it would be useful (drain_pipe() has
+     * the detail). Re-staging the file every iteration is not
+     * belt-and-braces: a conviction quarantines it, so the file is
+     * gone after the first attempt that avd actually scans. */
+    while (waited < deadline_ms) {
+      pid_t r = waitpid(avd_pid, &code, WNOHANG);
+
+      if (r == avd_pid) {
+        outmsg("QEMU_TEST: FAIL: avd exited during startup (status %d) - "
+               "the gate never armed. 120/121 mean the exec of /avd "
+               "itself failed, which points at a missing shared library "
+               "in the initramfs rather than at the gate.\n",
+               WIFEXITED(code) ? WEXITSTATUS(code) : -1);
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(pipefd[0]));
+        poweroff_now();
+        return 1;
+      }
+
+      write_file(malicious, malicious_content);
+      exec_expect_failure(malicious, &err, &killed);
+      last_err = err;
+      last_killed = killed;
+      if (!killed && err == EPERM) {
+        denied = 1;
+        break;
+      }
+      {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 200 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+      }
+      waited += 200;
+    }
+
+    if (!denied) {
+      outmsg("QEMU_TEST: FAIL: the exec gate never denied %s within %dms "
+             "(last errno=%d killed=%d). errno=%d (ENOEXEC) throughout "
+             "means avd is running but never marked the mount; killed=1 "
+             "means av.ko's netlink path convicted the file first, so "
+             "avd and its rules are fine and it is specifically the "
+             "fanotify gate that did not engage.\n",
+             malicious, deadline_ms, last_err, last_killed, ENOEXEC);
+      stop_avd(avd_pid); /* avd is still up here - see drain_pipe() */
+      outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(pipefd[0]));
+      poweroff_now();
+      return 1;
+    }
+    outmsg("QEMU_TEST: exec gate DENIED the malicious file (EPERM, "
+           "pre-exec)\n");
+
+    /* A gate that denies everything would pass the check above while
+     * being useless, so the clean file - same mount, same non-ELF
+     * shape, different bytes - has to still reach binfmt. */
+    exec_expect_failure(clean, &err, &killed);
+    if (killed || err != ENOEXEC) {
+      outmsg("QEMU_TEST: FAIL: the exec gate did not allow the clean file "
+             "(errno=%d killed=%d, expected ENOEXEC %d) - it is denying "
+             "on something other than the verdict\n",
+             err, killed, ENOEXEC);
+      stop_avd(avd_pid); /* avd is still up here - see drain_pipe() */
+      outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(pipefd[0]));
+      poweroff_now();
+      return 1;
+    }
+    outmsg("QEMU_TEST: exec gate ALLOWED the clean file\n");
+
+    /* perform_scan() quarantines what it convicts, on the gate's path
+     * as much as on the netlink one, so the denied file must be gone
+     * from where it was staged. This corroborates the EPERM against a
+     * second, independent effect of the same verdict. */
+    if (stat(malicious, &st) == 0) {
+      outmsg("QEMU_TEST: FAIL: %s was denied but is still at its original "
+             "path - perform_scan() convicted it without quarantining\n",
+             malicious);
+      poweroff_now();
+      return 1;
+    }
+
+    /* Shutdown. fanexec_stop() joins the responders before closing the
+     * fanotify fd, which is what releases any still-pending permission
+     * event; a daemon that cannot complete that leaves execs suspended
+     * on the marked mount with no kernel-side timeout, so "it exited"
+     * is a real assertion here and not a formality. */
+    if (kill(avd_pid, SIGTERM) != 0)
+      die("kill(avd, SIGTERM)");
+    if (!wait_for_exit(avd_pid, 15000, &code, &sig)) {
+      outmsg("QEMU_TEST: FAIL: avd did not exit within 15s of SIGTERM and "
+             "had to be SIGKILLed - the gate's shutdown path is stuck, "
+             "which is the state that strands suspended execs\n");
+      /* Expect this to be empty, and do not read that as a broken
+       * drain: avd never flushes, so a SIGKILLed avd takes its whole
+       * block-buffered stdout with it. Its stderr is on the console
+       * above, which is where a stuck shutdown actually shows itself. */
+      outmsg("QEMU_TEST: --- avd stdout (empty if SIGKILLed - see "
+             "stderr on the console above) ---\n%s\n",
+             drain_pipe(pipefd[0]));
+      poweroff_now();
+      return 1;
+    }
+
+    /* Reaped is not the same as shut down cleanly. avd returns 1 from
+     * main() when startup failed or when fanexec_abort() fired - an
+     * unrecoverable gate failure that SIGTERMs the process itself - so
+     * a gate that collapsed and tore itself down would be reaped here
+     * exactly like a healthy one, and without this the case would go
+     * on to report a clean shutdown. A signal means it crashed on the
+     * way out instead, which is the same story with a worse ending:
+     * either way the responders never joined and the mark's release is
+     * the kernel's doing rather than avd's. */
+    if (sig != 0 || code != 0) {
+      if (sig != 0)
+        outmsg("QEMU_TEST: FAIL: avd was killed by signal %d during "
+               "shutdown rather than exiting - the teardown path "
+               "crashed\n",
+               sig);
+      else
+        outmsg("QEMU_TEST: FAIL: avd exited %d on SIGTERM, not 0 - main() "
+               "returns 1 for a failed startup or a fanexec_abort(), so "
+               "the gate did not simply stop, it gave up\n",
+               code);
+      outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(pipefd[0]));
+      poweroff_now();
+      return 1;
+    }
+
+    /* The mount must be usable again once the gate is gone. This is
+     * the observable half of "no exec was left suspended": if the
+     * fanotify group had not been torn down cleanly, this exec would
+     * hang here rather than fail fast. */
+    write_file(malicious, malicious_content);
+    exec_expect_failure(malicious, &err, &killed);
+    if (err != ENOEXEC) {
+      outmsg("QEMU_TEST: FAIL: after avd exited, exec of %s gave errno=%d "
+             "killed=%d - expected ENOEXEC (%d), i.e. the mark released "
+             "and the mount back to its ungated behaviour\n",
+             malicious, err, killed, ENOEXEC);
+      poweroff_now();
+      return 1;
+    }
+
+    /* Only now is the pipe worth reading: avd has exited, so its
+     * buffered stdout has been flushed and the write end is closed.
+     * The exit-code and errno checks above say the right things
+     * happened; these two lines say avd is the thing that did them. */
+    avd_out = drain_pipe(pipefd[0]);
+    close(pipefd[0]);
+    if (!strstr(avd_out, "fanotify exec gate active")) {
+      outmsg("QEMU_TEST: FAIL: avd never reported the exec gate active, "
+             "yet the checks above passed - something other than the "
+             "gate is producing these results\n");
+      outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", avd_out);
+      poweroff_now();
+      return 1;
+    }
+    if (!strstr(avd_out, "fanotify exec DENIED") ||
+        !strstr(avd_out, "path=\"/tmp/gate_malicious\"")) {
+      outmsg("QEMU_TEST: FAIL: the exec was refused with EPERM but avd "
+             "logged no matching fanotify denial - the refusal did not "
+             "come from the gate\n");
+      outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", avd_out);
+      poweroff_now();
+      return 1;
+    }
+    outmsg("QEMU_TEST: avd shut down cleanly and released the mark\n");
+    /* Inside the else, never after it. The CI job greps for exactly
+     * this line to prove the case was not quietly dropped, so printing
+     * it on the skip path would forge the evidence that guard exists
+     * to check. */
+    outmsg("QEMU_TEST: fanotify exec gate integration check passed\n");
   }
 
   pass_and_poweroff();

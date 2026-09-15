@@ -21,13 +21,16 @@
 #      pkexec exactly as tests/run_all.sh does.
 #
 # WHAT THIS DOES NOT COVER, stated up front because #34's lesson here
-# was that a quiet gap is worse than a loud one: nothing runs avd
+# was that a quiet gap is worse than a loud one: neither half runs avd
 # itself with the gate switched on. avd refuses to start without the av
 # kernel module, which is arm64-only, so the integrated path cannot be
 # exercised on an ordinary development host at all. Part 1 pins the
 # integration's shape and part 2 proves the mechanism it sits on; the
-# seam between them - avd's own event loop, wired end to end - is
-# currently covered by neither. See the tracking issue for that.
+# seam between them - avd's own event loop, wired end to end - belongs
+# to the QEMU boot job, where there is a real kernel with av.ko loaded.
+# That case lives in tests/qemu-boot/init.c (issue #48), and several
+# checks here exist only because it found the corresponding bug: a
+# static check is cheap to run on every commit, a VM boot is not.
 #
 # Usage:
 #   tests/test_fanotify_exec_gate.sh
@@ -193,6 +196,32 @@ else
     else
         fail "mark scope is no longer read from AVD_FANOTIFY_MARK"
     fi
+    # main() unblocks SIGINT/SIGTERM in the main thread BEFORE calling
+    # fanexec_init(), so responders spawned without re-blocking inherit
+    # them unblocked and a process-directed SIGTERM can run the handler
+    # on a responder - on its stack, while it holds an unanswered
+    # FAN_OPEN_EXEC_PERM event. main()'s loop polls, so running = 0 is
+    # still seen within an interval; this is no longer a hang by
+    # itself, but it was one before that loop polled and it is not a
+    # place we want a handler. Found by the #48 QEMU case.
+    if grep -q 'pthread_sigmask' <<<"$INIT_BODY"; then
+        pass "responders are spawned with termination signals blocked"
+    else
+        fail "fanexec_init() spawns responders without blocking SIGINT/SIGTERM - the handler could run on a responder holding an unanswered exec event"
+    fi
+fi
+
+# Not gate code, but the gate is what makes it critical. libnl retries
+# EINTR inside its own recvmsg(), so a signal cannot break
+# nl_recvmsgs_default() out and a handler setting running = 0 has
+# nothing to wake the loop. avd then waits for the next netlink message
+# to notice it was asked to stop - never, on a quiet system - and with
+# the gate on it holds the mark the whole time, suspending every exec
+# on the marked mount. The loop must poll with a timeout instead.
+if grep -q 'AVD_NL_POLL_MS' "$AVD"; then
+    pass "the netlink receive loop re-checks running on a timer"
+else
+    fail "main()'s netlink loop no longer polls - libnl swallows EINTR, so SIGTERM would not be noticed until the next message and the gate would hold its mark meanwhile"
 fi
 
 section "#2: the gate stays off unless it is asked for, and fails loudly"

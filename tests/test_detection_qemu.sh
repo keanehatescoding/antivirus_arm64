@@ -137,7 +137,14 @@ chmod 755 root/init
 cp cold_launcher root/cold_launcher
 chmod 755 root/cold_launcher
 cp "$REPO_ROOT/av/av.ko" root/av.ko
-( cd root && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 ) > initramfs.cpio.gz
+# -R root:root: cpio otherwise stamps the archive with this machine's
+# ownership, giving the guest a "/" owned by an unprivileged uid. The
+# CI initramfs is packed the same way so the two harnesses agree on
+# what the guest rootfs looks like. In copy-out mode this only sets
+# header values, so it needs no privilege.
+( cd root && find . -print0 \
+    | cpio --null -o -H newc -R root:root 2>/dev/null \
+    | gzip -9 ) > initramfs.cpio.gz
 
 echo "test_detection_qemu.sh: booting in QEMU"
 # TCG (software emulation) unless this happens to already be a native
