@@ -624,7 +624,24 @@ int main(int argc, char *const argv[]) {
    * leaves a daemon running, and marking /tmp gates every exec on that
    * mount for as long as avd lives - so anything added after this must
    * account for both. */
-  {
+  if (access("/avd", X_OK) != 0) {
+    /* Two harnesses boot this init: the CI job, which stages avd and
+     * its whole ldd closure, rules and corpus into the initramfs, and
+     * tests/test_detection_qemu.sh, which stages only init,
+     * cold_launcher and av.ko because it exists to exercise the
+     * kernel module and deliberately carries none of avd's build
+     * dependencies. Skipping here rather than failing keeps the local
+     * harness meaningful instead of red for a reason that has nothing
+     * to do with what it tests.
+     *
+     * A skip is only safe because it cannot happen unnoticed where it
+     * matters: the CI job greps the serial log for this case's PASS
+     * marker and fails the build if it is absent, so a silently
+     * skipped gate case there is already an error. */
+    outmsg("QEMU_TEST: SKIP: /avd not staged in this initramfs - the "
+           "fanotify exec gate case needs the daemon (CI stages it; the "
+           "local av.ko harness does not)\n");
+  } else {
     const char *malicious = "/tmp/gate_malicious";
     const char *clean = "/tmp/gate_clean";
     /* Matches tests/fixtures/test.yar's
@@ -907,8 +924,12 @@ int main(int argc, char *const argv[]) {
       return 1;
     }
     outmsg("QEMU_TEST: avd shut down cleanly and released the mark\n");
+    /* Inside the else, never after it. The CI job greps for exactly
+     * this line to prove the case was not quietly dropped, so printing
+     * it on the skip path would forge the evidence that guard exists
+     * to check. */
+    outmsg("QEMU_TEST: fanotify exec gate integration check passed\n");
   }
-  outmsg("QEMU_TEST: fanotify exec gate integration check passed\n");
 
   pass_and_poweroff();
   return 0; /* unreached */
