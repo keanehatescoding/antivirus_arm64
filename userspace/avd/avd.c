@@ -2623,12 +2623,60 @@ static int fanexec_init(void) {
     fanexec_fd = -1;
     return -1;
   }
-  for (i = 0; i < fanexec_threads; i++) {
-    if (pthread_create(&fanexec_tids[i], NULL, fanexec_main, NULL) != 0) {
-      fprintf(stderr, "avd: could not start fanotify responder thread %d\n", i);
-      break;
+  /* Responders must not be able to receive SIGINT/SIGTERM. main()
+   * blocks both before spawning any thread precisely so termination
+   * lands on the one thread parked in the EINTR-able
+   * nl_recvmsgs_default() loop - but it unblocks them again in the
+   * main thread just before that loop, and fanexec_init() is called
+   * AFTER that point. Threads inherit their creator's mask, so
+   * spawning responders here would hand each of them SIGTERM
+   * unblocked; the kernel could then deliver a process-directed
+   * SIGTERM to a responder, where handle_sigint() sets `running = 0`
+   * while main stays blocked in nl_recvmsgs_default() with nothing to
+   * wake it. avd would ignore SIGTERM entirely, and since the mount
+   * is still marked, every exec on it stays suspended - the exact
+   * wedge the gate is supposed to avoid. Caught by the #48 QEMU case,
+   * which SIGTERMs a live gate and waits for the exit.
+   *
+   * Blocked here around the pthread_create() loop and restored after,
+   * rather than by reordering main(): this way fanexec_init() is
+   * correct wherever it is called from, instead of depending on a
+   * call-site ordering that nothing enforces and that already
+   * silently broke once. */
+  {
+    sigset_t block, prev;
+
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &block, &prev) != 0) {
+      fprintf(stderr,
+              "avd: could not block termination signals before starting "
+              "responders: %s\n",
+              strerror(errno));
+      free(fanexec_tids);
+      fanexec_tids = NULL;
+      close(fanexec_fd);
+      fanexec_fd = -1;
+      return -1;
     }
-    fanexec_tids_started++;
+
+    for (i = 0; i < fanexec_threads; i++) {
+      if (pthread_create(&fanexec_tids[i], NULL, fanexec_main, NULL) != 0) {
+        fprintf(stderr, "avd: could not start fanotify responder thread %d\n",
+                i);
+        break;
+      }
+      fanexec_tids_started++;
+    }
+
+    /* Restore before returning either way - the caller is the main
+     * thread and it needs these deliverable again. */
+    if (pthread_sigmask(SIG_SETMASK, &prev, NULL) != 0)
+      fprintf(stderr,
+              "avd: warning: could not restore the signal mask after "
+              "starting responders: %s\n",
+              strerror(errno));
   }
   if (fanexec_tids_started == 0) {
     fprintf(stderr, "avd: no fanotify responder threads - exec gate not started\n");

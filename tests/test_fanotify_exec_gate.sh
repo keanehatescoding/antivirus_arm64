@@ -193,6 +193,18 @@ else
     else
         fail "mark scope is no longer read from AVD_FANOTIFY_MARK"
     fi
+    # main() unblocks SIGINT/SIGTERM in the main thread BEFORE calling
+    # fanexec_init(), so responders spawned without re-blocking inherit
+    # them unblocked. A process-directed SIGTERM delivered to a
+    # responder sets running = 0 there while main stays parked in
+    # nl_recvmsgs_default() with nothing to EINTR it - avd then ignores
+    # SIGTERM with the mount still marked, suspending every exec on it.
+    # Found by the #48 QEMU case; this keeps it from coming back.
+    if grep -q 'pthread_sigmask' <<<"$INIT_BODY"; then
+        pass "responders are spawned with termination signals blocked"
+    else
+        fail "fanexec_init() spawns responders without blocking SIGINT/SIGTERM - a SIGTERM landing on one wedges shutdown with the mount still marked"
+    fi
 fi
 
 section "#2: the gate stays off unless it is asked for, and fails loudly"

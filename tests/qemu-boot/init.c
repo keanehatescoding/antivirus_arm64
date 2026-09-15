@@ -857,7 +857,13 @@ int main(int argc, char *const argv[]) {
       outmsg("QEMU_TEST: FAIL: avd did not exit within 15s of SIGTERM and "
              "had to be SIGKILLed - the gate's shutdown path is stuck, "
              "which is the state that strands suspended execs\n");
-      outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(pipefd[0]));
+      /* Expect this to be empty, and do not read that as a broken
+       * drain: avd never flushes, so a SIGKILLed avd takes its whole
+       * block-buffered stdout with it. Its stderr is on the console
+       * above, which is where a stuck shutdown actually shows itself. */
+      outmsg("QEMU_TEST: --- avd stdout (empty if SIGKILLed - see "
+             "stderr on the console above) ---\n%s\n",
+             drain_pipe(pipefd[0]));
       poweroff_now();
       return 1;
     }
