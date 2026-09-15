@@ -88,6 +88,23 @@ not oversights. A *new* way to defeat one of them is still very welcome:
   faulted, `MADV_DONTNEED`'d before exec) so the kprobe handler's
   atomic copy genuinely sees a non-resident page, and the case gates
   on the bypass it observes.
+
+  Both halves of that gap share one cause — the verdict is computed from a
+  pathname the module copied itself, not from the file the kernel already
+  resolved — and a module cannot fix it, because `security_add_hooks()` is
+  `__init` and unexported, so nothing loaded with `insmod` can ever
+  register `bprm_check_security`. `avd` therefore ships an **opt-in
+  fanotify exec gate** (`FAN_OPEN_EXEC_PERM`, discussion #33 option C)
+  that scans the kernel-supplied event fd instead. On marked mounts it
+  closes both halves: there is no second `open()` to race, and no
+  pathname is copied in atomic context for a cold page to defeat.
+
+  It is **off unless `AVD_FANOTIFY_EXEC=1` and `AVD_FANOTIFY_MARK=...`
+  are set**, it covers only the mounts named there, and the kprobe path
+  is unchanged and still has both gaps. So this is not yet a reason to
+  consider the gap closed on a default install — please still don't
+  report the gap itself, but a way to defeat the *gate* on a mount it
+  covers is very much in scope.
 - **arm64 only.** The module hooks `__arm64_sys_execve` by symbol name and
   will not build or load on x86_64.
 

@@ -73,8 +73,14 @@ jobs:
           # qemu-system-arm (not qemu-system-x86) ships the
           # qemu-system-aarch64 binary this job actually invokes below,
           # on both Debian and Ubuntu.
+          # The libnl/yara/fuzzy trio and pkg-config are avd's build
+          # dependencies (see userspace/avd/Makefile's checkdeps
+          # target), needed here because this job now boots avd itself
+          # for the exec-gate integration case - see the initramfs
+          # step below and issue #48.
           sudo apt-get install -y build-essential bc bison flex libssl-dev \
-            libelf-dev qemu-system-arm cpio
+            libelf-dev qemu-system-arm cpio pkg-config \
+            libnl-3-dev libnl-genl-3-dev libyara-dev libfuzzy-dev
 
       - name: Cache built kernel tree
         id: cache-kernel
@@ -171,6 +177,21 @@ jobs:
           ./scripts/config --enable CONFIG_SERIAL_AMBA_PL011
           ./scripts/config --enable CONFIG_SERIAL_AMBA_PL011_CONSOLE
           ./scripts/config --enable CONFIG_PRINTK
+          # avd's FAN_OPEN_EXEC_PERM exec gate (issue #2 / #48). The
+          # second symbol is the one that matters and the one distro
+          # kernels most often leave off: CONFIG_FANOTIFY alone can
+          # only WATCH execs, never deny one, and fanotify_init() with
+          # FAN_CLASS_CONTENT fails EINVAL without it - which avd
+          # reports and then refuses to start, so a missing symbol here
+          # surfaces as an avd startup failure rather than as a gate
+          # that silently allows everything.
+          ./scripts/config --enable CONFIG_FANOTIFY
+          ./scripts/config --enable CONFIG_FANOTIFY_ACCESS_PERMISSIONS
+          # AF_UNIX, for avd's control socket. defconfig has it, but so
+          # does defconfig have most of the list above - spelled out
+          # for the same reason: this job's boot must not depend on
+          # what a given kernel version's defconfig happens to include.
+          ./scripts/config --enable CONFIG_UNIX
           make ARCH=arm64 olddefconfig
           make ARCH=arm64 -j"$(nproc)" Image modules
 
@@ -203,7 +224,71 @@ jobs:
           cp cold_launcher root/cold_launcher
           chmod 755 root/cold_launcher
           cp "$GITHUB_WORKSPACE/av/av.ko" root/av.ko
-          ( cd root && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 ) > initramfs.cpio.gz
+
+          # ---- avd, for the exec-gate integration case (issue #48) ----
+          # Built by its own Makefile with its normal flags, so what
+          # boots here is the binary the project ships rather than a
+          # test-only variant of it.
+          make -C "$GITHUB_WORKSPACE/userspace/avd"
+          cp "$GITHUB_WORKSPACE/userspace/avd/avd" root/avd
+          chmod 755 root/avd
+
+          # Everything else in this initramfs is `gcc -static`, so
+          # until now it had no dynamic loader and no libraries at all.
+          # avd is dynamically linked and deliberately stays that way:
+          # static-linking it would mean booting a differently-built
+          # binary (different hardening flags, a different libc path)
+          # than the one that ships, which is the opposite of what an
+          # integration test is for.
+          #
+          # The closure is COMPUTED from ldd rather than listed by
+          # hand - yara alone pulls in libcrypto, libmagic and a whole
+          # compression stack, and a hand-written list would rot into
+          # an unexplained avd startup failure the first time one of
+          # them gained a dependency.
+          #
+          # Each library is copied to the SAME absolute path it has on
+          # the runner, which is what makes LD_LIBRARY_PATH
+          # unnecessary: the interpreter baked into avd's PT_INTERP,
+          # and every DT_NEEDED under it, resolve inside the initramfs
+          # unchanged.
+          ldd "$GITHUB_WORKSPACE/userspace/avd/avd"
+          ldd "$GITHUB_WORKSPACE/userspace/avd/avd" \
+            | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) { print $i; break } }' \
+            | sort -u \
+            | while read -r lib; do
+                mkdir -p "root$(dirname "$lib")"
+                cp -L "$lib" "root$lib"
+              done
+
+          # avd's rules and corpora. Production rules plus
+          # tests/fixtures/test.yar, staged exactly the way
+          # tests/test_avd_socket.sh stages them: the fixture is what
+          # convicts init.c's malicious sample, and its own header
+          # explains why it must never reach a production rules dir.
+          mkdir -p root/av-rules root/av-corpus
+          cp "$GITHUB_WORKSPACE"/rules/heuristics.yar \
+             "$GITHUB_WORKSPACE"/rules/elf_analysis.yar \
+             "$GITHUB_WORKSPACE"/rules/entropy.yar \
+             "$GITHUB_WORKSPACE"/tests/fixtures/test.yar \
+             root/av-rules/
+          cp "$GITHUB_WORKSPACE"/corpus/fuzzy_hashes.txt \
+             "$GITHUB_WORKSPACE"/corpus/tlsh_hashes.txt \
+             root/av-corpus/
+
+          # -R root:root because cpio otherwise stamps the archive with
+          # the ownership it sees on the runner, and the runner is not
+          # root - every entry, including "." (which becomes the guest's
+          # "/"), would land owned by uid 1001. That is not how a real
+          # initramfs looks, and avd notices: dir_hierarchy_trusted()
+          # walks a path's parents to "/" and refuses any directory an
+          # unprivileged uid controls, so a 1001-owned "/" makes it
+          # decline both its control socket and its quarantine dir. In
+          # copy-out mode -R only sets the header values, so this needs
+          # no privilege here.
+          ( cd root && find . -print0 \
+              | cpio --null -o -H newc -R root:root 2>/dev/null \
+              | gzip -9 ) > initramfs.cpio.gz
           ls -la initramfs.cpio.gz
 
       - name: Boot in QEMU and check for detection
@@ -230,7 +315,17 @@ jobs:
             echo "KVM unavailable - falling back to TCG (software emulation)"
           fi
 
-          timeout 90 qemu-system-aarch64 \
+          # 300s, not the 90s this ran with before the exec-gate case
+          # (#48) was added. That case starts avd inside the guest and
+          # polls for up to 60s for the gate to arm, plus avd's own
+          # startup (compiling the YARA rule set) and up to 15s for its
+          # shutdown - all of which is cheap under KVM and emphatically
+          # is not under TCG, which is the leg free-tier runners
+          # actually take. A budget that clips the guest mid-test shows
+          # up as "neither PASS nor FAIL", i.e. as a harness defect,
+          # so it is set with room rather than tuned to the observed
+          # time.
+          timeout 300 qemu-system-aarch64 \
             -M virt \
             -kernel "$KDIR/arch/arm64/boot/Image" \
             -initrd initramfs.cpio.gz \
@@ -276,6 +371,22 @@ jobs:
               echo "::error::init never started - boot failed before the" \
                    "test ran; see log above"
             fi
+            exit 1
+          fi
+
+          # A PASS means init reached the end, which today implies the
+          # exec-gate case ran - but only because it sits before
+          # pass_and_poweroff(). That is an ordering, not a guarantee,
+          # and a case deleted or #if'd out of init.c would still
+          # produce a perfectly green PASS. Assert the marker
+          # explicitly so removing the case has to be a deliberate edit
+          # here too.
+          if ! grep -q "QEMU_TEST: fanotify exec gate integration check passed" \
+               serial.log; then
+            echo "::error::init reported PASS but the fanotify exec gate" \
+                 "case (#48) never printed its marker - the case was" \
+                 "skipped or removed. A green run without it is not" \
+                 "coverage of the gate."
             exit 1
           fi
 
