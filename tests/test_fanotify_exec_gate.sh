@@ -364,11 +364,17 @@ done
 # running avd with a 1s YARA budget. That only works if the budget is
 # runtime-tunable: a hardcoded SCAN_TIMEOUT_SECS would make the case
 # unstageable without a rebuild, and a tunable that nothing reads is
-# a flag-shaped no-op. Both halves pinned here so neither rots.
-if grep -q 'avd_scan_timeout_secs = parse_tunable_env("AVD_SCAN_TIMEOUT_SECS"' "$AVD"; then
-    pass "YARA scan budget is tunable via AVD_SCAN_TIMEOUT_SECS"
+# a flag-shaped no-op. The call is matched in full - default plus both
+# bound macros - so passing 0, a literal, or a wider max still fails
+# here even though the bound macros exist separately below.
+TUNABLE_CALL="$(grep -A3 'parse_tunable_env("AVD_SCAN_TIMEOUT_SECS"' "$AVD" || true)"
+if grep -q 'parse_tunable_env("AVD_SCAN_TIMEOUT_SECS"' <<<"$TUNABLE_CALL" \
+    && grep -qE '^[[:space:]]*SCAN_TIMEOUT_SECS,$' <<<"$TUNABLE_CALL" \
+    && grep -qE '^[[:space:]]*AVD_SCAN_TIMEOUT_MIN,$' <<<"$TUNABLE_CALL" \
+    && grep -qE '^[[:space:]]*AVD_SCAN_TIMEOUT_MAX\)' <<<"$TUNABLE_CALL"; then
+    pass "YARA scan budget is tunable via AVD_SCAN_TIMEOUT_SECS (default + both bounds)"
 else
-    fail "AVD_SCAN_TIMEOUT_SECS is not wired - the fail-closed QEMU case cannot set its budget"
+    fail "AVD_SCAN_TIMEOUT_SECS is not wired with its default and bounds - the fail-closed QEMU case cannot set its budget"
 fi
 if grep -q 'yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,' <<<"$SCAN_BODY" \
     && grep -q 'avd_scan_timeout_secs' <<<"$SCAN_BODY" \
