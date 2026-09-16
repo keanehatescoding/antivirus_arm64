@@ -1067,7 +1067,8 @@ int main(int argc, char *const argv[]) {
       pid_t fc_pid;
       int fc_pipe[2];
       char *fc_out;
-      int fc_waited = 0, fc_denied = 0;
+      int fc_denied = 0;
+      struct timespec fc_start;
       int fc_err = -1, fc_killed = 0;
 
       write_repeated(slow, 'a', 1536);
@@ -1100,8 +1101,7 @@ int main(int argc, char *const argv[]) {
                1);
         setenv("AVD_FANOTIFY_EXEC", "1", 1);
         setenv("AVD_FANOTIFY_MARK", "/tmp", 1);
-        setenv("AVD_FANOTIFY_FAIL_CLOSED", "1", 1);
-        /* 1s budget: the slow file needs ~6s, small files need ~1ms
+        /* 1s budget: the slow file needs ~1.35s, small files need ~1ms
          * (calibrated on libyara 4.5.8 - see the fixture's header).
          * TCG only widens the margin. */
         setenv("AVD_SCAN_TIMEOUT_SECS", "1", 1);
@@ -1116,8 +1116,19 @@ int main(int argc, char *const argv[]) {
        * way, but a stale path would forge ENOENT into evidence),
        * and treat the first EPERM as armed. Deadline is generous:
        * avd startup (rule compile) plus the 1s scan itself, all
-       * under TCG. */
-      while (fc_waited < deadline_ms) {
+       * under TCG.
+       *
+       * Wall-clock deadline, not an iteration count: each
+       * exec_expect_failure() here blocks for the full 1s YARA
+       * budget while the gate is not yet denying (vs ~1ms per exec
+       * in the verdict case above), so a fixed += 200 per iteration
+       * would undercount real time ~6x and let the loop run past the
+       * workflow's outer QEMU timeout - turning the intended
+       * "never denied" FAIL below into an opaque harness timeout. */
+      clock_gettime(CLOCK_MONOTONIC, &fc_start);
+      for (;;) {
+        struct timespec now;
+        long elapsed_ms;
         pid_t r = waitpid(fc_pid, &code, WNOHANG);
 
         if (r == fc_pid) {
@@ -1137,11 +1148,15 @@ int main(int argc, char *const argv[]) {
           fc_denied = 1;
           break;
         }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed_ms = (now.tv_sec - fc_start.tv_sec) * 1000L +
+                     (now.tv_nsec - fc_start.tv_nsec) / 1000000L;
+        if (elapsed_ms >= deadline_ms)
+          break;
         {
           struct timespec ts = {.tv_sec = 0, .tv_nsec = 200 * 1000 * 1000L};
           nanosleep(&ts, NULL);
         }
-        fc_waited += 200;
       }
       if (!fc_denied) {
         outmsg("QEMU_TEST: FAIL: fail-closed gate never denied %s within "

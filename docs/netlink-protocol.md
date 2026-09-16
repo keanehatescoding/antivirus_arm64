@@ -184,8 +184,10 @@ by watching your own shell die.
   `AVD_FANOTIFY_EXEC=1`, `AVD_FANOTIFY_MARK=/:/home` (required, no
   default), optionally `AVD_FANOTIFY_FAIL_CLOSED=1` and
   `AVD_FANOTIFY_THREADS=N`. The per-scan YARA budget is tunable via
-  `AVD_SCAN_TIMEOUT_SECS` (default 10, range 1-3600; 0 is refused
-  because YARA treats it as "no timeout"). The kprobe path is unchanged
+  `AVD_SCAN_TIMEOUT_SECS` (default 10, range 1-10: the tunable only
+  shortens - a longer budget would outrun av/main.c's daemon_timeout_ms
+  headroom and avctl's slow-verb budget; 0 is refused because YARA
+  treats it as "no timeout"). The kprobe path is unchanged
   and still has both gaps, so this narrows the exposure rather than
   removing it. See discussion #33 for why fanotify over an LSM, and
   `tests/test_fanotify_exec_gate.sh` for what is and isn't covered by

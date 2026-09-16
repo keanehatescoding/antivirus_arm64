@@ -189,9 +189,19 @@
 /* Bounds for the AVD_SCAN_TIMEOUT_SECS override below. 0 is deliberately
  * excluded: YARA treats a timeout of 0 as "no timeout", so allowing it
  * would turn a typo into an unbounded scan holding a responder (and,
- * on the fanotify path, a suspended exec) indefinitely. */
+ * on the fanotify path, a suspended exec) indefinitely. The upper bound
+ * is the compiled-in default rather than an arbitrary large value:
+ * lengthening the budget past it breaks the two timeout invariants
+ * tuned around ~10s elsewhere - av/main.c's daemon_timeout_ms (default
+ * 12000ms, "a couple seconds of headroom over avd's real worst case",
+ * whose own comment warns the verdict-race returns if the kernel wait
+ * expires first) and userspace/avctl/avctl.c's
+ * AVCTL_CONTROL_SLOW_TIMEOUT_SECS (30s client-side SCAN budget).
+ * Shortening is always safe (verdicts only arrive earlier);
+ * lengthening needs those raised in step, so the tunable only goes
+ * down. */
 #define AVD_SCAN_TIMEOUT_MIN 1
-#define AVD_SCAN_TIMEOUT_MAX 3600
+#define AVD_SCAN_TIMEOUT_MAX SCAN_TIMEOUT_SECS
 
 /* Cap on what check_fuzzy_corpus()/check_tlsh_corpus() will read.
  * yr_rules_scan_fd() (the YARA path, see avd_scan_timeout_secs above) is
@@ -308,11 +318,14 @@ static YR_RULES *compiled_rules;
 static int avd_scan_threads = AVD_SCAN_THREADS_DEFAULT;
 static int avd_scan_queue_max = AVD_SCAN_QUEUE_MAX_DEFAULT;
 /* YARA budget per scan, in seconds (YARA's own unit - verified: a scan
- * needing ~6s returns ERROR_SCAN_TIMEOUT under timeout=1 and runs to
- * completion under timeout=0, which disables the limit entirely).
- * Set once in main() from AVD_SCAN_TIMEOUT_SECS before any worker or
- * responder thread exists, read-only after - same discipline as
- * avd_scan_threads above. */
+ * needing ~1.35s returns ERROR_SCAN_TIMEOUT under timeout=1 and runs
+ * to completion under timeout=0, which disables the limit entirely).
+ * Lowered at runtime via AVD_SCAN_TIMEOUT_SECS (range 1..default -
+ * raising past the default would break av/main.c's daemon_timeout_ms
+ * and avctl's slow-verb budget, so the tunable only goes down; see
+ * AVD_SCAN_TIMEOUT_MAX's comment). Set once in main() before any
+ * worker or responder thread exists, read-only after - same
+ * discipline as avd_scan_threads above. */
 static int avd_scan_timeout_secs = SCAN_TIMEOUT_SECS;
 
 /* nl_send_auto() touches `sock`'s internal sequence-number/port state,

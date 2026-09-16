@@ -379,11 +379,20 @@ else
 fi
 # 0 would disable YARA's timeout entirely (verified: timeout=0 means no
 # limit), turning a typo into an unbounded scan holding a suspended
-# exec indefinitely - so the tunable must refuse it.
+# exec indefinitely - so the tunable must refuse it. The upper bound is
+# the compiled-in default, not an arbitrary large value: lengthening
+# past it breaks av/main.c's daemon_timeout_ms headroom and avctl's
+# slow-verb budget, so the tunable only shortens. Both halves pinned
+# here so neither rots.
 if grep -q 'AVD_SCAN_TIMEOUT_MIN 1' "$AVD"; then
     pass "the timeout tunable refuses 0 (YARA's 'no timeout' value)"
 else
     fail "AVD_SCAN_TIMEOUT_MIN is not 1 - AVD_SCAN_TIMEOUT_SECS=0 would disable the scan budget"
+fi
+if grep -q 'AVD_SCAN_TIMEOUT_MAX SCAN_TIMEOUT_SECS' "$AVD"; then
+    pass "the timeout tunable only shortens (max is the compiled-in default)"
+else
+    fail "AVD_SCAN_TIMEOUT_MAX is not SCAN_TIMEOUT_SECS - a longer budget would outrun daemon_timeout_ms/avctl"
 fi
 
 STOP_BODY="$(extract_c_func "$AVD" fanexec_stop | strip_c_comments)"
