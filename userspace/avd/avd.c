@@ -160,12 +160,12 @@
 #define AVD_CONTROL_MAX_CONNS_PER_UID (AVD_CONTROL_MAX_CONNS / 4)
 /* Caps how many control-socket SCAN commands may run at once, separately
  * from AVD_CONTROL_MAX_CONNS. SCAN is the one control verb that runs
- * perform_scan() (bounded by SCAN_TIMEOUT_SECS, not
+ * perform_scan() (bounded by avd_scan_timeout_secs, not
  * AVD_CONTROL_RECV_TIMEOUT_SECS) directly on its own connection's thread
  * rather than sharing the kernel-triggered scan queue's worker pool - see
  * docs/avd-socket-protocol.md's SCAN section. Without a cap of its own, a
  * root-authenticated client issuing AVD_CONTROL_MAX_CONNS concurrent SCANs
- * would occupy every control connection slot for up to SCAN_TIMEOUT_SECS
+ * would occupy every control connection slot for up to avd_scan_timeout_secs
  * each, starving ordinary STATUS/VERDICTS/QUARANTINE LIST use by every
  * other local user for that whole window - left well under
  * AVD_CONTROL_MAX_CONNS so those verbs always have room regardless of how
@@ -186,9 +186,25 @@
  * was added as its own deliberate feature (see avctl's save/load). */
 #define AVD_VERDICT_HISTORY_MAX 500
 #define SCAN_TIMEOUT_SECS 10
+/* Bounds for the AVD_SCAN_TIMEOUT_SECS override below. 0 is deliberately
+ * excluded: YARA treats a timeout of 0 as "no timeout", so allowing it
+ * would turn a typo into an unbounded scan holding a responder (and,
+ * on the fanotify path, a suspended exec) indefinitely. The upper bound
+ * is the compiled-in default rather than an arbitrary large value:
+ * lengthening the budget past it breaks the two timeout invariants
+ * tuned around ~10s elsewhere - av/main.c's daemon_timeout_ms (default
+ * 12000ms, "a couple seconds of headroom over avd's real worst case",
+ * whose own comment warns the verdict-race returns if the kernel wait
+ * expires first) and userspace/avctl/avctl.c's
+ * AVCTL_CONTROL_SLOW_TIMEOUT_SECS (30s client-side SCAN budget).
+ * Shortening is always safe (verdicts only arrive earlier);
+ * lengthening needs those raised in step, so the tunable only goes
+ * down. */
+#define AVD_SCAN_TIMEOUT_MIN 1
+#define AVD_SCAN_TIMEOUT_MAX SCAN_TIMEOUT_SECS
 
 /* Cap on what check_fuzzy_corpus()/check_tlsh_corpus() will read.
- * yr_rules_scan_fd() (the YARA path, see SCAN_TIMEOUT_SECS above) is
+ * yr_rules_scan_fd() (the YARA path, see avd_scan_timeout_secs above) is
  * bounded by a timeout; libfuzzy's fuzzy_hash_file() and
  * av_tlsh_hash_fd() have no equivalent of their own and read to EOF
  * with nothing else stopping them. Only avd_scan_threads (default
@@ -200,7 +216,7 @@
  * though the two caps guard unrelated code paths. */
 #define MAX_FUZZY_TLSH_FILE_SIZE (256 * 1024 * 1024)
 #define MALICIOUS_SCORE_THRESHOLD 100
-/* handle_scan_request() (YARA scan, up to SCAN_TIMEOUT_SECS, plus the
+/* handle_scan_request() (YARA scan, up to avd_scan_timeout_secs, plus the
  * fuzzy-hash pass) used to run synchronously inside msg_handler(),
  * called directly from the single nl_recvmsgs_default() loop in
  * main(). A second SCAN_REQUEST arriving while a scan was in
@@ -301,6 +317,16 @@ static YR_RULES *compiled_rules;
  * no lock guards them. */
 static int avd_scan_threads = AVD_SCAN_THREADS_DEFAULT;
 static int avd_scan_queue_max = AVD_SCAN_QUEUE_MAX_DEFAULT;
+/* YARA budget per scan, in seconds (YARA's own unit - verified: a scan
+ * needing ~1.35s returns ERROR_SCAN_TIMEOUT under timeout=1 and runs
+ * to completion under timeout=0, which disables the limit entirely).
+ * Lowered at runtime via AVD_SCAN_TIMEOUT_SECS (range 1..default -
+ * raising past the default would break av/main.c's daemon_timeout_ms
+ * and avctl's slow-verb budget, so the tunable only goes down; see
+ * AVD_SCAN_TIMEOUT_MAX's comment). Set once in main() before any
+ * worker or responder thread exists, read-only after - same
+ * discipline as avd_scan_threads above. */
+static int avd_scan_timeout_secs = SCAN_TIMEOUT_SECS;
 
 /* nl_send_auto() touches `sock`'s internal sequence-number/port state,
  * which libnl does not guarantee is safe for concurrent callers - so
@@ -1783,7 +1809,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
    * verdict_record's uid field comment. */
   uid_t owner_uid = fstat(fd, &owner_st) == 0 ? owner_st.st_uid : (uid_t)-1;
   /* SHA256 size gate (issue #3): sha256_fd() used to stream the whole
-   * file with no timeout, unlike YARA (SCAN_TIMEOUT_SECS) and
+   * file with no timeout, unlike YARA (avd_scan_timeout_secs) and
    * fuzzy/TLSH (MAX_FUZZY_TLSH_FILE_SIZE). Two layers now, mirroring
    * the fuzzy path's own fast-reject plus capped-read shape: the
    * fstat() check below skips obviously-huge files without starting
@@ -1860,7 +1886,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   }
 
   ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
-                         SCAN_TIMEOUT_SECS);
+                         avd_scan_timeout_secs);
   if (ret != ERROR_SUCCESS) {
     /* File vanished, permission denied, scan timeout, etc. - fail
      * open here too, matching the kernel side's own fail-open
@@ -1871,7 +1897,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
      * this as a threat model rather than an error path: of all the
      * inconclusive outcomes here this is the one an attacker has the
      * most influence over, since the input file's own size and
-     * structure drive how long SCAN_TIMEOUT_SECS has to absorb. */
+     * structure drive how long avd_scan_timeout_secs has to absorb. */
     out->incomplete = true;
     goto record;
   }
@@ -2003,7 +2029,7 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
    * referring to the exact same file for its entire lifetime
    * regardless of what happens to `path` afterward (deleted, renamed,
    * replaced with a symlink to something else - even during the scan
-   * itself, which can take up to SCAN_TIMEOUT_SECS), so there's
+   * itself, which can take up to avd_scan_timeout_secs), so there's
    * nothing left for an attacker to swap out from under it. This
    * replaces the previous design's lstat-baseline-then-re-check-at-
    * rename-time approach, which could only narrow that window, not
@@ -3998,6 +4024,16 @@ int main(int argc, char **argv) {
                                          AVD_SCAN_QUEUE_MAX_DEFAULT,
                                          AVD_SCAN_QUEUE_MIN,
                                          AVD_SCAN_QUEUE_MAX_MAX);
+  /* Same parse_tunable_env() discipline as the pool sizes: invalid or
+   * out-of-range input keeps the compiled-in default and logs why,
+   * rather than silently running unbounded (0) or refusing to start.
+   * A second avd instance with AVD_FANOTIFY_FAIL_CLOSED=1 and this set
+   * low is how the QEMU gate case forces an incomplete scan at
+   * runtime (issue #51) - see tests/qemu-boot/init.c. */
+  avd_scan_timeout_secs = parse_tunable_env("AVD_SCAN_TIMEOUT_SECS",
+                                            SCAN_TIMEOUT_SECS,
+                                            AVD_SCAN_TIMEOUT_MIN,
+                                            AVD_SCAN_TIMEOUT_MAX);
 
   /* The fanotify exec gate (issue #2 / discussion #33 option C) - see
    * the block comment above fanexec_init(). Read here, acted on just

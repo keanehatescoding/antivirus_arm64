@@ -271,6 +271,7 @@ jobs:
              "$GITHUB_WORKSPACE"/rules/elf_analysis.yar \
              "$GITHUB_WORKSPACE"/rules/entropy.yar \
              "$GITHUB_WORKSPACE"/tests/fixtures/test.yar \
+             "$GITHUB_WORKSPACE"/tests/fixtures/fail_closed_slow.yar \
              root/av-rules/
           cp "$GITHUB_WORKSPACE"/corpus/fuzzy_hashes.txt \
              "$GITHUB_WORKSPACE"/corpus/tlsh_hashes.txt \
@@ -380,13 +381,23 @@ jobs:
           # and a case deleted or #if'd out of init.c would still
           # produce a perfectly green PASS. Assert the marker
           # explicitly so removing the case has to be a deliberate edit
-          # here too.
           if ! grep -q "QEMU_TEST: fanotify exec gate integration check passed" \
                serial.log; then
             echo "::error::init reported PASS but the fanotify exec gate" \
                  "case (#48) never printed its marker - the case was" \
                  "skipped or removed. A green run without it is not" \
                  "coverage of the gate."
+            exit 1
+          fi
+          # Issue #51: the fail-closed incomplete-scan half of the gate
+          # case. Same reasoning as the marker above - a PASS without
+          # this line means the flag's runtime contract was never
+          # exercised, not that it held.
+          if ! grep -q "QEMU_TEST: fanotify fail-closed incomplete-scan check passed" \
+               serial.log; then
+            echo "::error::init reported PASS but the fanotify fail-closed" \
+                 "case (#51) never printed its marker - the incomplete-scan" \
+                 "branch was not exercised at runtime."
             exit 1
           fi
 

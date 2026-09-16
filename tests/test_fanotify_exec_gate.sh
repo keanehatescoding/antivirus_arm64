@@ -360,6 +360,65 @@ for fn in handle_scan_request cmd_scan; do
     fi
 done
 
+# The QEMU fail-closed case (issue #51) forces an incomplete scan by
+# running avd with a 1s YARA budget. That only works if the budget is
+# runtime-tunable: a hardcoded SCAN_TIMEOUT_SECS would make the case
+# unstageable without a rebuild, and a tunable that nothing reads is
+# a flag-shaped no-op. The call is matched in full - default plus both
+# bound macros - so passing 0, a literal, or a wider max still fails
+# here even though the bound macros exist separately below.
+TUNABLE_CALL="$(grep -A3 'parse_tunable_env("AVD_SCAN_TIMEOUT_SECS"' "$AVD" || true)"
+if grep -q 'parse_tunable_env("AVD_SCAN_TIMEOUT_SECS"' <<<"$TUNABLE_CALL" \
+    && grep -qE '^[[:space:]]*SCAN_TIMEOUT_SECS,$' <<<"$TUNABLE_CALL" \
+    && grep -qE '^[[:space:]]*AVD_SCAN_TIMEOUT_MIN,$' <<<"$TUNABLE_CALL" \
+    && grep -qE '^[[:space:]]*AVD_SCAN_TIMEOUT_MAX\)' <<<"$TUNABLE_CALL"; then
+    pass "YARA scan budget is tunable via AVD_SCAN_TIMEOUT_SECS (default + both bounds)"
+else
+    fail "AVD_SCAN_TIMEOUT_SECS is not wired with its default and bounds - the fail-closed QEMU case cannot set its budget"
+fi
+if grep -q 'yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,' <<<"$SCAN_BODY" \
+    && grep -q 'avd_scan_timeout_secs' <<<"$SCAN_BODY" \
+    && ! grep -q 'SCAN_TIMEOUT_SECS)' <<<"$SCAN_BODY"; then
+    pass "perform_scan() scans under the tunable budget, not the compiled-in default"
+else
+    fail "perform_scan() does not use avd_scan_timeout_secs as its YARA budget"
+fi
+# 0 would disable YARA's timeout entirely (verified: timeout=0 means no
+# limit), turning a typo into an unbounded scan holding a suspended
+# exec indefinitely - so the tunable must refuse it. The upper bound is
+# the compiled-in default, not an arbitrary large value: lengthening
+# past it breaks av/main.c's daemon_timeout_ms headroom and avctl's
+# slow-verb budget, so the tunable only shortens. Both halves pinned
+# here so neither rots.
+if grep -q 'AVD_SCAN_TIMEOUT_MIN 1' "$AVD"; then
+    pass "the timeout tunable refuses 0 (YARA's 'no timeout' value)"
+else
+    fail "AVD_SCAN_TIMEOUT_MIN is not 1 - AVD_SCAN_TIMEOUT_SECS=0 would disable the scan budget"
+fi
+if grep -q 'AVD_SCAN_TIMEOUT_MAX SCAN_TIMEOUT_SECS' "$AVD"; then
+    pass "the timeout tunable only shortens (max is the compiled-in default)"
+else
+    fail "AVD_SCAN_TIMEOUT_MAX is not SCAN_TIMEOUT_SECS - a longer budget would outrun daemon_timeout_ms/avctl"
+fi
+
+# The fail-closed QEMU case (issue #51) only exercises the flag if its
+# second avd actually sets it: the verdict case above starts avd
+# without AVD_FANOTIFY_FAIL_CLOSED, so a dropped setenv here silently
+# turns the whole phase into a second fail-open gate (slow file
+# ALLOWED, "never denied" FAIL every run). dfd3553 did exactly this -
+# a comment reword in the same hunk deleted the setenv line, and the
+# 33/33 local run stayed green because nothing here reads init.c's
+# setenv calls. Counted, not just present: the verdict case must NOT
+# set it (fail-open control) and the fail-closed block must set it
+# exactly once.
+INIT="$REPO_ROOT/tests/qemu-boot/init.c"
+n_fc_setenv="$(grep -c 'setenv("AVD_FANOTIFY_FAIL_CLOSED", "1", 1)' "$INIT" || true)"
+if [ "$n_fc_setenv" -eq 1 ]; then
+    pass "the fail-closed QEMU phase arms its flag (exactly one setenv)"
+else
+    fail "expected exactly one AVD_FANOTIFY_FAIL_CLOSED setenv in init.c (fail-closed phase), found $n_fc_setenv"
+fi
+
 STOP_BODY="$(extract_c_func "$AVD" fanexec_stop | strip_c_comments)"
 # Closing the fanotify fd releases every still-pending permission event
 # as allowed, so it must not happen while a responder still holds one.

@@ -179,6 +179,29 @@ static void write_file(const char *path, const char *content) {
   close(fd);
 }
 
+/* Writes `n` copies of byte `c` to `path` (0700, like write_file()).
+ * Used for the #51 slow-scan fixture below: an 8KB file of identical
+ * bytes is content only a calibration rule cares about, and a fixed
+ * byte keeps the staging time independent of guest entropy. */
+static void write_repeated(const char *path, char c, size_t n) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
+  char chunk[4096];
+  size_t done = 0;
+
+  if (fd < 0)
+    die("open for repeated write");
+  memset(chunk, c, sizeof(chunk));
+  while (done < n) {
+    size_t want = n - done > sizeof(chunk) ? sizeof(chunk) : n - done;
+    ssize_t w = write(fd, chunk, want);
+
+    if (w < 0)
+      die("repeated write");
+    done += (size_t)w;
+  }
+  close(fd);
+}
+
 /* Runs `path` and reports how it terminated via *killed_by_sigkill /
  * *exited_cleanly. Blocks until it exits. `arg1`, if non-NULL, is
  * passed as argv[1] (used to re-exec /init itself with
@@ -1008,6 +1031,232 @@ int main(int argc, char *const argv[]) {
      * it on the skip path would forge the evidence that guard exists
      * to check. */
     outmsg("QEMU_TEST: fanotify exec gate integration check passed\n");
+    /* ---- #51: AVD_FANOTIFY_FAIL_CLOSED at runtime, via the
+     * incomplete-scan path ----
+     *
+     * The case above proves the gate's verdict path (malicious DENY,
+     * clean ALLOW) but starts avd without the flag, so every
+     * no-verdict path takes its default FAN_ALLOW and the fail-closed
+     * contract is never observed. This starts a SECOND avd with
+     * AVD_FANOTIFY_FAIL_CLOSED=1 and AVD_SCAN_TIMEOUT_SECS=1, then
+     * execs a file whose scan cannot conclude in that budget: 1.5KB of
+     * identical bytes against tests/fixtures/fail_closed_slow.yar's
+     * three calibration rules, whose nested quantifiers need ~1.35s on
+     * libyara 4.5.x while matching nothing (no 'b' present, so no
+     * conviction regardless of score - and weight=1 could never convict
+     * alone anyway). perform_scan() reports CLEAN with incomplete=1,
+     * and the handler must deny it because the flag is set.
+     *
+     * Same errno discipline as the verdict case: both samples are
+     * non-ELF, so the only variable is ENOEXEC (allowed through to
+     * binfmt) vs EPERM (the gate denied pre-exec). Attribution comes
+     * from the same two controls: the first avd's clean file staying
+     * ENOEXEC, and avd's own end-of-run tally ("1 allowed, ... 1
+     * undecided") showing the slow file denied without a detection -
+     * the incomplete branch counts there by design, not under denied.
+     *
+     * Non-vacuity, per #45: the small-clean control below proves the
+     * 1s budget does not deny everything, and the verdict case's
+     * ENOEXEC baseline proves clean content reaches binfmt ungated. If
+     * the incomplete branch ever stops consulting the flag, the slow
+     * file reads ENOEXEC where EPERM is asserted and this fails.
+     */
+    {
+      const char *slow = "/tmp/gate_slow";
+      const char *slow_clean = "/tmp/gate_slow_clean";
+      pid_t fc_pid;
+      int fc_pipe[2];
+      char *fc_out;
+      int fc_denied = 0;
+      struct timespec fc_start;
+      int fc_err = -1, fc_killed = 0;
+
+      write_repeated(slow, 'a', 1536);
+      write_file(slow_clean, clean_content);
+
+      if (pipe(fc_pipe) != 0)
+        die("pipe for fail-closed avd stdout");
+      fc_pid = fork();
+      if (fc_pid < 0)
+        die("fork fail-closed avd");
+      if (fc_pid == 0) {
+        char *const av_argv[] = {(char *)"/avd", NULL};
+
+        close(fc_pipe[0]);
+        if (dup2(fc_pipe[1], 1) < 0)
+          _exit(120);
+        close(fc_pipe[1]);
+        setenv("AVD_RULES_DIR", "/av-rules", 1);
+        setenv("AVD_CORPUS_FILE", "/av-corpus/fuzzy_hashes.txt", 1);
+        setenv("AVD_TLSH_CORPUS_FILE", "/av-corpus/tlsh_hashes.txt", 1);
+        setenv("AVD_QUARANTINE_DIR", "/tmp/av-quarantine", 1);
+        /* Separate socket path: the control socket is a filesystem
+         * path, and the first avd is gone by now - but reusing its
+         * path would turn a shutdown-ordering bug into a bind
+         * failure here, blaming this case for the earlier one's
+         * teardown. */
+        setenv("AVD_SOCK_PATH", "/tmp/avd-fc.sock", 1);
+        setenv("LD_LIBRARY_PATH",
+               "/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu",
+               1);
+        setenv("AVD_FANOTIFY_EXEC", "1", 1);
+        setenv("AVD_FANOTIFY_MARK", "/tmp", 1);
+        setenv("AVD_FANOTIFY_FAIL_CLOSED", "1", 1);
+        /* 1s budget: the slow file needs ~1.35s, small files need ~1ms
+         * (calibrated on libyara 4.5.8 - see the fixture's header).
+         * TCG only widens the margin. */
+        setenv("AVD_SCAN_TIMEOUT_SECS", "1", 1);
+        execv("/avd", av_argv);
+        _exit(121);
+      }
+      close(fc_pipe[1]);
+
+      /* Readiness, same behaviour-poll shape as the verdict case:
+       * re-stage the slow file every iteration (a fail-open avd
+       * would allow it; nothing quarantines a CLEAN file either
+       * way, but a stale path would forge ENOENT into evidence),
+       * and treat the first EPERM as armed. Deadline is generous:
+       * avd startup (rule compile) plus the 1s scan itself, all
+       * under TCG.
+       *
+       * Wall-clock deadline, not an iteration count: each
+       * exec_expect_failure() here blocks for the full 1s YARA
+       * budget while the gate is not yet denying (vs ~1ms per exec
+       * in the verdict case above), so a fixed += 200 per iteration
+       * would undercount real time ~6x and let the loop run past the
+       * workflow's outer QEMU timeout - turning the intended
+       * "never denied" FAIL below into an opaque harness timeout. */
+      clock_gettime(CLOCK_MONOTONIC, &fc_start);
+      for (;;) {
+        struct timespec now;
+        long elapsed_ms;
+        pid_t r = waitpid(fc_pid, &code, WNOHANG);
+
+        if (r == fc_pid) {
+          outmsg("QEMU_TEST: FAIL: fail-closed avd exited during startup "
+                 "(status %d) - the gate never armed\n",
+                 WIFEXITED(code) ? WEXITSTATUS(code) : -1);
+          outmsg("QEMU_TEST: --- avd stdout ---\n%s\n",
+                 drain_pipe(fc_pipe[0]));
+          poweroff_now();
+          return 1;
+        }
+        write_repeated(slow, 'a', 1536);
+        exec_expect_failure(slow, &err, &killed);
+        last_err = err;
+        last_killed = killed;
+        if (!killed && err == EPERM) {
+          fc_denied = 1;
+          break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed_ms = (now.tv_sec - fc_start.tv_sec) * 1000L +
+                     (now.tv_nsec - fc_start.tv_nsec) / 1000000L;
+        if (elapsed_ms >= deadline_ms)
+          break;
+        {
+          struct timespec ts = {.tv_sec = 0, .tv_nsec = 200 * 1000 * 1000L};
+          nanosleep(&ts, NULL);
+        }
+      }
+      if (!fc_denied) {
+        outmsg("QEMU_TEST: FAIL: fail-closed gate never denied %s within "
+               "%dms (last errno=%d killed=%d) - the incomplete-scan "
+               "branch is not denying\n",
+               slow, deadline_ms, last_err, last_killed);
+        stop_avd(fc_pid);
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n",
+               drain_pipe(fc_pipe[0]));
+        poweroff_now();
+        return 1;
+      }
+      outmsg("QEMU_TEST: fail-closed gate DENIED the incomplete scan "
+             "(EPERM, pre-exec)\n");
+
+      /* Companion control: a small clean file under the SAME 1s budget
+       * must still reach binfmt. This proves the EPERM above came
+       * from the scan not concluding, not from the 1s budget denying
+       * everything or the flag denying unconditionally. */
+      exec_expect_failure(slow_clean, &fc_err, &fc_killed);
+      if (fc_killed || fc_err != ENOEXEC) {
+        outmsg("QEMU_TEST: FAIL: fail-closed gate did not allow the small "
+               "clean file under the same 1s budget (errno=%d killed=%d, "
+               "expected ENOEXEC %d) - it is denying on something other "
+               "than incompleteness\n",
+               fc_err, fc_killed, ENOEXEC);
+        stop_avd(fc_pid);
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n",
+               drain_pipe(fc_pipe[0]));
+        poweroff_now();
+        return 1;
+      }
+      outmsg("QEMU_TEST: fail-closed gate ALLOWED the small clean file "
+             "under the same budget\n");
+
+      if (kill(fc_pid, SIGTERM) != 0)
+        die("kill(fail-closed avd, SIGTERM)");
+      if (!wait_for_exit(fc_pid, 15000, &code, &sig)) {
+        outmsg("QEMU_TEST: FAIL: fail-closed avd did not exit within 15s "
+               "of SIGTERM and had to be SIGKILLed\n");
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n",
+               drain_pipe(fc_pipe[0]));
+        poweroff_now();
+        return 1;
+      }
+      if (sig != 0 || code != 0) {
+        if (sig != 0)
+          outmsg("QEMU_TEST: FAIL: fail-closed avd was killed by signal "
+                 "%d during shutdown rather than exiting\n",
+                 sig);
+        else
+          outmsg("QEMU_TEST: FAIL: fail-closed avd exited %d on SIGTERM, "
+                 "not 0 - the gate gave up\n",
+                 code);
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n",
+               drain_pipe(fc_pipe[0]));
+        poweroff_now();
+        return 1;
+      }
+
+      /* Attribution, same as the verdict case: exit codes and errnos
+       * say the right things happened; avd's own log says it did
+       * them, and specifically through the incomplete branch. */
+      fc_out = drain_pipe(fc_pipe[0]);
+      close(fc_pipe[0]);
+      if (!strstr(fc_out, "fanotify exec gate active") ||
+          !strstr(fc_out, "fail-closed")) {
+        outmsg("QEMU_TEST: FAIL: fail-closed avd never reported the gate "
+               "active in fail-closed mode, yet the checks above passed "
+               "- something other than the gate is producing these "
+               "results\n");
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", fc_out);
+        poweroff_now();
+        return 1;
+      }
+      /* The per-event "did not complete" line goes to stderr, which
+       * stays on the console (see the set-up comment where avd is
+       * forked) - it is visible in the serial log above, not in this
+       * pipe. What stdout carries is the gate's end-of-run tally,
+       * where the incomplete-scan deny lands in the undecided column
+       * by design (nothing was detected - see fanexec_handle_event()'s
+       * comment). The exact tally is the assertion: "1 allowed" is
+       * the small-clean control, "1 undecided" is the slow file
+       * denied without a detection, "0 denied" rules out any
+       * conviction path producing the EPERM. A fail-open regression
+       * reads "2 allowed, 0 undecided" and fails here, same as at the
+       * errno assertions above. */
+      if (!strstr(fc_out, "1 allowed, 0 denied, 1 undecided")) {
+        outmsg("QEMU_TEST: FAIL: fail-closed avd's tally is not \"1 "
+               "allowed, 0 denied, 1 undecided\" - the slow exec's EPERM "
+               "did not come from the incomplete-scan branch\n");
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", fc_out);
+        poweroff_now();
+        return 1;
+      }
+      outmsg("QEMU_TEST: fail-closed avd shut down cleanly and released "
+             "the mark\n");
+      outmsg("QEMU_TEST: fanotify fail-closed incomplete-scan check passed\n");
+    }
   }
 
   pass_and_poweroff();
