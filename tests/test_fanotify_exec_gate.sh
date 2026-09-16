@@ -360,6 +360,32 @@ for fn in handle_scan_request cmd_scan; do
     fi
 done
 
+# The QEMU fail-closed case (issue #51) forces an incomplete scan by
+# running avd with a 1s YARA budget. That only works if the budget is
+# runtime-tunable: a hardcoded SCAN_TIMEOUT_SECS would make the case
+# unstageable without a rebuild, and a tunable that nothing reads is
+# a flag-shaped no-op. Both halves pinned here so neither rots.
+if grep -q 'avd_scan_timeout_secs = parse_tunable_env("AVD_SCAN_TIMEOUT_SECS"' "$AVD"; then
+    pass "YARA scan budget is tunable via AVD_SCAN_TIMEOUT_SECS"
+else
+    fail "AVD_SCAN_TIMEOUT_SECS is not wired - the fail-closed QEMU case cannot set its budget"
+fi
+if grep -q 'yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,' <<<"$SCAN_BODY" \
+    && grep -q 'avd_scan_timeout_secs' <<<"$SCAN_BODY" \
+    && ! grep -q 'SCAN_TIMEOUT_SECS)' <<<"$SCAN_BODY"; then
+    pass "perform_scan() scans under the tunable budget, not the compiled-in default"
+else
+    fail "perform_scan() does not use avd_scan_timeout_secs as its YARA budget"
+fi
+# 0 would disable YARA's timeout entirely (verified: timeout=0 means no
+# limit), turning a typo into an unbounded scan holding a suspended
+# exec indefinitely - so the tunable must refuse it.
+if grep -q 'AVD_SCAN_TIMEOUT_MIN 1' "$AVD"; then
+    pass "the timeout tunable refuses 0 (YARA's 'no timeout' value)"
+else
+    fail "AVD_SCAN_TIMEOUT_MIN is not 1 - AVD_SCAN_TIMEOUT_SECS=0 would disable the scan budget"
+fi
+
 STOP_BODY="$(extract_c_func "$AVD" fanexec_stop | strip_c_comments)"
 # Closing the fanotify fd releases every still-pending permission event
 # as allowed, so it must not happen while a responder still holds one.

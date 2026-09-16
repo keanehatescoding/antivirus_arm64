@@ -229,6 +229,10 @@ and still has both gaps. Its own remaining fail-open surface is queue
 overflow (`FAN_Q_OVERFLOW`), where events are dropped and the execs
 behind them proceed unchecked — logged loudly rather than silently
 tolerated, but a real ceiling set by `fs/fanotify/max_queued_events`.
+The other no-verdict paths (unscannable file, scan that does not
+conclude) are governed by `AVD_FANOTIFY_FAIL_CLOSED` and exercised at
+runtime by the QEMU gate case (issue #51); the per-scan YARA budget
+behind that case is tunable via `AVD_SCAN_TIMEOUT_SECS`.
 
 One methodological note that generalizes past this finding: because a
 permission event *suspends* the exec until the listener answers, the
