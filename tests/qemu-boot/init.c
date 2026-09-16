@@ -1101,6 +1101,7 @@ int main(int argc, char *const argv[]) {
                1);
         setenv("AVD_FANOTIFY_EXEC", "1", 1);
         setenv("AVD_FANOTIFY_MARK", "/tmp", 1);
+        setenv("AVD_FANOTIFY_FAIL_CLOSED", "1", 1);
         /* 1s budget: the slow file needs ~1.35s, small files need ~1ms
          * (calibrated on libyara 4.5.8 - see the fixture's header).
          * TCG only widens the margin. */

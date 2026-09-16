@@ -395,6 +395,24 @@ else
     fail "AVD_SCAN_TIMEOUT_MAX is not SCAN_TIMEOUT_SECS - a longer budget would outrun daemon_timeout_ms/avctl"
 fi
 
+# The fail-closed QEMU case (issue #51) only exercises the flag if its
+# second avd actually sets it: the verdict case above starts avd
+# without AVD_FANOTIFY_FAIL_CLOSED, so a dropped setenv here silently
+# turns the whole phase into a second fail-open gate (slow file
+# ALLOWED, "never denied" FAIL every run). dfd3553 did exactly this -
+# a comment reword in the same hunk deleted the setenv line, and the
+# 33/33 local run stayed green because nothing here reads init.c's
+# setenv calls. Counted, not just present: the verdict case must NOT
+# set it (fail-open control) and the fail-closed block must set it
+# exactly once.
+INIT="$REPO_ROOT/tests/qemu-boot/init.c"
+n_fc_setenv="$(grep -c 'setenv("AVD_FANOTIFY_FAIL_CLOSED", "1", 1)' "$INIT" || true)"
+if [ "$n_fc_setenv" -eq 1 ]; then
+    pass "the fail-closed QEMU phase arms its flag (exactly one setenv)"
+else
+    fail "expected exactly one AVD_FANOTIFY_FAIL_CLOSED setenv in init.c (fail-closed phase), found $n_fc_setenv"
+fi
+
 STOP_BODY="$(extract_c_func "$AVD" fanexec_stop | strip_c_comments)"
 # Closing the fanotify fd releases every still-pending permission event
 # as allowed, so it must not happen while a responder still holds one.
