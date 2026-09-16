@@ -1051,10 +1051,9 @@ int main(int argc, char *const argv[]) {
      * non-ELF, so the only variable is ENOEXEC (allowed through to
      * binfmt) vs EPERM (the gate denied pre-exec). Attribution comes
      * from the same two controls: the first avd's clean file staying
-     * ENOEXEC, and avd's own stdout naming the deny reason. The
-     * distinguishing assertion is the log line: "did not complete",
-     * not "DENIED ... rule=", proving the denial came from the
-     * incomplete branch rather than a detection.
+     * ENOEXEC, and avd's own end-of-run tally ("1 allowed, ... 1
+     * undecided") showing the slow file denied without a detection -
+     * the incomplete branch counts there by design, not under denied.
      *
      * Non-vacuity, per #45: the small-clean control below proves the
      * 1s budget does not deny everything, and the verdict case's
@@ -1218,10 +1217,22 @@ int main(int argc, char *const argv[]) {
         poweroff_now();
         return 1;
       }
-      if (!strstr(fc_out, "did not complete")) {
-        outmsg("QEMU_TEST: FAIL: the slow exec was refused with EPERM but "
-               "avd logged no incomplete-scan line - the refusal did not "
-               "come from the fail-closed branch\n");
+      /* The per-event "did not complete" line goes to stderr, which
+       * stays on the console (see the set-up comment where avd is
+       * forked) - it is visible in the serial log above, not in this
+       * pipe. What stdout carries is the gate's end-of-run tally,
+       * where the incomplete-scan deny lands in the undecided column
+       * by design (nothing was detected - see fanexec_handle_event()'s
+       * comment). The exact tally is the assertion: "1 allowed" is
+       * the small-clean control, "1 undecided" is the slow file
+       * denied without a detection, "0 denied" rules out any
+       * conviction path producing the EPERM. A fail-open regression
+       * reads "2 allowed, 0 undecided" and fails here, same as at the
+       * errno assertions above. */
+      if (!strstr(fc_out, "1 allowed, 0 denied, 1 undecided")) {
+        outmsg("QEMU_TEST: FAIL: fail-closed avd's tally is not \"1 "
+               "allowed, 0 denied, 1 undecided\" - the slow exec's EPERM "
+               "did not come from the incomplete-scan branch\n");
         outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", fc_out);
         poweroff_now();
         return 1;
