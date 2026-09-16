@@ -1039,13 +1039,13 @@ int main(int argc, char *const argv[]) {
      * no-verdict path takes its default FAN_ALLOW and the fail-closed
      * contract is never observed. This starts a SECOND avd with
      * AVD_FANOTIFY_FAIL_CLOSED=1 and AVD_SCAN_TIMEOUT_SECS=1, then
-     * execs a file whose scan cannot conclude in that budget: 8KB of
+     * execs a file whose scan cannot conclude in that budget: 1.5KB of
      * identical bytes against tests/fixtures/fail_closed_slow.yar's
-     * calibration rule, whose nested quantifier needs ~6s on libyara
-     * 4.5.x while matching nothing (no 'b' present, so no conviction
-     * regardless of score - and weight=1 could never convict alone
-     * anyway). perform_scan() reports CLEAN with incomplete=1, and
-     * the handler must deny it because the flag is set.
+     * three calibration rules, whose nested quantifiers need ~1.35s on
+     * libyara 4.5.x while matching nothing (no 'b' present, so no
+     * conviction regardless of score - and weight=1 could never convict
+     * alone anyway). perform_scan() reports CLEAN with incomplete=1,
+     * and the handler must deny it because the flag is set.
      *
      * Same errno discipline as the verdict case: both samples are
      * non-ELF, so the only variable is ENOEXEC (allowed through to
@@ -1056,13 +1056,12 @@ int main(int argc, char *const argv[]) {
      * not "DENIED ... rule=", proving the denial came from the
      * incomplete branch rather than a detection.
      *
-     * Non-vacuity is two-sided, per #45: the slow file must be
-     * ALLOWED (ENOEXEC) under a fail-open avd with the same 1s
-     * budget - proving the file is scannable-but-slow rather than
-     * unloadable - and the flag-less first avd above already showed
-     * clean content reaching binfmt. If the incomplete branch ever
-     * stops consulting the flag, this fails: EPERM where ENOEXEC is
-     * asserted, or vice versa. */
+     * Non-vacuity, per #45: the small-clean control below proves the
+     * 1s budget does not deny everything, and the verdict case's
+     * ENOEXEC baseline proves clean content reaches binfmt ungated. If
+     * the incomplete branch ever stops consulting the flag, the slow
+     * file reads ENOEXEC where EPERM is asserted and this fails.
+     */
     {
       const char *slow = "/tmp/gate_slow";
       const char *slow_clean = "/tmp/gate_slow_clean";
@@ -1072,7 +1071,7 @@ int main(int argc, char *const argv[]) {
       int fc_waited = 0, fc_denied = 0;
       int fc_err = -1, fc_killed = 0;
 
-      write_repeated(slow, 'a', 8192);
+      write_repeated(slow, 'a', 1536);
       write_file(slow_clean, clean_content);
 
       if (pipe(fc_pipe) != 0)
@@ -1131,7 +1130,7 @@ int main(int argc, char *const argv[]) {
           poweroff_now();
           return 1;
         }
-        write_repeated(slow, 'a', 8192);
+        write_repeated(slow, 'a', 1536);
         exec_expect_failure(slow, &err, &killed);
         last_err = err;
         last_killed = killed;
