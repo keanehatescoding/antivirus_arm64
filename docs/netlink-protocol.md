@@ -41,7 +41,9 @@ in the kernel headers the way a raw `NETLINK_*` family would.
    |                                         2. ssdeep similarity
    |                                         3. TLSH distance
    |                                       the first stage to convict
-   |                                       quarantines and stops; a YARA
+   |                                       stops there, emits MALICIOUS
+   |                                       and attempts quarantine (best
+   |                                       effort - see below); a YARA
    |                                       match that scores below the
    |                                       threshold still falls through
    |                                       to 2 and 3 ]
@@ -201,6 +203,20 @@ by watching your own shell die.
   removing it. See discussion #33 for why fanotify over an LSM, and
   `tests/test_fanotify_exec_gate.sh` for what is and isn't covered by
   tests.
+- **Quarantine is best effort, and the verdict does not depend on it.**
+  `quarantine_file()` returns `void`, and `out->verdict` is already set
+  to `AV_VERDICT_MALICIOUS` before it is called — so every failure
+  inside it is logged to stderr and nothing more: an unusable
+  quarantine directory, `linkat()` *and* the copy fallback both
+  failing, or the original's `unlink()` failing after the copy landed.
+  `AV_C_VERDICT` still carries `VERDICT=1` in every one of those cases,
+  so the kernel still kills the exec'ing process — *detection* doesn't
+  degrade here, *containment* does. The original can be left in place,
+  and in the failed-`unlink()` case the file then exists in both
+  places at once. Nothing on this channel reports that back to the
+  kernel, so `dmesg` showing a kill is not by itself evidence that the
+  file was contained; check `avd`'s own stderr/journal for the
+  quarantine line.
 - **Kernel netlink API surface is version-sensitive**, same caveat as
   the syscall-wrapper kprobe hooking — `genl_family` struct layout has
   changed across kernel versions (notably where `.policy` lives). This
