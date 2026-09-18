@@ -215,8 +215,20 @@ by watching your own shell die.
   and in the failed-`unlink()` case the file then exists in both
   places at once. Nothing on this channel reports that back to the
   kernel, so `dmesg` showing a kill is not by itself evidence that the
-  file was contained; check `avd`'s own stderr/journal for the
-  quarantine line.
+  file was contained — that lives only in `avd`'s own output, and the
+  two halves go to **different streams**: the success line
+  (`avd: QUARANTINED "<path>" -> "<dest>"`) is a `printf()` to
+  **stdout**, every failure above is an `fprintf()` to **stderr**. Under
+  the systemd unit both land in the journal (`journalctl -u avd`); run
+  in a foreground terminal, the success line is on stdout.
+  **Buffering caveat:** `avd` never calls `setvbuf()`/`setlinebuf()`, so
+  whenever stdout isn't a tty — piped, redirected to a file, or the
+  journal — glibc block-buffers it while stderr stays unbuffered. The
+  practical effect is that a `QUARANTINED` line can lag the failure
+  lines around it by up to a buffer's worth of output, and is lost
+  entirely if `avd` is `SIGKILL`ed before the buffer flushes. Absence of
+  the line in a journal snapshot is therefore not proof that quarantine
+  failed; a failure line is proof that it did.
 - **Kernel netlink API surface is version-sensitive**, same caveat as
   the syscall-wrapper kprobe hooking — `genl_family` struct layout has
   changed across kernel versions (notably where `.policy` lives). This
