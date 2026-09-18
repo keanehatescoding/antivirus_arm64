@@ -33,10 +33,18 @@ in the kernel headers the way a raw `NETLINK_*` family would.
    |           REQID, PID, PATH,             (kernel generates a unique
    |           SHA256                        REQID per request)
    |
-   |                                     [ daemon opens the file, runs
-   |                                       weighted YARA, then ssdeep,
-   |                                       then TLSH; quarantines on a
-   |                                       MALICIOUS verdict ]
+   |                                     [ daemon opens the file and runs
+   |                                       up to three stages, each only
+   |                                       reached if the one before it
+   |                                       did not convict:
+   |                                         1. weighted YARA scoring
+   |                                         2. ssdeep similarity
+   |                                         3. TLSH distance
+   |                                       the first stage to convict
+   |                                       quarantines and stops; a YARA
+   |                                       match that scores below the
+   |                                       threshold still falls through
+   |                                       to 2 and 3 ]
    |
    |<--------- AV_C_VERDICT -------------|   REQID (echoed back),
    |           VERDICT (0=clean/                VERDICT, RULE_NAME
