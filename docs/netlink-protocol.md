@@ -1,9 +1,10 @@
 # Kernel ↔ Daemon Protocol (Generic Netlink)
 
-This document + `av/netlink_chan.{c,h}` +
-`userspace/avd/` establish the request/response channel; the actual YARA
-matching logic still needs to be added inside `avd` as its own feature
-commit.
+This document + `av/netlink_chan.{c,h}` + `userspace/avd/` establish the
+request/response channel. The scan logic that answers on it — weighted YARA
+scoring, entropy/ELF heuristics, then ssdeep and TLSH fuzzy hashing — landed
+inside `avd` later and is documented separately (see the wiki's *Detection
+Rules* and *avd Daemon* pages); this file covers only the channel.
 
 ## Why Generic Netlink
 
@@ -33,9 +34,9 @@ in the kernel headers the way a raw `NETLINK_*` family would.
    |           SHA256                        REQID per request)
    |
    |                                     [ daemon opens the file, runs
-   |                                       YARA / heuristics - not yet
-   |                                       implemented, stubbed as
-   |                                       "always clean" for now ]
+   |                                       weighted YARA, then ssdeep,
+   |                                       then TLSH; quarantines on a
+   |                                       MALICIOUS verdict ]
    |
    |<--------- AV_C_VERDICT -------------|   REQID (echoed back),
    |           VERDICT (0=clean/                VERDICT, RULE_NAME
