@@ -236,11 +236,16 @@ static int sig_proc_open(struct inode *inode, struct file *file) {
   return single_open(file, sig_proc_show, NULL);
 }
 
-static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
-                              size_t count, loff_t *ppos) {
+/* ppos is only read here, but proc_write must match struct proc_ops's
+ * fixed non-const loff_t * signature exactly - same class of false
+ * positive as protected_proc_write()'s own identical suppression in
+ * behavior.c. */
+/* cppcheck-suppress constParameterCallback */
+static ssize_t sig_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
   char kbuf[256];
   char cmd[8], algo_str[8], hex[AV_HASH_HEX_MAXLEN + 1], name[AV_SIG_NAME_LEN];
   enum av_algo algo;
+  size_t len;
   int n;
 
   /* DAC mode (0600) alone only checks UID 0, not the capability that
@@ -251,6 +256,15 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
    * trust_proc_write() (behavior.c) and protected_proc_write(). */
   if (!capable(CAP_SYS_ADMIN))
     return -EPERM;
+
+  /* Reject anything but the first write to a freshly-opened fd - a
+   * genuine continuation of an earlier call (its *ppos already
+   * advanced past 0) is never a complete, standalone command on its
+   * own and must not be parsed as one. Same contract as
+   * protected_proc_write() in behavior.c and daemon_policy_proc_write()
+   * in main.c (issue #57). */
+  if (*ppos != 0)
+    return -EINVAL;
 
   /* Reject oversized writes instead of silently truncating them.
    * The old min(count, sizeof(kbuf) - 1) read a short prefix of an
@@ -265,6 +279,24 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
   if (copy_from_user(kbuf, ubuf, count))
     return -EFAULT;
   kbuf[count] = '\0';
+
+  /* Require (and then strip) a mandatory trailing terminator rather
+   * than parsing whatever arrived as a complete command: a write that
+   * got cut mid-content by chunked delivery ends mid-token, not on a
+   * newline, so requiring one here is what actually rejects a
+   * truncated fragment instead of silently accepting it as a complete
+   * entry with a mangled name. Same contract as
+   * protected_proc_write()/daemon_policy_proc_write() (issue #57);
+   * avctl already appends the terminator uniformly via
+   * write_command_to(), so callers need no change. An optional
+   * preceding \r is stripped too, for a caller on the other side of a
+   * CRLF-translating pipe. */
+  len = strlen(kbuf);
+  if (len == 0 || kbuf[len - 1] != '\n')
+    return -EINVAL;
+  kbuf[--len] = '\0';
+  if (len > 0 && kbuf[len - 1] == '\r')
+    kbuf[--len] = '\0';
 
   n = sscanf(kbuf, "%7s %7s %64s %63[^\n]", cmd, algo_str, hex, name);
   if (n < 3)

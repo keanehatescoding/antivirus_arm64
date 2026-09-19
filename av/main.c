@@ -1078,6 +1078,16 @@ static void av_work_fn(struct work_struct *w) {
     pr_warn_ratelimited("kernel-av: event=hash-error path=\"%s\" pid=%d "
                         "err=%d (skipped signature and daemon checks)\n",
                         log_path, pid_nr(aw->target_pid), ret);
+    /* Record the exec even though the hash is unknown (issue #58): with
+     * no record the self-delete heuristic can never match this pid
+     * (exec_path stays empty), and worse, a previously-recorded
+     * trusted=true survives on an entry whose start_time still matches
+     * the live task - so a process that first exec'd a trusted binary
+     * keeps its rapid-write/rename exemption after exec'ing something
+     * we could not hash. An empty hash never matches the trust table,
+     * so this actively clears the exemption while restoring a
+     * comparable exec_path. */
+    av_behavior_record_exec(aw->tgid, abs_path, "", aw->start_time);
     goto out;
   }
 
