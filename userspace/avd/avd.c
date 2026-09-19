@@ -1885,21 +1885,42 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
     goto record;
   }
 
-  ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
-                         avd_scan_timeout_secs);
-  if (ret != ERROR_SUCCESS) {
-    /* File vanished, permission denied, scan timeout, etc. - fail
-     * open here too, matching the kernel side's own fail-open
-     * stance on inconclusive information (see docs/netlink-protocol.md). */
-    fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
-            ret);
-    /* Includes ERROR_SCAN_TIMEOUT. Worth noting for anyone reading
-     * this as a threat model rather than an error path: of all the
-     * inconclusive outcomes here this is the one an attacker has the
-     * most influence over, since the input file's own size and
-     * structure drive how long avd_scan_timeout_secs has to absorb. */
+  /* YARA size gate (issue #60, follow-up to #3): every other
+   * unbounded-read path in perform_scan() has a file-size gate except
+   * this one. The fuzzy/TLSH paths fast-reject via fuzzy_tlsh_size_ok()
+   * and the SHA-256 path fast-rejects via sha256_size_ok above, both
+   * against MAX_FUZZY_TLSH_FILE_SIZE. YARA had only
+   * avd_scan_timeout_secs, which bounds one scan's wall-clock but not
+   * the aggregate cost of a burst: TIMEOUT_SECS per worker x N workers
+   * of saturated pool means kernel-side scans queue past
+   * avd_scan_queue_max and fail open. Reuse the same cap against the
+   * already-available owner_st (no extra syscall, same snapshot the
+   * SHA-256 gate used). Over-cap files skip YARA, mark incomplete, and
+   * continue to the fuzzy/TLSH stages (which enforce the same cap
+   * themselves) rather than reporting a YARA-clean verdict. */
+  if (owner_uid != (uid_t)-1 &&
+      owner_st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
+    fprintf(stderr,
+            "avd: skipping YARA scan - file is %lld bytes, over the %d cap\n",
+            (long long)owner_st.st_size, MAX_FUZZY_TLSH_FILE_SIZE);
     out->incomplete = true;
-    goto record;
+  } else {
+    ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
+                           avd_scan_timeout_secs);
+    if (ret != ERROR_SUCCESS) {
+      /* File vanished, permission denied, scan timeout, etc. - fail
+       * open here too, matching the kernel side's own fail-open
+       * stance on inconclusive information (see docs/netlink-protocol.md). */
+      fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
+              ret);
+      /* Includes ERROR_SCAN_TIMEOUT. Worth noting for anyone reading
+       * this as a threat model rather than an error path: of all the
+       * inconclusive outcomes here this is the one an attacker has the
+       * most influence over, since the input file's own size and
+       * structure drive how long avd_scan_timeout_secs has to absorb. */
+      out->incomplete = true;
+      goto record;
+    }
   }
 
   if (ctx.matched) {
