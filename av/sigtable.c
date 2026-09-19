@@ -280,6 +280,14 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf, size_t
     return -EFAULT;
   kbuf[count] = '\0';
 
+  /* Reject embedded NULs: copy_from_user() copies raw bytes, but
+   * strlen()/sscanf() below stop at the first NUL. Without this,
+   * "valid-cmd\n\0garbage" passes the trailing-newline check against
+   * the truncated prefix while the actual write neither ends in
+   * newline nor equals what was parsed. */
+  if (memchr(kbuf, '\0', count) != NULL)
+    return -EINVAL;
+
   /* Require (and then strip) a mandatory trailing terminator rather
    * than parsing whatever arrived as a complete command: a write that
    * got cut mid-content by chunked delivery ends mid-token, not on a

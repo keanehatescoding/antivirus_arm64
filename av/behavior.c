@@ -588,6 +588,14 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf, size
     return -EFAULT;
   kbuf[count] = '\0';
 
+  /* Reject embedded NULs: copy_from_user() copies raw bytes, but
+   * strlen()/sscanf() below stop at the first NUL. Without this,
+   * "valid-cmd\n\0garbage" passes the trailing-newline check against
+   * the truncated prefix while the actual write neither ends in
+   * newline nor equals what was parsed. */
+  if (memchr(kbuf, '\0', count) != NULL)
+    return -EINVAL;
+
   /* Require (and then strip) a mandatory trailing terminator rather
    * than parsing whatever arrived as a complete command: a write that
    * got cut mid-content by chunked delivery ends mid-token, not on a
@@ -919,6 +927,17 @@ static ssize_t protected_proc_write(struct file *file, const char __user *ubuf, 
     goto out;
   }
   kbuf[count] = '\0';
+
+  /* Reject embedded NULs: copy_from_user() copies raw bytes, but the
+   * strcspn()/strspn()/strlen()/sscanf() parsing below stops at the
+   * first NUL. Without this, "add /path\n\0garbage" passes the
+   * trailing-newline check against the truncated prefix while the
+   * actual write neither ends in newline nor equals what was parsed -
+   * same class as sig_proc_write()/trust_proc_write(). */
+  if (memchr(kbuf, '\0', count) != NULL) {
+    ret = -EINVAL;
+    goto out;
+  }
 
   /* Not sscanf("%7s %4095[^\n]", ...) for the path half: a FIXED-width
    * field silently truncates an oversized path to 4095 bytes rather
