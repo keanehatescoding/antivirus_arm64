@@ -80,6 +80,7 @@
 #include <linux/sched/signal.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
@@ -870,6 +871,15 @@ static ssize_t daemon_policy_proc_write(struct file *file, const char __user *ub
     return -EFAULT;
   kbuf[count] = '\0';
 
+  /* Reject embedded NULs: copy_from_user() copies raw bytes, but
+   * strlen()/strcasecmp() below stop at the first NUL. Without this,
+   * "fail-open\n\0garbage" passes the trailing-newline check against
+   * the truncated prefix while the actual write neither ends in
+   * newline nor equals what was parsed - same class as
+   * sig_proc_write()/trust_proc_write(). */
+  if (memchr(kbuf, '\0', count) != NULL)
+    return -EINVAL;
+
   len = strlen(kbuf);
   if (len == 0 || kbuf[len - 1] != '\n')
     return -EINVAL;
@@ -1078,6 +1088,16 @@ static void av_work_fn(struct work_struct *w) {
     pr_warn_ratelimited("kernel-av: event=hash-error path=\"%s\" pid=%d "
                         "err=%d (skipped signature and daemon checks)\n",
                         log_path, pid_nr(aw->target_pid), ret);
+    /* Record the exec even though the hash is unknown (issue #58): with
+     * no record the self-delete heuristic can never match this pid
+     * (exec_path stays empty), and worse, a previously-recorded
+     * trusted=true survives on an entry whose start_time still matches
+     * the live task - so a process that first exec'd a trusted binary
+     * keeps its rapid-write/rename exemption after exec'ing something
+     * we could not hash. An empty hash never matches the trust table,
+     * so this actively clears the exemption while restoring a
+     * comparable exec_path. */
+    av_behavior_record_exec(aw->tgid, abs_path, "", aw->start_time);
     goto out;
   }
 

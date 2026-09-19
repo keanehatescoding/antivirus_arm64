@@ -550,10 +550,14 @@ static int trust_proc_open(struct inode *inode, struct file *file) {
   return single_open(file, trust_proc_show, NULL);
 }
 
-static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
-                                size_t count, loff_t *ppos) {
+/* ppos is only read here, but proc_write must match struct proc_ops's
+ * fixed non-const loff_t * signature exactly - same class of false
+ * positive as protected_proc_write()'s own identical suppression below. */
+/* cppcheck-suppress constParameterCallback */
+static ssize_t trust_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
   char kbuf[192];
   char cmd[8], hex[SHA256_HEX_LEN + 1], name[TRUST_NAME_LEN];
+  size_t len;
   int n;
 
   /* DAC mode (0600) alone only checks UID 0, not the capability that
@@ -563,6 +567,13 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
    * GENL_ADMIN_PERM; this proc handler needs the same bar. */
   if (!capable(CAP_SYS_ADMIN))
     return -EPERM;
+
+  /* Reject anything but the first write to a freshly-opened fd - same
+   * contract as protected_proc_write() below and daemon_policy_proc_write()
+   * in main.c (issue #57). A continuation chunk is never a complete,
+   * standalone command on its own and must not be parsed as one. */
+  if (*ppos != 0)
+    return -EINVAL;
 
   /* Reject oversized writes instead of silently truncating them -
    * same fix, same reasoning as sig_proc_write() in sigtable.c: the
@@ -576,6 +587,32 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
   if (copy_from_user(kbuf, ubuf, count))
     return -EFAULT;
   kbuf[count] = '\0';
+
+  /* Reject embedded NULs: copy_from_user() copies raw bytes, but
+   * strlen()/sscanf() below stop at the first NUL. Without this,
+   * "valid-cmd\n\0garbage" passes the trailing-newline check against
+   * the truncated prefix while the actual write neither ends in
+   * newline nor equals what was parsed. */
+  if (memchr(kbuf, '\0', count) != NULL)
+    return -EINVAL;
+
+  /* Require (and then strip) a mandatory trailing terminator rather
+   * than parsing whatever arrived as a complete command: a write that
+   * got cut mid-content by chunked delivery ends mid-token, not on a
+   * newline, so requiring one here is what actually rejects a
+   * truncated fragment instead of silently accepting it as a complete
+   * entry with a mangled name. Same contract as
+   * protected_proc_write()/daemon_policy_proc_write() (issue #57);
+   * avctl already appends the terminator uniformly via
+   * write_command_to(), so callers need no change. An optional
+   * preceding \r is stripped too, for a caller on the other side of a
+   * CRLF-translating pipe. */
+  len = strlen(kbuf);
+  if (len == 0 || kbuf[len - 1] != '\n')
+    return -EINVAL;
+  kbuf[--len] = '\0';
+  if (len > 0 && kbuf[len - 1] == '\r')
+    kbuf[--len] = '\0';
 
   n = sscanf(kbuf, "%7s %64s %63[^\n]", cmd, hex, name);
   if (n < 2)
@@ -890,6 +927,17 @@ static ssize_t protected_proc_write(struct file *file, const char __user *ubuf, 
     goto out;
   }
   kbuf[count] = '\0';
+
+  /* Reject embedded NULs: copy_from_user() copies raw bytes, but the
+   * strcspn()/strspn()/strlen()/sscanf() parsing below stops at the
+   * first NUL. Without this, "add /path\n\0garbage" passes the
+   * trailing-newline check against the truncated prefix while the
+   * actual write neither ends in newline nor equals what was parsed -
+   * same class as sig_proc_write()/trust_proc_write(). */
+  if (memchr(kbuf, '\0', count) != NULL) {
+    ret = -EINVAL;
+    goto out;
+  }
 
   /* Not sscanf("%7s %4095[^\n]", ...) for the path half: a FIXED-width
    * field silently truncates an oversized path to 4095 bytes rather
