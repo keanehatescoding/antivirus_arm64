@@ -1,9 +1,10 @@
 # Kernel ↔ Daemon Protocol (Generic Netlink)
 
-This document + `av/netlink_chan.{c,h}` +
-`userspace/avd/` establish the request/response channel; the actual YARA
-matching logic still needs to be added inside `avd` as its own feature
-commit.
+This document + `av/netlink_chan.{c,h}` + `userspace/avd/` establish the
+request/response channel. The scan logic that answers on it — weighted YARA
+scoring, entropy/ELF heuristics, then ssdeep and TLSH fuzzy hashing — landed
+inside `avd` later and is documented separately (see the wiki's *Detection
+Rules* and *avd Daemon* pages); this file covers only the channel.
 
 ## Why Generic Netlink
 
@@ -32,10 +33,20 @@ in the kernel headers the way a raw `NETLINK_*` family would.
    |           REQID, PID, PATH,             (kernel generates a unique
    |           SHA256                        REQID per request)
    |
-   |                                     [ daemon opens the file, runs
-   |                                       YARA / heuristics - not yet
-   |                                       implemented, stubbed as
-   |                                       "always clean" for now ]
+   |                                     [ daemon opens the file and runs
+   |                                       up to three stages, each only
+   |                                       reached if the one before it
+   |                                       did not convict:
+   |                                         1. weighted YARA scoring
+   |                                         2. ssdeep similarity
+   |                                         3. TLSH distance
+   |                                       the first stage to convict
+   |                                       stops there, emits MALICIOUS
+   |                                       and attempts quarantine (best
+   |                                       effort - see below); a YARA
+   |                                       match that scores below the
+   |                                       threshold still falls through
+   |                                       to 2 and 3 ]
    |
    |<--------- AV_C_VERDICT -------------|   REQID (echoed back),
    |           VERDICT (0=clean/                VERDICT, RULE_NAME
@@ -192,6 +203,32 @@ by watching your own shell die.
   removing it. See discussion #33 for why fanotify over an LSM, and
   `tests/test_fanotify_exec_gate.sh` for what is and isn't covered by
   tests.
+- **Quarantine is best effort, and the verdict does not depend on it.**
+  `quarantine_file()` returns `void`, and `out->verdict` is already set
+  to `AV_VERDICT_MALICIOUS` before it is called — so every failure
+  inside it is logged to stderr and nothing more: an unusable
+  quarantine directory, `linkat()` *and* the copy fallback both
+  failing, or the original's `unlink()` failing after the copy landed.
+  `AV_C_VERDICT` still carries `VERDICT=1` in every one of those cases,
+  so the kernel still kills the exec'ing process — *detection* doesn't
+  degrade here, *containment* does. The original can be left in place,
+  and in the failed-`unlink()` case the file then exists in both
+  places at once. Nothing on this channel reports that back to the
+  kernel, so `dmesg` showing a kill is not by itself evidence that the
+  file was contained — that lives only in `avd`'s own output, and the
+  two halves go to **different streams**: the success line
+  (`avd: QUARANTINED "<path>" -> "<dest>"`) is a `printf()` to
+  **stdout**, every failure above is an `fprintf()` to **stderr**. Under
+  the systemd unit both land in the journal (`journalctl -u avd`); run
+  in a foreground terminal, the success line is on stdout.
+  **Buffering caveat:** `avd` never calls `setvbuf()`/`setlinebuf()`, so
+  whenever stdout isn't a tty — piped, redirected to a file, or the
+  journal — glibc block-buffers it while stderr stays unbuffered. The
+  practical effect is that a `QUARANTINED` line can lag the failure
+  lines around it by up to a buffer's worth of output, and is lost
+  entirely if `avd` is `SIGKILL`ed before the buffer flushes. Absence of
+  the line in a journal snapshot is therefore not proof that quarantine
+  failed; a failure line is proof that it did.
 - **Kernel netlink API surface is version-sensitive**, same caveat as
   the syscall-wrapper kprobe hooking — `genl_family` struct layout has
   changed across kernel versions (notably where `.policy` lives). This
