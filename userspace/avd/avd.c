@@ -1827,6 +1827,19 @@ static void yara_snapshot_release(size_t held) {
   pthread_mutex_unlock(&yara_snapshot_lock);
 }
 
+/* Diagnostic read of the in-flight total for the budget-exhausted log
+ * line below. The counter lives under yara_snapshot_lock, so a plain
+ * read from a scan worker would race concurrent reserve/release
+ * updates - copy it under the lock instead. */
+static size_t yara_snapshot_inflight_bytes(void) {
+  size_t in_flight;
+
+  pthread_mutex_lock(&yara_snapshot_lock);
+  in_flight = yara_snapshot_inflight;
+  pthread_mutex_unlock(&yara_snapshot_lock);
+  return in_flight;
+}
+
 /*
  * Shared core of file analysis - YARA, then fuzzy/TLSH fallback,
  * quarantine on MALICIOUS, and a verdict_history record either way.
@@ -2035,7 +2048,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
         fprintf(stderr,
                 "avd: YARA snapshot budget exhausted (%zu in flight) - "
                 "skipping YARA scan of \"%s\" (%zu bytes), failing open\n",
-                yara_snapshot_inflight, path, scan_len);
+                yara_snapshot_inflight_bytes(), path, scan_len);
         out->incomplete = true;
       } else if (!(snap = malloc(scan_len))) {
         fprintf(stderr, "avd: malloc(%zu) for YARA scan of \"%s\" failed - "
