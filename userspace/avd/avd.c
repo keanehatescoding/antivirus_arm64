@@ -203,11 +203,12 @@
 #define AVD_SCAN_TIMEOUT_MIN 1
 #define AVD_SCAN_TIMEOUT_MAX SCAN_TIMEOUT_SECS
 
-/* Cap on what check_fuzzy_corpus()/check_tlsh_corpus() will read.
- * yr_rules_scan_fd() (the YARA path, see avd_scan_timeout_secs above) is
- * bounded by a timeout; libfuzzy's fuzzy_hash_file() and
- * av_tlsh_hash_fd() have no equivalent of their own and read to EOF
- * with nothing else stopping them. Only avd_scan_threads (default
+/* Cap on what check_fuzzy_corpus()/check_tlsh_corpus() will read, and on
+ * the YARA stage's scan mapping in perform_scan() (capped at this same
+ * value via yr_rules_scan_mem(), on top of the avd_scan_timeout_secs
+ * timeout). libfuzzy's fuzzy_hash_file() and av_tlsh_hash_fd() have no
+ * equivalent of their own and read to EOF with nothing else stopping
+ * them. Only avd_scan_threads (default
  * AVD_SCAN_THREADS_DEFAULT) workers exist, so a handful of very large
  * files - kernel-triggered or a control-socket SCAN - can tie up the
  * whole pool for as long as the read takes; kernel-side scans then
@@ -336,9 +337,9 @@ static int avd_scan_timeout_secs = SCAN_TIMEOUT_SECS;
  * itself, so contention is negligible. compiled_rules and
  * fuzzy_corpus need no such lock: both are populated once at startup
  * (load_rules()/load_fuzzy_corpus()) before any worker thread exists
- * and are read-only from then on - yr_rules_scan_fd() (or
- * yr_rules_scan_file()) against a shared, unmodified YR_RULES is
- * documented as safe for concurrent callers on that basis. */
+ * and are read-only from then on - yr_rules_scan_mem() (like
+ * yr_rules_scan_fd()/yr_rules_scan_file()) against a shared, unmodified
+ * YR_RULES is documented as safe for concurrent callers on that basis. */
 static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Bounded producer/consumer queue between msg_handler() (the single
@@ -1893,11 +1894,24 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
    * avd_scan_timeout_secs, which bounds one scan's wall-clock but not
    * the aggregate cost of a burst: TIMEOUT_SECS per worker x N workers
    * of saturated pool means kernel-side scans queue past
-   * avd_scan_queue_max and fail open. Reuse the same cap against the
-   * already-available owner_st (no extra syscall, same snapshot the
-   * SHA-256 gate used). Over-cap files skip YARA, mark incomplete, and
-   * continue to the fuzzy/TLSH stages (which enforce the same cap
-   * themselves) rather than reporting a YARA-clean verdict. */
+   * avd_scan_queue_max and fail open. Two layers, mirroring the
+   * SHA-256 path's fast-reject plus capped-read shape:
+   *
+   * 1. Fast-reject on the already-available owner_st snapshot (no extra
+   *    syscall, same snapshot the SHA-256 gate used). Over-cap files
+   *    skip YARA, mark incomplete, and continue to the fuzzy/TLSH
+   *    stages (which enforce the same cap themselves) rather than
+   *    reporting a YARA-clean verdict.
+   * 2. Enforcement: the scan itself runs over a MAP_PRIVATE mapping of
+   *    at most MAX_FUZZY_TLSH_FILE_SIZE bytes via yr_rules_scan_mem(),
+   *    not yr_rules_scan_fd() - the latter maps the descriptor's whole
+   *    current size, so a file that grows past the snapshot between the
+   *    fstat() and the scan would still tie up a worker past the cap.
+   *    The mapping length comes from a fresh fstat() taken here (not
+   *    the stale owner_st, which predates the hashing reads above), and
+   *    a post-scan fstat() marks incomplete if the size changed
+   *    mid-scan, so a capped prefix scan is never reported as a
+   *    complete clean verdict. */
   if (owner_uid != (uid_t)-1 &&
       owner_st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
     fprintf(stderr,
@@ -1905,21 +1919,66 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
             (long long)owner_st.st_size, MAX_FUZZY_TLSH_FILE_SIZE);
     out->incomplete = true;
   } else {
-    ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
-                           avd_scan_timeout_secs);
-    if (ret != ERROR_SUCCESS) {
-      /* File vanished, permission denied, scan timeout, etc. - fail
-       * open here too, matching the kernel side's own fail-open
-       * stance on inconclusive information (see docs/netlink-protocol.md). */
-      fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
-              ret);
-      /* Includes ERROR_SCAN_TIMEOUT. Worth noting for anyone reading
-       * this as a threat model rather than an error path: of all the
-       * inconclusive outcomes here this is the one an attacker has the
-       * most influence over, since the input file's own size and
-       * structure drive how long avd_scan_timeout_secs has to absorb. */
+    struct stat yara_st;
+    size_t scan_len = 0;
+    void *map = MAP_FAILED;
+
+    if (fstat(fd, &yara_st) != 0) {
+      fprintf(stderr, "avd: fstat(\"%s\") before YARA scan failed: %s - "
+                      "failing open\n",
+              path, strerror(errno));
       out->incomplete = true;
       goto record;
+    }
+    if (yara_st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
+      fprintf(stderr,
+              "avd: skipping YARA scan - file is %lld bytes, over the %d cap\n",
+              (long long)yara_st.st_size, MAX_FUZZY_TLSH_FILE_SIZE);
+      out->incomplete = true;
+    } else if (yara_st.st_size == 0) {
+      /* Empty file: nothing for YARA to match on. Vacuously clean and
+       * complete, same outcome yr_rules_scan_fd() reports for one. */
+    } else {
+      scan_len = (size_t)yara_st.st_size;
+      map = mmap(NULL, scan_len, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (map == MAP_FAILED) {
+        fprintf(stderr, "avd: mmap(\"%s\", %zu) before YARA scan failed: "
+                        "%s - failing open\n",
+                path, scan_len, strerror(errno));
+        out->incomplete = true;
+      } else {
+        ret = yr_rules_scan_mem(compiled_rules, map, scan_len, 0,
+                                yara_callback, &ctx, avd_scan_timeout_secs);
+        munmap(map, scan_len);
+        if (ret != ERROR_SUCCESS) {
+          /* File vanished, permission denied, scan timeout, etc. - fail
+           * open here too, matching the kernel side's own fail-open
+           * stance on inconclusive information (see
+           * docs/netlink-protocol.md). */
+          fprintf(stderr, "avd: yr_rules_scan_mem(\"%s\") failed: error %d\n",
+                  path, ret);
+          /* Includes ERROR_SCAN_TIMEOUT. Worth noting for anyone reading
+           * this as a threat model rather than an error path: of all the
+           * inconclusive outcomes here this is the one an attacker has the
+           * most influence over, since the input file's own size and
+           * structure drive how long avd_scan_timeout_secs has to absorb. */
+          out->incomplete = true;
+          goto record;
+        }
+        /* The mapping above is bounded by construction, but it is still
+         * a snapshot: a concurrent growth means the scan covered only a
+         * prefix of the file's current content (and a shrink means it
+         * covered stale bytes). Either way the result no longer reflects
+         * the file - say so rather than reporting it as complete. */
+        if (fstat(fd, &yara_st) != 0 ||
+            yara_st.st_size != (off_t)scan_len) {
+          fprintf(stderr,
+                  "avd: YARA scan of \"%s\" raced a size change "
+                  "(scanned %zu bytes) - marking incomplete\n",
+                  path, scan_len);
+          out->incomplete = true;
+        }
+      }
     }
   }
 
