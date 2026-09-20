@@ -1914,9 +1914,22 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
    *    EOF raises SIGBUS inside the scan, killing the daemon before any
    *    post-scan check runs). The copy length comes from a fresh
    *    fstat() taken here (not the stale owner_st, which predates the
-   *    hashing reads above), and a post-scan fstat() marks incomplete
-   *    if the size changed mid-scan, so a capped prefix scan is never
-   *    reported as a complete clean verdict. */
+   *    hashing reads above), and a post-scan consistency check marks
+   *    incomplete if the file changed mid-scan, so a torn or capped
+   *    prefix scan is never reported as a complete clean verdict. The
+   *    check covers size and st_mtim/st_ctim: a same-size concurrent
+   *    write leaves st_size untouched, so size alone would bless a
+   *    mixed snapshot as complete. This is defense in depth, stated
+   *    honestly: timestamps can miss writes within one timestamp tick
+   *    (notably on coarse-granularity filesystems), and the same
+   *    live-file race exists in every other streaming stage here
+   *    (SHA-256, fuzzy, TLSH all read a mutable inode with no writer
+   *    coordination - there is no writer-lock protocol anywhere in this
+   *    codebase to enforce). A lock-or-stable-filesystem correction
+   *    would need one invented first; the exec-time TOCTOU at large is
+   *    tracked separately (issue #2 / LSM design). What this layer does
+   *    guarantee is that any change the filesystem bothered to record
+   *    surfaces as incomplete rather than clean. */
   if (owner_uid != (uid_t)-1 &&
       owner_st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
     fprintf(stderr,
@@ -1925,6 +1938,8 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
     out->incomplete = true;
   } else {
     struct stat yara_st;
+    struct timespec pre_mtim = {0, 0};
+    struct timespec pre_ctim = {0, 0};
     size_t scan_len = 0;
 
     if (fstat(fd, &yara_st) != 0) {
@@ -1947,6 +1962,12 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       size_t total = 0;
 
       scan_len = (size_t)yara_st.st_size;
+      /* Content timestamps for the post-scan consistency check below -
+       * captured here, before the copy, so anything a concurrent writer
+       * changes during the read-and-scan window compares unequal even
+       * when the size is untouched. */
+      pre_mtim = yara_st.st_mtim;
+      pre_ctim = yara_st.st_ctim;
       snap = malloc(scan_len);
       if (!snap) {
         fprintf(stderr, "avd: malloc(%zu) for YARA scan of \"%s\" failed - "
@@ -2003,14 +2024,21 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
             goto record;
           }
           /* The copy above is bounded by construction, but it is still
-           * a snapshot: total < scan_len means truncation mid-read, and
-           * a post-scan size mismatch means the file changed around the
-           * scan. Either way the result no longer reflects the file -
-           * say so rather than reporting it as complete. */
+           * a snapshot of a live file: total < scan_len means truncation
+           * mid-read, a post-scan size mismatch means the file changed
+           * around the scan, and changed st_mtim/st_ctim at a stable size
+           * means a same-size write landed inside the snapshot window
+           * (size alone would bless that mixed copy as complete). Any of
+           * the three means the result no longer reflects the file - say
+           * so rather than reporting it as complete. */
           if (total != scan_len || fstat(fd, &yara_st) != 0 ||
-              yara_st.st_size != (off_t)scan_len) {
+              yara_st.st_size != (off_t)scan_len ||
+              yara_st.st_mtim.tv_sec != pre_mtim.tv_sec ||
+              yara_st.st_mtim.tv_nsec != pre_mtim.tv_nsec ||
+              yara_st.st_ctim.tv_sec != pre_ctim.tv_sec ||
+              yara_st.st_ctim.tv_nsec != pre_ctim.tv_nsec) {
             fprintf(stderr,
-                    "avd: YARA scan of \"%s\" raced a size change "
+                    "avd: YARA scan of \"%s\" raced a file change "
                     "(scanned %zu of %zu bytes) - marking incomplete\n",
                     path, total, scan_len);
             out->incomplete = true;
