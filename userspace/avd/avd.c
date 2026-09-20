@@ -110,6 +110,7 @@
 #include "../../av/netlink_proto.h"
 #include "sha256.h"
 #include "tlsh_shim.h"
+#include "wire_escape.h"
 
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000 /* glibc's plain <fcntl.h> doesn't define this
@@ -139,9 +140,15 @@
 #define AVD_SOCK_LINE_MAX (PATH_MAX + 256)
 /* Bounds one QUARANTINE LIST / VERDICTS row: two PATH_MAX-sized fields at
  * most (id + original_path) plus the small fixed fields alongside them
- * (timestamps, 64-char sha256, rule name, tabs/NUL). Named so the
- * PATH_MAX*2 headroom is a documented bound, not a magic buffer size. */
-#define AVD_ROW_MAX (PATH_MAX * 2 + 256)
+ * (timestamps, 64-char sha256, rule name, tabs/NUL) - times
+ * WIRE_ESCAPE_MAX_EXPANSION, because both path-sized fields are
+ * percent-escaped on emit (see wire_escape.h: a hostile basename can
+ * force every byte to triple). Named so the headroom is a documented
+ * bound, not a magic buffer size. */
+#define AVD_ROW_MAX (PATH_MAX * 2 * WIRE_ESCAPE_MAX_EXPANSION + 256)
+/* Bounds one escaped path-sized field on the wire: a full PATH_MAX
+ * path, every byte escaped. */
+#define AVD_ESCAPED_PATH_MAX (PATH_MAX * WIRE_ESCAPE_MAX_EXPANSION)
 /* Caps how many control-socket connections avd will service at once -
  * the socket is 0666 (see start_control_socket()'s comment), so
  * without this any local user could open connections without limit,
@@ -1213,7 +1220,12 @@ static void record_verdict_history(uint32_t pid, uid_t uid, const char *path,
 static int read_quarantine_meta(const char *meta_path,
                                 struct quarantine_meta *out) {
   FILE *f = fopen(meta_path, "r");
-  char line[PATH_MAX + 64];
+  /* 3x PATH_MAX: ORIGINAL_PATH/RULE_NAME are percent-escaped on write
+   * (see write_quarantine_meta()), so the longest single line is an
+   * escaped full-length path, not a raw one. An undersized buffer here
+   * would split that line across two fgets() reads and truncate the
+   * path on restore - the exact bug escaping was added to close. */
+  char line[PATH_MAX * WIRE_ESCAPE_MAX_EXPANSION + 64];
 
   if (!f)
     return -1;
@@ -1229,14 +1241,27 @@ static int read_quarantine_meta(const char *meta_path,
       line[--len] = '\0';
 
     /* "%.*s" with an explicit precision, not a bare "%s" - `line` is a
-     * PATH_MAX+64 stack buffer whose actual content length gcc can't
+     * 3*PATH_MAX stack buffer whose actual content length gcc can't
      * bound at compile time, so a bare "%s" into these smaller fixed
      * struct fields trips -Wformat-truncation. Same pattern already
      * used by load_fuzzy_corpus()/load_tlsh_corpus() above for the
-     * identical reason. */
-    if (!strncmp(line, "ORIGINAL_PATH=", 14))
+     * identical reason.
+     *
+     * Unescape BEFORE truncating into the field: the escaped form is
+     * up to 3x the raw value, so truncating first could split a "%XX"
+     * triplet and leave literal escape junk at the tail. Unescaping
+     * the value in place (it only ever shrinks) and then bounding the
+     * copy keeps an over-long value a clean prefix-truncation instead.
+     * Pre-escape sidecars (plain paths, no '%') decode to themselves,
+     * so old metadata keeps working - except a pre-existing path
+     * containing a literal "%XX" hex-looking sequence, which now
+     * decodes (documented in docs/avd-socket-protocol.md). */
+    if (!strncmp(line, "ORIGINAL_PATH=", 14)) {
+      char *val = line + 14;
+      wire_unescape(val);
       snprintf(out->original_path, sizeof(out->original_path), "%.*s",
-               (int)sizeof(out->original_path) - 1, line + 14);
+               (int)sizeof(out->original_path) - 1, val);
+    }
     else if (!strncmp(line, "ORIGINAL_MODE=", 14))
       out->original_mode = (mode_t)strtoul(line + 14, NULL, 8);
     else if (!strncmp(line, "ORIGINAL_UID=", 13))
@@ -1245,9 +1270,12 @@ static int read_quarantine_meta(const char *meta_path,
       out->original_gid = (gid_t)strtoul(line + 13, NULL, 10);
     else if (!strncmp(line, "TIMESTAMP=", 10))
       out->timestamp = (time_t)strtoll(line + 10, NULL, 10);
-    else if (!strncmp(line, "RULE_NAME=", 10))
+    else if (!strncmp(line, "RULE_NAME=", 10)) {
+      char *val = line + 10;
+      wire_unescape(val);
       snprintf(out->rule_name, sizeof(out->rule_name), "%.*s",
-               (int)sizeof(out->rule_name) - 1, line + 10);
+               (int)sizeof(out->rule_name) - 1, val);
+    }
     else if (!strncmp(line, "SHA256=", 7))
       snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%.*s",
                (int)sizeof(out->sha256_hex) - 1, line + 7);
@@ -1268,14 +1296,15 @@ static int read_quarantine_meta(const char *meta_path,
  * failed) supplies the mode/uid/gid to restore later; without it,
  * restore falls back to 0600/root:root rather than failing outright.
  *
- * ORIGINAL_PATH is written LAST and has no field after it - Linux
- * filenames may legally contain a literal newline (never NUL or '/'),
- * which would otherwise let a pathological path corrupt whatever line
- * came after it when this file is read back with fgets(). Putting it
- * last means that edge case can only truncate the path itself on
- * restore, never a different field - the same kind of narrow,
- * documented limitation as avctl's save/load format (see do_save()'s
- * comment in avctl.c for the equivalent caveat there).
+ * ORIGINAL_PATH is written LAST and has no field after it - kept from
+ * the days when the raw path was written verbatim: a Linux filename
+ * may legally contain a literal newline, which under fgets()-line
+ * reading would then corrupt whatever line came after it. Paths are
+ * now percent-escaped on write (see wire_escape.h), so an embedded
+ * newline survives as "%0A" and the ordering is just belt-and-braces -
+ * but the escape is what actually closes it (#59's root cause, #64
+ * item 2), since escaping also protects the wire rows built from the
+ * same value, which last-line placement alone could never do.
  */
 static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
                                  const char *orig_path, const char *rule_name,
@@ -1288,6 +1317,16 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
   FILE *f;
   int mfd;
   int mn;
+  /* Escaped form of the two free-text fields: without this, a newline
+   * in orig_path would truncate ORIGINAL_PATH on read (fgets splits
+   * lines), and a tab/newline would later break the tab/newline-framed
+   * control rows built from the sidecar (#59, #64 item 2). Sized 3x
+   * (WIRE_ESCAPE_MAX_EXPANSION) so escaping cannot truncate; a -1 here
+   * fails the sidecar write rather than recording a half-escaped path. */
+  char esc_path[sizeof(((struct quarantine_meta *)0)->original_path) *
+                WIRE_ESCAPE_MAX_EXPANSION + 1];
+  char esc_rule[sizeof(((struct quarantine_meta *)0)->rule_name) *
+                WIRE_ESCAPE_MAX_EXPANSION + 1];
 
   /* Fail closed on truncation: a silently-truncated meta path would
    * attach the sidecar to the wrong file (or a different directory)
@@ -1312,13 +1351,20 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
     return -1;
   }
 
+  if (wire_escape(orig_path ? orig_path : "", esc_path, sizeof(esc_path)) != 0 ||
+      wire_escape(rule_name ? rule_name : "", esc_rule, sizeof(esc_rule)) != 0) {
+    close(mfd);
+    unlink(meta_path);
+    return -1;
+  }
+
   if (fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600) < 0 ||
       fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0) < 0 ||
       fprintf(f, "ORIGINAL_GID=%d\n", orig_st ? (int)orig_st->st_gid : 0) < 0 ||
       fprintf(f, "TIMESTAMP=%lld\n", (long long)time(NULL)) < 0 ||
-      fprintf(f, "RULE_NAME=%s\n", rule_name ? rule_name : "") < 0 ||
+      fprintf(f, "RULE_NAME=%s\n", esc_rule) < 0 ||
       fprintf(f, "SHA256=%s\n", sha256_hex ? sha256_hex : "") < 0 ||
-      fprintf(f, "ORIGINAL_PATH=%s\n", orig_path) < 0) {
+      fprintf(f, "ORIGINAL_PATH=%s\n", esc_path) < 0) {
     fclose(f);
     unlink(meta_path);
     return -1;
@@ -3053,17 +3099,44 @@ static void cmd_verdicts_recent(int fd, size_t n, uid_t peer_uid,
   snprintf(hdr, sizeof(hdr), "COUNT %zu\n", take);
   write_all(fd, hdr, strlen(hdr));
   for (i = 0, take = 0; i < avail && take < n; i++) {
-    char row[PATH_MAX + 256];
+    /* Escaped on emit (#59): snap[i].path is an attacker-influenced
+     * filename and may legally contain '\t'/'\n', which would shift
+     * fields or inject rows into this tab/newline-framed response.
+     * rule_name is internal (a YARA identifier) but escaped the same
+     * way so every variable-text field shares one invariant: no raw
+     * tab/newline ever reaches the wire. Buffers are 3x by
+     * construction (WIRE_ESCAPE_MAX_EXPANSION), so escape failure is
+     * impossible - the "?" fallback below only keeps COUNT/END
+     * framing exact if that ever stops being true. */
+    char row[AVD_ESCAPED_PATH_MAX + 512];
+    char esc_path[AVD_ESCAPED_PATH_MAX];
+    char esc_rule[sizeof(snap[i].rule_name) * WIRE_ESCAPE_MAX_EXPANSION + 1];
+    int rn;
 
     if (!verdict_visible_to(&snap[i], peer_uid, is_root))
       continue;
     take++;
 
-    snprintf(row, sizeof(row), "%llu\t%ld\t%u\t%s\t%s\t%s\t%s\t%d\t%d\n",
-             (unsigned long long)snap[i].id, (long)snap[i].timestamp,
-             snap[i].pid, snap[i].path, snap[i].sha256_hex,
-             snap[i].verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
-             snap[i].rule_name, snap[i].score, snap[i].on_demand ? 1 : 0);
+    if (wire_escape(snap[i].path, esc_path, sizeof(esc_path)) != 0 ||
+        wire_escape(snap[i].rule_name, esc_rule, sizeof(esc_rule)) != 0) {
+      snprintf(row, sizeof(row), "%llu\t%ld\t%u\t?\t%s\t?\t?\t%d\t%d\n",
+               (unsigned long long)snap[i].id, (long)snap[i].timestamp,
+               snap[i].pid, snap[i].sha256_hex,
+               snap[i].score, snap[i].on_demand ? 1 : 0);
+    } else {
+      rn = snprintf(row, sizeof(row),
+                    "%llu\t%ld\t%u\t%s\t%s\t%s\t%s\t%d\t%d\n",
+                    (unsigned long long)snap[i].id, (long)snap[i].timestamp,
+                    snap[i].pid, esc_path, snap[i].sha256_hex,
+                    snap[i].verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
+                    esc_rule, snap[i].score, snap[i].on_demand ? 1 : 0);
+      if (rn < 0 || (size_t)rn >= sizeof(row))
+        snprintf(row, sizeof(row),
+                 "%llu\t%ld\t%u\t?\t%s\t?\t?\t%d\t%d\n",
+                 (unsigned long long)snap[i].id, (long)snap[i].timestamp,
+                 snap[i].pid, snap[i].sha256_hex,
+                 snap[i].score, snap[i].on_demand ? 1 : 0);
+    }
     /* Stop at the first failed write rather than pressing on through
      * the rest of `take` rows - SO_SNDTIMEO (see control_conn_main())
      * bounds each individual write_all() call, not this whole loop,
@@ -3151,18 +3224,46 @@ static void cmd_quarantine_list(int fd, uid_t peer_uid, bool is_root) {
     snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", quarantine_dir,
              namelist[i]->d_name);
 
-    if (read_quarantine_meta(meta_path, &meta) == 0)
-      snprintf(row, sizeof(row), "%s\t%s\t%ld\t%s\t%s\n", id,
-               meta.original_path, (long)meta.timestamp, meta.rule_name,
-               meta.sha256_hex);
-    else
-      /* No metadata - quarantined before this feature existed, or the
-       * sidecar write itself failed (see quarantine_file()'s comment).
-       * Still list it (it's a real quarantined file on disk) rather
-       * than hiding it, just without the extra fields. Only reachable
-       * here when is_root, since a missing/unreadable meta makes
-       * visible[i] false for anyone else above. */
-      snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", id);
+    /* Escaped on emit (#59): `id` pastes the original basename straight
+     * into the on-disk quarantine name (see quarantine_file()), and
+     * original_path is the full attacker-chosen path - either may
+     * legally contain '\t'/'\n'. Same invariant as
+     * cmd_verdicts_recent(): no raw tab/newline reaches the wire, so a
+     * crafted filename can neither hide its own row from avctl (which
+     * skips unparseable rows) nor forge a plausible-looking one after
+     * it. Escape failures are impossible by construction (3x buffers),
+     * so the "?" fallbacks below only keep COUNT/END framing exact if
+     * that ever stops being true. */
+    {
+      char esc_id[sizeof(id) * WIRE_ESCAPE_MAX_EXPANSION + 1];
+      int id_ok = wire_escape(id, esc_id, sizeof(esc_id));
+
+      if (id_ok != 0) {
+        snprintf(row, sizeof(row), "?\t?\t0\t?\t?\n");
+      } else if (read_quarantine_meta(meta_path, &meta) == 0) {
+        char esc_path[AVD_ESCAPED_PATH_MAX];
+        char esc_rule[sizeof(meta.rule_name) * WIRE_ESCAPE_MAX_EXPANSION + 1];
+        int rn;
+
+        if (wire_escape(meta.original_path, esc_path, sizeof(esc_path)) != 0 ||
+            wire_escape(meta.rule_name, esc_rule, sizeof(esc_rule)) != 0) {
+          snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", esc_id);
+        } else {
+          rn = snprintf(row, sizeof(row), "%s\t%s\t%ld\t%s\t%s\n", esc_id,
+                        esc_path, (long)meta.timestamp, esc_rule,
+                        meta.sha256_hex);
+          if (rn < 0 || (size_t)rn >= sizeof(row))
+            snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", esc_id);
+        }
+      } else
+        /* No metadata - quarantined before this feature existed, or the
+         * sidecar write itself failed (see quarantine_file()'s comment).
+         * Still list it (it's a real quarantined file on disk) rather
+         * than hiding it, just without the extra fields. Only reachable
+         * here when is_root, since a missing/unreadable meta makes
+         * visible[i] false for anyone else above. */
+        snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", esc_id);
+    }
 
     /* Stop at the first failed write, same reasoning as
      * cmd_verdicts_recent()'s identical check - still have to free

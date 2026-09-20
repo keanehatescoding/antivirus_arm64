@@ -293,6 +293,54 @@ if "$AVCTL" quarantine list 2>/dev/null | grep -q "$TEST_FILE"; then
 else
     pass "quarantine list no longer shows the deleted entry"
 fi
+
+section "crafted TAB filename survives list/restore (issues #59, #64)"
+# A literal TAB in the basename is legal on Linux and is exactly the
+# shape #59 describes: unescaped, it would shift the row's fields
+# (avctl skips the row with a warning) or forge a second row. The
+# scan quarantines under that name; the list must still show the
+# entry exactly once, with the TAB percent-escaped on the wire.
+CRAFTED_FILE="$TEST_TMP_DIR/evil"$'\t'"eicar.bin"
+# shellcheck disable=SC2016
+printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > "$CRAFTED_FILE"
+"$AVCTL" scan "$CRAFTED_FILE" >/dev/null 2>&1
+if [ -e "$CRAFTED_FILE" ]; then
+    fail "crafted-name EICAR file was not quarantined"
+else
+    pass "crafted-name EICAR file was quarantined"
+fi
+LIST_OUT="$("$AVCTL" quarantine list 2>"$AVCTL_LOG")"
+if echo "$LIST_OUT" | grep -q "evil.*eicar"; then
+    pass "quarantine list shows the crafted-name entry (decoded)"
+else
+    fail "quarantine list missing crafted-name entry: $LIST_OUT"
+fi
+# Raw wire form: the TAB must travel as %09, and the row must still
+# split into exactly the documented 5 fields.
+RAW_LIST="$(printf 'QUARANTINE LIST\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>>"$SOCAT_LOG")"
+CRAFTED_ROW="$(echo "$RAW_LIST" | grep '%09' | head -1)"
+if [ -n "$CRAFTED_ROW" ] && [ "$(echo "$CRAFTED_ROW" | awk -F'\t' '{print NF}')" = "5" ]; then
+    pass "crafted row is escaped on the wire with 5 true fields"
+else
+    fail "crafted row not escaped as expected: $CRAFTED_ROW"
+fi
+RAW_VERDICTS="$(printf 'VERDICTS RECENT 5\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>>"$SOCAT_LOG")"
+CRAFTED_VROW="$(echo "$RAW_VERDICTS" | grep '%09' | head -1)"
+if [ -n "$CRAFTED_VROW" ] && [ "$(echo "$CRAFTED_VROW" | awk -F'\t' '{print NF}')" = "9" ]; then
+    pass "crafted verdict row is escaped on the wire with 9 true fields"
+else
+    fail "crafted verdict row not escaped as expected: $CRAFTED_VROW"
+fi
+# Restore through the decoded id avctl displays (id is the %-40s first
+# column; cut -c1-40 preserves the embedded TAB that awk would split
+# on). Proves the sidecar + restore path handles the name end to end.
+QID_CRAFTED="$(echo "$LIST_OUT" | grep "evil.*eicar" | head -1 | cut -c1-40 | sed 's/ *$//')"
+if [ -n "$QID_CRAFTED" ] && "$AVCTL" quarantine restore "$QID_CRAFTED" >"$AVCTL_LOG" 2>&1 && [ -e "$CRAFTED_FILE" ]; then
+    pass "crafted-name file restores to its exact original path"
+else
+    fail "crafted-name restore failed (id=$QID_CRAFTED): $(cat "$AVCTL_LOG" 2>/dev/null)"
+fi
+rm -f "$CRAFTED_FILE"
 rm -f "$TEST_FILE"
 
 section "unload"

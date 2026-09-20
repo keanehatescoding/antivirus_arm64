@@ -49,6 +49,12 @@
 #include <sys/time.h>
 #include <sys/un.h>
 
+/* Shared percent-escape helpers with avd (the emit side). Relative
+ * include, not -I: this translation unit builds with a bare
+ * `$(CC) -o avctl avctl.c` (see Makefile), and the pre-commit hook's
+ * `gcc -fsyntax-only` likewise passes no -I flags. */
+#include "../avd/wire_escape.h"
+
 #define PROC_PATH "/proc/kernel_av_signatures"
 #define TRUST_PROC_PATH "/proc/kernel_av_trusted"
 #define PROTECTED_PROC_PATH "/proc/kernel_av_protected"
@@ -1678,21 +1684,29 @@ static int do_quarantine_list(void)
 
     printf("%-40s %-6s %-20s %s\n", "ID", "RULE", "TIMESTAMP", "ORIGINAL PATH");
     while ((line = next_line(&cursor)) != NULL && strcmp(line, "END")) {
-        char id[256] = "", path[PATH_MAX] = "", rule[128] = "", sha[128] = "";
-        /* Path field width built from sizeof(path) - 1, not a
-         * hardcoded 4095 - scanf field widths can't take a runtime
-         * '*' argument the way printf precision can, so the format
-         * string itself is built at runtime instead. This keeps the
-         * width tied to the actual buffer size even if PATH_MAX (or
-         * this array) ever changes, rather than a magic number that
-         * could silently drift out of sync with it. */
-        char fmt[64];
+        /* 3x-sized for the percent-escaped wire form (see
+         * wire_escape.h): id pastes an attacker-chosen basename (up to
+         * NAME_MAX raw bytes) and path a full PATH_MAX one - the
+         * sscanf widths below must fit the ESCAPED lengths, not the
+         * raw ones, or a hostile name truncates mid-triplet and the
+         * unescape after the split leaves literal "%" junk. sha/ts
+         * stay small: hex/digits never escape. */
+        char id[768] = "", path[PATH_MAX * 3] = "", rule[256] = "", sha[128] = "";
+        /* Field widths built from the sizeof()s above, not hardcoded
+         * numbers - scanf field widths can't take a runtime '*'
+         * argument the way printf precision can, so the format string
+         * itself is built at runtime instead. This keeps the widths
+         * tied to the actual buffer sizes even if PATH_MAX (or these
+         * arrays) ever changes, rather than magic numbers that could
+         * silently drift out of sync with them. */
+        char fmt[96];
         long ts = 0;
         int fmt_len;
 
         fmt_len = snprintf(fmt, sizeof(fmt),
-                            "%%255[^\t]\t%%%zu[^\t]\t%%ld\t%%127[^\t]\t%%127[^\t\n]",
-                            sizeof(path) - 1);
+                            "%%%zu[^\t]\t%%%zu[^\t]\t%%ld\t%%%zu[^\t]\t%%%zu[^\t\n]",
+                            sizeof(id) - 1, sizeof(path) - 1,
+                            sizeof(rule) - 1, sizeof(sha) - 1);
         if (fmt_len < 0 || (size_t)fmt_len >= sizeof(fmt))
             continue; /* shouldn't happen - fmt is generously sized */
 
@@ -1705,6 +1719,15 @@ static int do_quarantine_list(void)
                     "avctl: warning: skipping malformed quarantine row\n");
             continue;
         }
+        /* Percent-decoding AFTER the tab-split (#59): avd escapes
+         * id/path/rule on emit, so the split above always sees the
+         * true field boundaries even for hostile filenames - decoding
+         * first would reintroduce the raw tabs/newlines the split
+         * relies on not seeing. In-place decode only ever shrinks,
+         * so the sscanf-sized buffers stay valid. */
+        wire_unescape(id);
+        wire_unescape(path);
+        wire_unescape(rule);
         (void)sha; /* not shown in the table - avctl quarantine list is a
                    * human-facing summary; the GUI reads the same
                    * response and shows the full sha256 itself */
