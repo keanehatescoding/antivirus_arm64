@@ -1873,11 +1873,12 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   /* sha256_fd() above drains through a dup()'d handle, and dup() shares
    * the underlying file offset with the original fd (same open file
    * description) - so on any on-demand scan (no precomputed sha256_hex,
-   * i.e. every avctl/GUI SCAN request) `fd` is sitting at EOF here and
-   * YARA would scan zero bytes and always report CLEAN. Rewind before
-   * scanning; yr_rules_scan_fd() does not do this itself. Fail open on
-   * a rewind error, matching this function's stance on inconclusive
-   * information elsewhere. */
+   * i.e. every avctl/GUI SCAN request) `fd` is sitting at EOF here.
+   * The snapshot copy below reads with pread() and the fuzzy/TLSH
+   * stages rewind their own dup()s, so none of them depends on this -
+   * but leave the offset normalized rather than handing an EOF-sitting
+   * fd down the pipeline. Fail open on a rewind error, matching this
+   * function's stance on inconclusive information elsewhere. */
   if (lseek(fd, 0, SEEK_SET) < 0) {
     fprintf(stderr, "avd: lseek(\"%s\", SEEK_SET) before YARA scan failed: "
                     "%s - failing open\n",
@@ -1902,16 +1903,20 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
    *    skip YARA, mark incomplete, and continue to the fuzzy/TLSH
    *    stages (which enforce the same cap themselves) rather than
    *    reporting a YARA-clean verdict.
-   * 2. Enforcement: the scan itself runs over a MAP_PRIVATE mapping of
-   *    at most MAX_FUZZY_TLSH_FILE_SIZE bytes via yr_rules_scan_mem(),
-   *    not yr_rules_scan_fd() - the latter maps the descriptor's whole
+   * 2. Enforcement: the scan itself runs over a stable snapshot of at
+   *    most MAX_FUZZY_TLSH_FILE_SIZE bytes via yr_rules_scan_mem(), not
+   *    yr_rules_scan_fd() - the latter maps the descriptor's whole
    *    current size, so a file that grows past the snapshot between the
    *    fstat() and the scan would still tie up a worker past the cap.
-   *    The mapping length comes from a fresh fstat() taken here (not
-   *    the stale owner_st, which predates the hashing reads above), and
-   *    a post-scan fstat() marks incomplete if the size changed
-   *    mid-scan, so a capped prefix scan is never reported as a
-   *    complete clean verdict. */
+   *    The snapshot is an anonymous malloc()'d copy filled with
+   *    pread(), not a MAP_PRIVATE mapping of the file: a mapping does
+   *    not survive concurrent truncation (touching a page past the new
+   *    EOF raises SIGBUS inside the scan, killing the daemon before any
+   *    post-scan check runs). The copy length comes from a fresh
+   *    fstat() taken here (not the stale owner_st, which predates the
+   *    hashing reads above), and a post-scan fstat() marks incomplete
+   *    if the size changed mid-scan, so a capped prefix scan is never
+   *    reported as a complete clean verdict. */
   if (owner_uid != (uid_t)-1 &&
       owner_st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
     fprintf(stderr,
@@ -1921,7 +1926,6 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   } else {
     struct stat yara_st;
     size_t scan_len = 0;
-    void *map = MAP_FAILED;
 
     if (fstat(fd, &yara_st) != 0) {
       fprintf(stderr, "avd: fstat(\"%s\") before YARA scan failed: %s - "
@@ -1939,45 +1943,80 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       /* Empty file: nothing for YARA to match on. Vacuously clean and
        * complete, same outcome yr_rules_scan_fd() reports for one. */
     } else {
+      uint8_t *snap;
+      size_t total = 0;
+
       scan_len = (size_t)yara_st.st_size;
-      map = mmap(NULL, scan_len, PROT_READ, MAP_PRIVATE, fd, 0);
-      if (map == MAP_FAILED) {
-        fprintf(stderr, "avd: mmap(\"%s\", %zu) before YARA scan failed: "
-                        "%s - failing open\n",
-                path, scan_len, strerror(errno));
+      snap = malloc(scan_len);
+      if (!snap) {
+        fprintf(stderr, "avd: malloc(%zu) for YARA scan of \"%s\" failed - "
+                        "failing open\n",
+                scan_len, path);
         out->incomplete = true;
       } else {
-        ret = yr_rules_scan_mem(compiled_rules, map, scan_len, 0,
-                                yara_callback, &ctx, avd_scan_timeout_secs);
-        munmap(map, scan_len);
-        if (ret != ERROR_SUCCESS) {
-          /* File vanished, permission denied, scan timeout, etc. - fail
-           * open here too, matching the kernel side's own fail-open
-           * stance on inconclusive information (see
-           * docs/netlink-protocol.md). */
-          fprintf(stderr, "avd: yr_rules_scan_mem(\"%s\") failed: error %d\n",
-                  path, ret);
-          /* Includes ERROR_SCAN_TIMEOUT. Worth noting for anyone reading
-           * this as a threat model rather than an error path: of all the
-           * inconclusive outcomes here this is the one an attacker has the
-           * most influence over, since the input file's own size and
-           * structure drive how long avd_scan_timeout_secs has to absorb. */
-          out->incomplete = true;
-          goto record;
+        /* Offset-based reads: the shared file offset is untouched, and
+         * a concurrent truncation just shortens the copy (rc 0) instead
+         * of faulting the scanner. EINTR-retried, like every other read
+         * loop in this file. */
+        while (total < scan_len) {
+          ssize_t n =
+              pread(fd, snap + total, scan_len - total, (off_t)total);
+
+          if (n == 0)
+            break;
+          if (n < 0) {
+            if (errno == EINTR)
+              continue;
+            fprintf(stderr, "avd: pread(\"%s\") for YARA scan failed: %s - "
+                            "failing open\n",
+                    path, strerror(errno));
+            break;
+          }
+          total += (size_t)n;
         }
-        /* The mapping above is bounded by construction, but it is still
-         * a snapshot: a concurrent growth means the scan covered only a
-         * prefix of the file's current content (and a shrink means it
-         * covered stale bytes). Either way the result no longer reflects
-         * the file - say so rather than reporting it as complete. */
-        if (fstat(fd, &yara_st) != 0 ||
-            yara_st.st_size != (off_t)scan_len) {
-          fprintf(stderr,
-                  "avd: YARA scan of \"%s\" raced a size change "
-                  "(scanned %zu bytes) - marking incomplete\n",
-                  path, scan_len);
-          out->incomplete = true;
+        if (total == 0) {
+          /* Vanished, truncated to empty, or unreadable before the
+           * first byte: no content to match on. Incomplete unless the
+           * file really is empty now. */
+          if (fstat(fd, &yara_st) != 0 || yara_st.st_size != 0)
+            out->incomplete = true;
+        } else {
+          ret = yr_rules_scan_mem(compiled_rules, snap, total, 0,
+                                  yara_callback, &ctx,
+                                  avd_scan_timeout_secs);
+          if (ret != ERROR_SUCCESS) {
+            /* File vanished, permission denied, scan timeout, etc. -
+             * fail open here too, matching the kernel side's own
+             * fail-open stance on inconclusive information (see
+             * docs/netlink-protocol.md). */
+            fprintf(stderr,
+                    "avd: yr_rules_scan_mem(\"%s\") failed: error %d\n", path,
+                    ret);
+            /* Includes ERROR_SCAN_TIMEOUT. Worth noting for anyone
+             * reading this as a threat model rather than an error path:
+             * of all the inconclusive outcomes here this is the one an
+             * attacker has the most influence over, since the input
+             * file's own size and structure drive how long
+             * avd_scan_timeout_secs has to absorb. */
+            out->incomplete = true;
+            free(snap);
+            goto record;
+          }
+          /* The copy above is bounded by construction, but it is still
+           * a snapshot: total < scan_len means truncation mid-read, and
+           * a post-scan size mismatch means the file changed around the
+           * scan. Either way the result no longer reflects the file -
+           * say so rather than reporting it as complete. */
+          if (total != scan_len || fstat(fd, &yara_st) != 0 ||
+              yara_st.st_size != (off_t)scan_len) {
+            fprintf(stderr,
+                    "avd: YARA scan of \"%s\" raced a size change "
+                    "(scanned %zu of %zu bytes) - marking incomplete\n",
+                    path, total, scan_len);
+            out->incomplete = true;
+          }
         }
+        free(snap);
       }
     }
   }
