@@ -37,6 +37,36 @@ class AvdError(Exception):
     """Raised for a connection failure or an ERR response from avd."""
 
 
+def unescape_field(value):
+    """Decodes one percent-escaped control-protocol field (issue #59).
+
+    Mirror of wire_escape.h's wire_unescape() in userspace/avd/ - avd
+    escapes '%' as "%25" and every byte below 0x20 (covers '\\t'/'\\n')
+    plus 0x7F as "%XX" on emit, so tab/newline-framed rows always split
+    on the true field boundaries. A '%' not followed by two hex digits
+    decodes to a literal '%', so malformed input degrades to display
+    text rather than failing the whole listing. Must stay in sync with
+    the C helper - tests/test_wire_escape.sh round-trips shared vectors
+    through both.
+    """
+    out = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        # Explicit hex-digit check, not int(pair, 16): int() tolerates
+        # whitespace/underscores (" 1", "1_"), which the C decoder
+        # (wire_hex_val) rejects - the two must agree exactly.
+        if ch == "%" and i + 2 < len(value):
+            pair = value[i + 1:i + 3]
+            if all(c in "0123456789abcdefABCDEF" for c in pair):
+                out.append(chr(int(pair, 16)))
+                i += 3
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _request(cmd):
     """Sends one command line and returns the full response text. avd
     closes the connection after exactly one response (one command per
@@ -157,7 +187,17 @@ def verdicts_recent(n=100):
                 f"malformed VERDICTS RECENT row: expected {len(keys)} "
                 f"fields, got {len(r)}"
             )
-    return [dict(zip(keys, r)) for r in rows]
+    # Decode AFTER the tab-split (#59): avd escapes path/rule_name on
+    # emit, so the split above always lands on true field boundaries -
+    # decoding first would reintroduce the raw tabs the split relies
+    # on not seeing. Numeric/sha/verdict fields never escape.
+    decoded = []
+    for r in rows:
+        d = dict(zip(keys, r))
+        d["path"] = unescape_field(d["path"])
+        d["rule_name"] = unescape_field(d["rule_name"])
+        decoded.append(d)
+    return decoded
 
 
 def quarantine_list():
@@ -171,4 +211,11 @@ def quarantine_list():
                 f"malformed QUARANTINE LIST row: expected {len(keys)} "
                 f"fields, got {len(r)}"
             )
-    return [dict(zip(keys, r)) for r in rows]
+    decoded = []
+    for r in rows:
+        d = dict(zip(keys, r))
+        d["id"] = unescape_field(d["id"])
+        d["original_path"] = unescape_field(d["original_path"])
+        d["rule_name"] = unescape_field(d["rule_name"])
+        decoded.append(d)
+    return decoded

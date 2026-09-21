@@ -17,6 +17,40 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from av_gui import avctl_path, path_validation
+from av_gui import avd_client
+
+
+class UnescapeFieldTest(unittest.TestCase):
+    """Percent-decoding mirror of wire_escape.h (issues #59/#64)."""
+
+    def test_plain_unchanged(self):
+        self.assertEqual(
+            avd_client.unescape_field("/tmp/sample.bin"), "/tmp/sample.bin"
+        )
+
+    def test_attack_bytes(self):
+        self.assertEqual(avd_client.unescape_field("evil%09x"), "evil\tx")
+        self.assertEqual(
+            avd_client.unescape_field("evil%0Arow"), "evil\nrow"
+        )
+        self.assertEqual(
+            avd_client.unescape_field("100%2509"), "100%09"
+        )
+
+    def test_lenient_not_strict(self):
+        """Malformed triplets stay literal - never fail a listing."""
+        self.assertEqual(avd_client.unescape_field("100%"), "100%")
+        self.assertEqual(avd_client.unescape_field("a%2"), "a%2")
+        self.assertEqual(avd_client.unescape_field("%ZZ"), "%ZZ")
+        self.assertEqual(avd_client.unescape_field("% 1"), "% 1")
+
+    def test_roundtrip_hostile_name(self):
+        """A crafted basename survives split-then-decode intact."""
+        row_field = "12_3%09evil%0Arow%01%25100"
+        decoded = avd_client.unescape_field(row_field)
+        self.assertEqual(decoded, "12_3\tevil\nrow\x01%100")
+        self.assertNotIn("\t", row_field)
+        self.assertNotIn("\n", row_field)
 
 
 class ValidateAbsolutePathTest(unittest.TestCase):

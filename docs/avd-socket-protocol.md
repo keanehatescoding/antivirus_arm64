@@ -82,20 +82,29 @@ COUNT <n>\n
 END\n
 ```
 
-Row fields are **tab-separated**. Known limitation, same class as
-`avctl save`/`load`'s documented one (see `do_save()` in `avctl.c`):
-a field value containing a literal tab or newline (a path or rule name
-could, in principle, on Linux) will misparse. Not addressed here for
-the same reason it wasn't addressed there - narrow, real-world-rare,
-and would need a heavier framing format to fully close.
+Row fields are **tab-separated**, and every free-text field (paths,
+quarantine ids, rule names) is **percent-escaped** on emit (issues
+#59/#64): `%` encodes as `%25`, and every byte below `0x20` (covers
+`\t`/`\n`/`\r`) plus `0x7F` encodes as `%XX` (uppercase hex).
+Everything else - including `/`, UTF-8, and non-UTF-8 high bytes -
+passes through literally, so ordinary rows are byte-identical to
+before. Clients must split rows on `\n` and fields on `\t` FIRST, then
+percent-decode each field; decoding before splitting would reintroduce
+the raw tabs/newlines the split relies on not seeing. A `%` not
+followed by two hex digits decodes to a literal `%` (lenient by
+design: a malformed field degrades to display text rather than failing
+the whole listing). Canonical encoder/decoder: `wire_escape()`/
+`wire_unescape()` in `userspace/avd/wire_escape.h` (C, shared by avd
+and avctl); the GUI mirrors the decode side in
+`av_gui/avd_client.py:unescape_field()`.
 
 ## Commands
 
 | Command | Auth | Response |
 |---|---|---|
 | `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` |
-| `VERDICTS RECENT <n>` | any, filtered | up to `n` most-recent rows *the caller owns* (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` |
-| `QUARANTINE LIST` | any, filtered | one row per quarantined file *the caller owns*: `id\toriginal_path\ttimestamp\trule_name\tsha256` |
+| `VERDICTS RECENT <n>` | any, filtered | up to `n` most-recent rows *the caller owns* (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` (`path`/`rule_name` percent-escaped - decode after splitting) |
+| `QUARANTINE LIST` | any, filtered | one row per quarantined file *the caller owns*: `id\toriginal_path\ttimestamp\trule_name\tsha256` (`id`/`original_path`/`rule_name` percent-escaped - decode after splitting) |
 | `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS)\trule_name\tscore\tsha256` |
 | `QUARANTINE RESTORE <id>` | **root** | `OK` only, no rows |
 | `QUARANTINE DELETE <id>` | **root** | `OK` only, no rows |
@@ -150,7 +159,15 @@ it gets there.
   save`/`load` for the kernel-state equivalent). Not addressed here;
   a future on-disk log is a reasonable follow-up if this turns out to
   matter in practice.
-- **Tab/newline in a field value misparses** - see Wire format above.
+- **Tab/newline in a field value is escaped, not misparsed** - see
+  Wire format above. Two residual edges worth knowing: (1) a
+  quarantine id containing a literal newline names a real on-disk file
+  but cannot be passed back through `QUARANTINE RESTORE`/`DELETE`,
+  whose requests are themselves newline-terminated lines (recover such
+  a file by moving it out of the quarantine directory by hand); (2) a
+  sidecar written before escaping existed whose original path
+  contains a literal `%XX` hex-looking sequence decodes to the
+  corresponding byte on read.
 - **No path-traversal protection needed on `SCAN`'s argument** beyond
   requiring it to be absolute - unlike quarantine `<id>`, an arbitrary
   absolute path is exactly what `SCAN` is *for* (scan any file the
