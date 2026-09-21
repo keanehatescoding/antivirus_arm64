@@ -225,5 +225,48 @@ class PrivilegedPathTest(unittest.TestCase):
                 )
 
 
+class StatusRowTest(unittest.TestCase):
+    """STATUS shape tolerance (#64 item 4): the 10-field row carries
+    the fanotify counters appended after scan_threads, and older
+    daemons still answer the 6-field row - both must parse, anything
+    else must fail closed."""
+
+    def _with_response(self, resp):
+        real = avd_client._request
+        avd_client._request = lambda cmd: resp
+        try:
+            return avd_client.status()
+        finally:
+            avd_client._request = real
+
+    def test_six_field_row(self):
+        st = self._with_response("OK\nCOUNT 1\n100\t1\t2\t3\t0\t4\nEND\n")
+        self.assertEqual(
+            st,
+            {
+                "uptime_secs": 100,
+                "rules_loaded": 1,
+                "fuzzy_corpus_count": 2,
+                "tlsh_corpus_count": 3,
+                "scan_queue_len": 0,
+                "scan_threads": 4,
+            },
+        )
+
+    def test_ten_field_row(self):
+        st = self._with_response(
+            "OK\nCOUNT 1\n100\t1\t2\t3\t0\t4\t50\t1\t0\t0\nEND\n"
+        )
+        self.assertEqual(st["scan_threads"], 4)
+        self.assertEqual(st["fanexec_allowed"], 50)
+        self.assertEqual(st["fanexec_denied"], 1)
+        self.assertEqual(st["fanexec_undecided"], 0)
+        self.assertEqual(st["fanexec_overflows"], 0)
+
+    def test_wrong_field_count_rejected(self):
+        with self.assertRaises(avd_client.AvdError):
+            self._with_response("OK\nCOUNT 1\n100\t1\t2\nEND\n")
+
+
 if __name__ == "__main__":
     unittest.main()

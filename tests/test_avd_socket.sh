@@ -164,6 +164,15 @@ if command -v socat >/dev/null 2>&1; then
     else
         fail "STATUS response malformed: $STATUS_RESP"
     fi
+    # 10 tab fields: the 6 base STATUS fields plus the 4 fanotify
+    # exec-gate counters appended by #64 item 4 (allowed/denied/
+    # undecided/overflows). The row is line 3 of OK/COUNT/row/END.
+    STATUS_ROW="$(echo "$STATUS_RESP" | awk 'NR==3')"
+    if [ "$(echo "$STATUS_ROW" | awk -F'\t' '{print NF}')" = "10" ]; then
+        pass "STATUS row carries 10 fields (6 base + 4 fanotify counters)"
+    else
+        fail "STATUS row field count wrong: $STATUS_ROW"
+    fi
 
     VERDICTS_RESP="$(printf 'VERDICTS RECENT 5\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>>"$SOCAT_LOG")"
     if echo "$VERDICTS_RESP" | grep -q '^OK$'; then

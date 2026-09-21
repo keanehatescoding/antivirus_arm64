@@ -102,7 +102,7 @@ and avctl); the GUI mirrors the decode side in
 
 | Command | Auth | Response |
 |---|---|---|
-| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` |
+| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads\tfanexec_allowed\tfanexec_denied\tfanexec_undecided\tfanexec_overflows` (the last four only on daemons new enough to report them - older daemons answer the 6-field row; clients must accept both) |
 | `VERDICTS RECENT <n>` | any, filtered | up to `n` most-recent rows *the caller owns* (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` (`path`/`rule_name` percent-escaped - decode after splitting) |
 | `QUARANTINE LIST` | any, filtered | one row per quarantined file *the caller owns*: `id\toriginal_path\ttimestamp\trule_name\tsha256` (`id`/`original_path`/`rule_name` percent-escaped - decode after splitting) |
 | `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS)\trule_name\tscore\tsha256` |
@@ -129,7 +129,12 @@ peer process - not attacker-writable, same trust boundary as
 returning `ERR permission denied ...` otherwise.
 
 `STATUS` answers any peer with aggregate counts only - nothing
-per-file. `VERDICTS RECENT` and `QUARANTINE LIST` also answer any
+per-file. The trailing `fanexec_*` counters are the fanotify exec
+gate's running tally (`allowed` / `denied` / `undecided` /
+`overflows`); `overflows` is the one to alert on - a `FAN_Q_OVERFLOW`
+means execs were allowed without a verdict (the daemon cannot mitigate
+those: the events behind them already ran), so a nonzero count answers
+"has this been happening?" without stopping the gate. `VERDICTS RECENT` and `QUARANTINE LIST` also answer any
 peer, but unlike the IOC `/proc` entries (which hold no per-user
 data and are owner-only reads), each row is a specific file's path and SHA-256 hash -
 worth protecting the same way file contents themselves are. Both
