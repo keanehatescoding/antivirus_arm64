@@ -447,9 +447,11 @@ struct save_dest {
  * directory owned by our euid or root, with no group/other write
  * access unless the sticky bit is set (in a sticky directory only an
  * entry's owner, the directory owner, or root can rename/remove
- * entries). Returns 0 if trusted, -1 (with an error already printed)
+ * entries). `op` names the operation for error messages ("save" or
+ * "load") - shared by do_save()'s destination walk and do_load()'s
+ * input walk. Returns 0 if trusted, -1 (with an error already printed)
  * otherwise. */
-static int save_dir_trusted_fd(int fd, const char *path)
+static int save_dir_trusted_fd(int fd, const char *path, const char *op)
 {
     struct stat st;
     uid_t euid = geteuid();
@@ -461,20 +463,20 @@ static int save_dir_trusted_fd(int fd, const char *path)
     }
     if (!S_ISDIR(st.st_mode)) {
         fprintf(stderr,
-                "avctl: parent of %s is not a directory - refusing to save there\n",
-                path);
+                "avctl: parent of %s is not a directory - refusing to %s there\n",
+                path, op);
         return -1;
     }
     if (st.st_uid != euid && st.st_uid != 0) {
         fprintf(stderr,
-                "avctl: parent directory of %s is owned by uid %d - refusing to save there\n",
-                path, (int)st.st_uid);
+                "avctl: parent directory of %s is owned by uid %d - refusing to %s there\n",
+                path, (int)st.st_uid, op);
         return -1;
     }
     if ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)) {
         fprintf(stderr,
-                "avctl: parent directory of %s is writable by other users without the sticky bit - refusing to save there\n",
-                path);
+                "avctl: parent directory of %s is writable by other users without the sticky bit - refusing to %s there\n",
+                path, op);
         return -1;
     }
     return 0;
@@ -517,8 +519,11 @@ static int save_tmp_lstat(int parent_fd, const char *tmpbase, struct stat *st)
  * components are safe to pass through: under pinning they resolve to
  * the real parent without ever traversing a symlink (none is ever
  * followed). Fills d (parent_fd + base + tmpbase) and returns 0,
- * or -1 (error printed, nothing held) on any failure. */
-static int pin_save_parent(const char *path, struct save_dest *d)
+ * or -1 (error printed, nothing held) on any failure. `op` names the
+ * operation for error messages ("save" or "load") - the walk is
+ * shared by do_save()'s destination and do_load()'s input. */
+static int pin_save_parent(const char *path, struct save_dest *d,
+                           const char *op)
 {
     const char *slash = strrchr(path, '/');
     const char *parent_part;
@@ -555,7 +560,7 @@ static int pin_save_parent(const char *path, struct save_dest *d)
                 path, strerror(errno));
         return -1;
     }
-    if (save_dir_trusted_fd(cur, path)) {
+    if (save_dir_trusted_fd(cur, path, op)) {
         close(cur);
         return -1;
     }
@@ -594,8 +599,8 @@ static int pin_save_parent(const char *path, struct save_dest *d)
         if (next < 0) {
             if (errno == ELOOP || errno == ENOTDIR)
                 fprintf(stderr,
-                        "avctl: parent directory of %s goes through a symlink - refusing to save there\n",
-                        path);
+                        "avctl: parent directory of %s goes through a symlink - refusing to %s there\n",
+                        path, op);
             else
                 fprintf(stderr,
                         "avctl: cannot open parent directory of %s: %s\n",
@@ -603,7 +608,7 @@ static int pin_save_parent(const char *path, struct save_dest *d)
             close(cur);
             return -1;
         }
-        if (save_dir_trusted_fd(next, path)) {
+        if (save_dir_trusted_fd(next, path, op)) {
             close(next);
             close(cur);
             return -1;
@@ -693,7 +698,7 @@ static int do_save(const char *path)
          * symlinked or untrusted ancestors and hands back a held-open
          * fd, so the create below cannot be redirected no matter what
          * happens to the namespace afterwards. */
-        if (pin_save_parent(path, &dest))
+        if (pin_save_parent(path, &dest, "save"))
             return 1;
 
         /* O_CREAT|O_EXCL|O_NOFOLLOW through the pinned parent, not
@@ -976,14 +981,100 @@ static int validate_sig_or_trust_fields(const char *kind, const char *rest)
     return 0;
 }
 
+/* Provenance gate for do_load()'s input: a load file is replayed line
+ * by line into /proc as root (trust entries, protected paths, daemon
+ * policy), so it must meet the same bar as do_save()'s destination -
+ * a bare fopen() trusts the file purely because root pointed at it,
+ * with no check that root is the one who wrote it (#61). Pins the
+ * parent with pin_save_parent() (symlinked or attacker-writable
+ * ancestors fail closed, same walk do_save() uses), then opens the
+ * file itself through the pinned fd with O_NOFOLLOW so a trailing
+ * symlink fails closed too, and requires it to be a root/euid-owned
+ * regular file with no group/other write access. Returns the open fd
+ * on success, -1 (error printed) otherwise. The fd names the validated
+ * inode directly, so there is no check-then-use gap between this and
+ * the caller's fdopen(). */
+static int open_load_file(const char *path)
+{
+    struct save_dest dest;
+    int fd;
+    struct stat st;
+    uid_t euid = geteuid();
+
+    if (strlen(path) >= PATH_MAX) {
+        fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+        return -1;
+    }
+    if (pin_save_parent(path, &dest, "load"))
+        return -1;
+    if (!dest.base[0]) {
+        fprintf(stderr,
+                "avctl: load: \"%s\" names a directory, not a load file - refusing\n",
+                path);
+        close(dest.parent_fd);
+        return -1;
+    }
+    fd = openat(dest.parent_fd, dest.base, O_RDONLY | O_NOFOLLOW);
+    close(dest.parent_fd);
+    if (fd < 0) {
+        if (errno == ELOOP)
+            fprintf(stderr,
+                    "avctl: load: \"%s\" is a symlink - refusing to load through it\n",
+                    path);
+        else
+            fprintf(stderr, "avctl: could not open %s: %s\n", path,
+                    strerror(errno));
+        return -1;
+    }
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "avctl: load: cannot stat \"%s\": %s\n", path,
+                strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr,
+                "avctl: load: \"%s\" is not a regular file - refusing\n",
+                path);
+        close(fd);
+        return -1;
+    }
+    if (st.st_uid != euid && st.st_uid != 0) {
+        fprintf(stderr,
+                "avctl: load: \"%s\" is owned by uid %d - refusing to replay a file root did not write\n",
+                path, (int)st.st_uid);
+        close(fd);
+        return -1;
+    }
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        fprintf(stderr,
+                "avctl: load: \"%s\" is writable by other users - refusing to replay it (copy it to a root-owned mode-0600 file first)\n",
+                path);
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static int do_load(const char *path)
 {
-    FILE *f = fopen(path, "r");
     char line[PATH_MAX + 16];
     int loaded = 0, skipped = 0, errors = 0;
+    int load_fd;
+    FILE *f;
 
+    /* Validated open, not fopen(): every line below is replayed into
+     * kernel/daemon state as root, so an unvalidated input - a file
+     * in an attacker-writable directory, a symlinked ancestor, or a
+     * group/world-writable file - would let an unprivileged user
+     * author root-replayed trust/policy writes. See open_load_file(). */
+    load_fd = open_load_file(path);
+    if (load_fd < 0)
+        return 1;
+    f = fdopen(load_fd, "r");
     if (!f) {
         fprintf(stderr, "avctl: could not open %s: %s\n", path, strerror(errno));
+        close(load_fd);
         return 1;
     }
 
