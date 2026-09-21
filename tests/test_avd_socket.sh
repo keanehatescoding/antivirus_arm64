@@ -331,10 +331,17 @@ if [ -n "$CRAFTED_VROW" ] && [ "$(echo "$CRAFTED_VROW" | awk -F'\t' '{print NF}'
 else
     fail "crafted verdict row not escaped as expected: $CRAFTED_VROW"
 fi
-# Restore through the decoded id avctl displays (id is the %-40s first
-# column; cut -c1-40 preserves the embedded TAB that awk would split
-# on). Proves the sidecar + restore path handles the name end to end.
-QID_CRAFTED="$(echo "$LIST_OUT" | grep "evil.*eicar" | head -1 | cut -c1-40 | sed 's/ *$//')"
+# Restore through the id decoded from the wire row: take the first TAB
+# field of CRAFTED_ROW (still percent-escaped) and run it through the
+# GUI's unescape_field(), the same decoder avctl/GUI use for display.
+# Fixed-width slicing of avctl's display table would be wrong here -
+# its %-40s ID column pads short ids but never truncates long ones
+# (PID + nanosecond-time + basename can exceed 40 chars), so cut -c1-40
+# would cut a long id short and the restore would fail on a truncated
+# id. The wire field is the exact value. Proves the sidecar + restore
+# path handles the name end to end.
+QID_CRAFTED_ESCAPED="$(printf '%s' "$CRAFTED_ROW" | cut -f1)"
+QID_CRAFTED="$(PYTHONPATH="$REPO_ROOT/userspace/av-gui" python3 -c 'import sys; from av_gui.avd_client import unescape_field; sys.stdout.write(unescape_field(sys.argv[1]))' "$QID_CRAFTED_ESCAPED")"
 if [ -n "$QID_CRAFTED" ] && "$AVCTL" quarantine restore "$QID_CRAFTED" >"$AVCTL_LOG" 2>&1 && [ -e "$CRAFTED_FILE" ]; then
     pass "crafted-name file restores to its exact original path"
 else
