@@ -153,18 +153,32 @@ def _parse_rows(resp):
 
 def status():
     """Returns a dict: uptime_secs, rules_loaded, fuzzy_corpus_count,
-    tlsh_corpus_count, scan_queue_len, scan_threads (all int)."""
+    tlsh_corpus_count, scan_queue_len, scan_threads (all int), plus -
+    on daemons new enough to report them - fanexec_allowed,
+    fanexec_denied, fanexec_undecided, fanexec_overflows (all int).
+    Accepts both the 6-field row (older avd) and the 10-field row:
+    the fanotify fields were appended, never inserted, so positional
+    parsing of the first six is stable either way."""
     rows = _parse_rows(_request("STATUS"))
     if len(rows) != 1:
         raise AvdError(f"STATUS returned {len(rows)} row(s), expected 1")
-    keys = [
+    base_keys = [
         "uptime_secs", "rules_loaded", "fuzzy_corpus_count",
         "tlsh_corpus_count", "scan_queue_len", "scan_threads",
     ]
+    fan_keys = [
+        "fanexec_allowed", "fanexec_denied",
+        "fanexec_undecided", "fanexec_overflows",
+    ]
     fields = rows[0]
-    if len(fields) != len(keys):
+    if len(fields) == len(base_keys):
+        keys = base_keys
+    elif len(fields) == len(base_keys) + len(fan_keys):
+        keys = base_keys + fan_keys
+    else:
         raise AvdError(
-            f"malformed STATUS row: expected {len(keys)} fields, got {len(fields)}"
+            f"malformed STATUS row: expected {len(base_keys)} or "
+            f"{len(base_keys) + len(fan_keys)} fields, got {len(fields)}"
         )
     try:
         values = [int(v) for v in fields]

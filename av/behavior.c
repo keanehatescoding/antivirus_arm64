@@ -1337,9 +1337,30 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
 }
 
 /* Periodic sweep: reclaims behavior_table entries for processes that
- * have since exited. Runs from process context (workqueue), so it's
- * fine to hold behavior_lock across the whole scan - this never runs
- * on the atomic kprobe path.
+ * have since exited. Runs from process context (workqueue), so it may
+ * sleep - but it must NOT hold behavior_lock across the whole table:
+ * that mutex is also taken by every detection hook
+ * (av_behavior_check_openat()/_unlink()/_rename(),
+ * av_behavior_record_exec()), so one long sweep and all live detection
+ * are mutually exclusive, for a hold time that scales with
+ * tracked-process count - exactly what a fork-heavy workload inflates
+ * (#63). Two passes instead:
+ *
+ * 1. Under the lock, sample (pid, start_time) into a bounded stack
+ *    batch, bucket by bucket (the table hash has a fixed bucket
+ *    count, so the resume cursor is just the bucket index - no
+ *    allocation, no re-walk). No liveness calls here, so each
+ *    critical section is short and bounded by BEHAVIOR_GC_BATCH.
+ * 2. Lock dropped, resolve liveness per sample with
+ *    find_vpid()/pid_task() (RCU only, no mutex needed).
+ * 3. Re-take the lock and re-verify each sample before acting: look
+ *    the pid up again and require the entry's start_time to still
+ *    equal the sampled one. Anything that changed in between (GC
+ *    eviction, a pid recycle with its record_exec) fails the recheck
+ *    and is left for the next sweep 30s later - a skipped action only
+ *    delays reclamation, while acting on a stale sample could delete
+ *    or reset a live entry, so the recheck is what keeps this correct
+ *    rather than merely shorter.
  *
  * Liveness check: find_vpid(pid) resolves the tgid number back to a
  * struct pid in this namespace (NULL if no such pid exists at all -
@@ -1359,49 +1380,115 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
  * overwrites them. Entries that never recorded an exec (start_time == 0)
  * are left alone - they may still belong to the same pre-exec process,
  * and record_exec() will initialise them on its first exec. */
+/* One pass-1 batch: 48 samples hold the lock only across a memcpy of
+ * (pid, start_time) pairs - 48 * 16 = 768 bytes of stack, comfortably
+ * under the frame-size warning limit the CI kernel builds enforce. */
+#define BEHAVIOR_GC_BATCH 48
+
+struct behavior_gc_sample {
+  pid_t pid;
+  u64 start_time;
+};
+
 static void behavior_gc_fn(struct work_struct *w) {
   /* Initialized to NULL only to satisfy static analyzers that can't
-   * expand hash_for_each_safe() (same false-positive category as
-   * get_or_create_entry()'s hash_for_each_possible() NULL init below) -
-   * the macro always assigns e before the loop body runs. */
+   * expand the hlist_for_each_entry_safe() macro below without full
+   * kernel headers (same false-positive category as
+   * get_or_create_entry()'s hash_for_each_possible() NULL init) - the
+   * macro itself always assigns e via hlist_entry() before the loop
+   * body runs. */
   struct av_behavior_entry *e = NULL;
   struct hlist_node *tmp;
-  int bkt;
   unsigned int removed = 0;
+  /* Resume cursor across pass-1 batches: bucket index into the fixed
+   * hashtable, so each batch continues where the previous one stopped
+   * without re-walking. Entries added, evicted, or recycled between
+   * batches only shift which sweep reclaims them - every action still
+   * goes through the pass-3 recheck, so resume imprecision can delay
+   * but never corrupt. */
+  unsigned int bkt = 0;
+  bool table_done = false;
 
-  mutex_lock(&behavior_lock);
-  hash_for_each_safe(behavior_table, bkt, tmp, e, node) {
-    struct pid *p;
-    struct task_struct *task;
-    bool alive;
-    u64 cur_start = 0;
+  while (!table_done) {
+    struct behavior_gc_sample samples[BEHAVIOR_GC_BATCH];
+    int nsamples = 0;
+    int i;
 
-    rcu_read_lock();
-    p = find_vpid(e->pid);
-    task = p ? pid_task(p, PIDTYPE_TGID) : NULL;
-    if (task)
-      cur_start = READ_ONCE(task->start_time);
-    alive = (task != NULL);
-    rcu_read_unlock();
+    /* Pass 1: sample under the lock, nothing else. */
+    mutex_lock(&behavior_lock);
+    for (; bkt < HASH_SIZE(behavior_table) &&
+           nsamples < BEHAVIOR_GC_BATCH;
+         bkt++) {
+      hlist_for_each_entry_safe(e, tmp, &behavior_table[bkt], node) {
+        if (nsamples >= BEHAVIOR_GC_BATCH)
+          break;
+        samples[nsamples].pid = e->pid;
+        samples[nsamples].start_time = e->start_time;
+        nsamples++;
+      }
+    }
+    table_done = (bkt >= HASH_SIZE(behavior_table));
+    mutex_unlock(&behavior_lock);
 
-    if (!alive) {
-      hash_del(&e->node);
-      kfree(e);
-      removed++;
-    } else if (e->start_time != 0 && e->start_time != cur_start) {
-      /* PID recycled since this entry's last exec - start clean so the
-       * new occupant is never judged on the previous process's activity. */
-      e->start_time = cur_start;
-      e->exec_path[0] = '\0';
-      e->trusted = false;
-      e->recent_path_next = 0;
-      e->recent_path_filled = 0;
-      e->recent_rename_next = 0;
-      e->recent_rename_filled = 0;
+    /* Passes 2+3 per sample: liveness with no lock held, then
+     * re-verify under the lock before acting. */
+    for (i = 0; i < nsamples; i++) {
+      struct pid *p;
+      struct task_struct *task;
+      bool alive;
+      u64 cur_start = 0;
+      /* Re-lookup result, same NULL-init convention as `e` above -
+       * hash_for_each_possible() always assigns cand before the body
+       * runs. */
+      struct av_behavior_entry *cand = NULL;
+      struct av_behavior_entry *dst = NULL;
+
+      rcu_read_lock();
+      p = find_vpid(samples[i].pid);
+      task = p ? pid_task(p, PIDTYPE_TGID) : NULL;
+      if (task)
+        cur_start = READ_ONCE(task->start_time);
+      alive = (task != NULL);
+      rcu_read_unlock();
+
+      mutex_lock(&behavior_lock);
+      hash_for_each_possible(behavior_table, cand, node,
+                             pid_key(samples[i].pid)) {
+        if (cand->pid == samples[i].pid) {
+          dst = cand;
+          break;
+        }
+      }
+      /* Skip on any change since sampling: evicted/deleted (dst NULL)
+       * or recycled/re-recorded (start_time moved on). The next sweep
+       * re-samples the current state, so a skip only ever delays. */
+      /* cppcheck-suppress knownConditionTrueFalse
+       * False positive, same class as get_or_create_entry() above:
+       * cppcheck can't expand hash_for_each_possible() without full
+       * kernel headers, so it doesn't see that the loop body (and the
+       * `dst = cand` assignment) genuinely runs at runtime for a pid
+       * still present in the table. */
+      if (dst && dst->start_time == samples[i].start_time) {
+        if (!alive) {
+          hash_del(&dst->node);
+          kfree(dst);
+          behavior_table_count--;
+          removed++;
+        } else if (dst->start_time != 0 && dst->start_time != cur_start) {
+          /* PID recycled since this entry's last exec - start clean so the
+           * new occupant is never judged on the previous process's activity. */
+          dst->start_time = cur_start;
+          dst->exec_path[0] = '\0';
+          dst->trusted = false;
+          dst->recent_path_next = 0;
+          dst->recent_path_filled = 0;
+          dst->recent_rename_next = 0;
+          dst->recent_rename_filled = 0;
+        }
+      }
+      mutex_unlock(&behavior_lock);
     }
   }
-  behavior_table_count -= removed;
-  mutex_unlock(&behavior_lock);
 
   if (removed)
     pr_debug("kernel-av: event=gc type=behavioral reclaimed=%u\n", removed);

@@ -1515,28 +1515,58 @@ static int dir_hierarchy_trusted(const char *label, const char *dir,
   return 0;
 }
 
-static int ensure_quarantine_dir(void) {
+/* Validate the quarantine directory chain and hand back a held-open
+ * fd for it (or -1): mkdir() tolerating EEXIST must not treat "a
+ * symlink to /etc" the same as "the directory already exists" - an
+ * attacker who pre-creates a symlink at quarantine_dir before avd
+ * starts would otherwise redirect every quarantine write through it.
+ * And the check runs after a successful mkdir() too: a fresh directory
+ * is ours, but the ancestors that allowed its creation may still be
+ * attacker-controlled (root can mkdir inside an attacker-owned tree
+ * just as easily as anywhere else - an attacker-owned ancestor can
+ * rename our new directory away afterwards). The full chain - not
+ * just the final component - is validated, so no unprivileged user
+ * can modify any of it.
+ *
+ * The returned fd is what closes the remaining check-then-use gap for
+ * the quarantine link step (#64 item 1): quarantine_file() creates
+ * through this fd rather than re-resolving quarantine_dir by path, so
+ * validation and use refer to the same object. Re-check the fd's own
+ * identity after opening (O_NOFOLLOW already fails a trailing symlink
+ * closed, this confirms ownership/mode of what was actually opened):
+ * directory, owned by our euid or root, no group/other write access.
+ * Ancestor trust still rests on the chain validation above - the fd
+ * pins the final component, not the whole path; sidecar meta and the
+ * restore/delete/list paths still resolve quarantine_dir by string
+ * (their opens are O_EXCL|O_NOFOLLOW and id-validated respectively),
+ * which is the documented residual, not a second pinning. */
+static int open_quarantine_dir(void) {
+  int dirfd;
+  struct stat st;
+
   if (mkdir(quarantine_dir, 0700) != 0 && errno != EEXIST) {
     fprintf(stderr, "avd: could not create quarantine dir \"%s\": %s\n",
             quarantine_dir, strerror(errno));
     return -1;
   }
-  /* mkdir() tolerating EEXIST must not treat "a symlink to /etc"
-   * the same as "the directory already exists": an attacker who
-   * pre-creates a symlink at quarantine_dir before avd starts would
-   * otherwise redirect every quarantine write through it. And the
-   * check runs after a successful mkdir() too: a fresh directory is
-   * ours, but the ancestors that allowed its creation may still be
-   * attacker-controlled (root can mkdir inside an attacker-owned tree
-   * just as easily as anywhere else - an attacker-owned ancestor can
-   * rename our new directory away afterwards). The full chain - not
-   * just the final component - is validated, so no unprivileged user
-   * can modify any of it; that is also what closes the check-then-use
-   * gap without pinned fds for every later operation. No *at()/dir-FD
-   * pinning on top: once unprivileged users cannot modify the
-   * directory or any ancestor, there is nothing left for a retained
-   * FD to defend against. */
-  return dir_hierarchy_trusted("quarantine dir", quarantine_dir, false);
+  if (dir_hierarchy_trusted("quarantine dir", quarantine_dir, false) != 0)
+    return -1;
+  dirfd = open(quarantine_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  if (dirfd < 0) {
+    fprintf(stderr, "avd: could not open quarantine dir \"%s\": %s\n",
+            quarantine_dir, strerror(errno));
+    return -1;
+  }
+  if (fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+      (st.st_uid != geteuid() && st.st_uid != 0) ||
+      (st.st_mode & (S_IWGRP | S_IWOTH))) {
+    fprintf(stderr,
+            "avd: quarantine dir \"%s\" failed identity recheck after open - refusing\n",
+            quarantine_dir);
+    close(dirfd);
+    return -1;
+  }
+  return dirfd;
 }
 
 /* Fallback for quarantine_file()'s linkat() failing - see that
@@ -1553,10 +1583,14 @@ static int ensure_quarantine_dir(void) {
  * it. Does NOT unlink the original; the caller does that separately
  * once, since removing-by-path is the one operation here that still
  * has to re-resolve a path name and can't be done purely through `fd`
- * (see quarantine_file()'s identity re-check that guards it). */
+ * (see quarantine_file()'s identity re-check that guards it).
+ *
+ * Creates through the quarantine dirfd (`dirfd`/`name`), not a full
+ * path: same pinning as the linkat() fast path, so validation and use
+ * refer to the same directory object here too. */
 static int write_all(int fd, const char *buf, size_t len);
 
-static int copy_fd_to(int fd, const char *dst) {
+static int copy_fd_to_at(int fd, int dirfd, const char *name) {
   int out_fd;
   char buf[65536];
   ssize_t n;
@@ -1565,7 +1599,7 @@ static int copy_fd_to(int fd, const char *dst) {
   if (lseek(fd, 0, SEEK_SET) < 0)
     return -1;
 
-  out_fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  out_fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL, 0600);
   if (out_fd < 0)
     return -1;
 
@@ -1591,7 +1625,7 @@ static int copy_fd_to(int fd, const char *dst) {
   close(out_fd);
 
   if (ret != 0)
-    unlink(dst); /* best-effort cleanup of the partial copy */
+    unlinkat(dirfd, name, 0); /* best-effort cleanup of the partial copy */
 
   return ret;
 }
@@ -1610,9 +1644,12 @@ static int copy_fd_to(int fd, const char *dst) {
  * `fd` was opened once at the very top of handle_scan_request(),
  * before scanning even began, and has been read from (never
  * re-opened by path) for every step since - see that function's
- * comment. The quarantine copy is created via linkat(fd, "", ...,
- * AT_EMPTY_PATH) - this creates a new directory entry pointing at
- * fd's underlying inode DIRECTLY, without re-walking `path`, so it's
+ * comment. The quarantine copy is created via linkat(fd, "", qdirfd,
+ * name, AT_EMPTY_PATH) - through the pinned quarantine dirfd from
+ * open_quarantine_dir(), not AT_FDCWD with a full path (#64 item 1),
+ * so the validated directory and the used one are the same open file
+ * description. This creates a new directory entry pointing at fd's
+ * underlying inode DIRECTLY, without re-walking `path`, so it's
  * immune to the swap-the-path race the previous, path-only version of
  * this function could only narrow (lstat/rename gap, double-swap)
  * rather than close: there's nothing left here to swap out from under
@@ -1652,20 +1689,28 @@ static int copy_fd_to(int fd, const char *dst) {
  */
 static void quarantine_file(int fd, const char *path, const char *rule_name,
                             const char *sha256_hex) {
+  /* `name` is the entry created through the pinned quarantine dirfd
+   * (linkat/copy/chmod/cleanup all go through it - #64 item 1, so the
+   * validated directory and the used one are the same object); `dest`
+   * is the same entry as a full path, for the sidecar meta (which
+   * opens "<dest>.meta" itself) and for log messages. */
   char dest[PATH_MAX];
+  char name[PATH_MAX];
   const char *base;
   struct timespec ts;
   struct stat fd_st;
   struct stat orig_st;
   bool have_orig_st;
   bool linked;
+  int qdirfd;
 
-  if (ensure_quarantine_dir() != 0)
+  qdirfd = open_quarantine_dir();
+  if (qdirfd < 0)
     return;
 
-  /* Captured before linkat()/chmod() below - once linkat() succeeds,
-   * `dest` is a second directory entry for fd's SAME inode (a
-   * hardlink, not a copy), so chmod(dest, 0000) further down would
+  /* Captured before linkat()/fchmodat() below - once linkat() succeeds,
+   * `name` is a second directory entry for fd's SAME inode (a
+   * hardlink, not a copy), so fchmodat(qdirfd, name, 0000) further down would
    * otherwise also be the last read of the original's own mode. This
    * is the one place in this function that needs the pre-quarantine
    * permissions, for write_quarantine_meta()'s restore record - not to
@@ -1685,32 +1730,48 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
    * monotonic-clock nanosecond reading is unique per call even if
    * two quarantines land in the same second. */
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  /* Fail closed on truncation: a silently-truncated dest would quarantine
-   * into the wrong directory entry (potentially outside quarantine_dir
-   * for a long attacker-influenced basename) with no error. */
+  /* Fail closed on truncation: a silently-truncated name would quarantine
+   * into the wrong directory entry with no error. `base` is
+   * attacker-influenced (the scanned file's own basename), so both the
+   * dirfd-relative name and the full display path are checked. */
   {
-    int dn = snprintf(dest, sizeof(dest), "%s/%d_%ld%09ld_%s.quarantined",
-                        quarantine_dir, (int)getpid(), (long)ts.tv_sec,
-                        ts.tv_nsec, base);
-    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
-      fprintf(stderr, "avd: quarantine destination path would truncate - refusing\n");
+    int nn = snprintf(name, sizeof(name), "%d_%ld%09ld_%s.quarantined",
+                        (int)getpid(), (long)ts.tv_sec, ts.tv_nsec, base);
+    int dn;
+    if (nn < 0 || (size_t)nn >= sizeof(name)) {
+      fprintf(stderr, "avd: quarantine destination name would truncate - refusing\n");
+      close(qdirfd);
       return;
     }
+    dn = snprintf(dest, sizeof(dest), "%s/%s", quarantine_dir, name);
+    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
+      fprintf(stderr, "avd: quarantine destination path would truncate - refusing\n");
+      close(qdirfd);
+      return;
+    }
+    /* `name` holds no '/' (built from fixed fields plus `base`, and a
+     * basename by construction contains none), so the *at() calls below
+     * cannot escape the pinned directory no matter what `base` held. */
   }
 
-  linked = (linkat(fd, "", AT_FDCWD, dest, AT_EMPTY_PATH) == 0);
+  /* Through the pinned dirfd, not AT_FDCWD with a full path: the
+   * directory validated by open_quarantine_dir() and the directory
+   * entered here are the same open file description, so no ancestor
+   * swap in between can redirect the new entry. */
+  linked = (linkat(fd, "", qdirfd, name, AT_EMPTY_PATH) == 0);
   if (!linked) {
     /* Fall back to the fd-based copy on ANY linkat failure, not just
-     * EXDEV - see copy_fd_to()'s comment for why ENOENT (source fully
+     * EXDEV - see copy_fd_to_at()'s comment for why ENOENT (source fully
      * unlinked, not just renamed away) is an equally real case here,
      * and the copy is correct regardless of which one triggered it. */
     int linkat_errno = errno;
 
-    if (copy_fd_to(fd, dest) != 0) {
+    if (copy_fd_to_at(fd, qdirfd, name) != 0) {
       fprintf(stderr,
               "avd: quarantine failed for \"%s\": linkat: %s; copy "
               "fallback: %s\n",
               path, strerror(linkat_errno), strerror(errno));
+      close(qdirfd);
       return;
     }
   }
@@ -1741,12 +1802,13 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
    * original in place - a worse but at least contained outcome for
    * this specific (essentially unreachable in practice: this is a
    * freshly-created file we just opened successfully) failure. */
-  if (chmod(dest, 0000) != 0) {
+  if (fchmodat(qdirfd, name, 0000, 0) != 0) {
     fprintf(stderr, "avd: quarantined \"%s\" to \"%s\" but chmod failed: %s "
             "- leaving the original in place rather than removing it "
             "without a locked-down copy to show for it\n",
             path, dest, strerror(errno));
-    unlink(dest);
+    unlinkat(qdirfd, name, 0);
+    close(qdirfd);
     return;
   }
 
@@ -1765,6 +1827,7 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
             "avd: quarantined \"%s\" to \"%s\", but refusing to remove the "
             "original - fstat on our own fd failed unexpectedly: %s\n",
             path, dest, strerror(errno));
+    close(qdirfd);
     return;
   }
 
@@ -1798,6 +1861,7 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
               "(possible symlink swap); remove it manually if "
               "appropriate\n",
               path, dest);
+      close(qdirfd);
       return;
     }
   }
@@ -1808,6 +1872,7 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
   else
     printf("avd: QUARANTINED \"%s\" -> \"%s\"%s\n", path, dest,
            linked ? "" : " (copy fallback)");
+  close(qdirfd);
 }
 
 struct scan_result {
@@ -2536,10 +2601,13 @@ static int fanexec_tids_started;
  * read after the signal it raises. */
 static volatile sig_atomic_t fanexec_aborted;
 
-/* Counters are reported at shutdown rather than per-event: an exec
+/* Counters are reported via STATUS rather than per-event: an exec
  * gate on a busy mount is a hot path, and a line per allowed exec
- * would be its own denial of service. Guarded by their own lock -
- * these are written from every responder thread. */
+ * would be its own denial of service. The shutdown log keeps a final
+ * tally, but an operator needs to ask "has this been overflowing?"
+ * without stopping the gate (#64 item 4) - cmd_status() snapshots
+ * these under the same lock. Guarded by their own lock - these are
+ * written from every responder thread. */
 static pthread_mutex_t fanexec_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long fanexec_allowed;
 static unsigned long fanexec_denied;
@@ -3266,18 +3334,35 @@ static int quarantine_id_valid(const char *id) {
 }
 
 static void cmd_status(int fd) {
-  char row[256];
+  /* 512: ten fields, four of them unsigned-long counters (up to 20
+   * digits each) - 256 still fit today but with no headroom worth
+   * trusting; snprintf() would silently truncate the tail. */
+  char row[512];
   size_t qlen;
+  /* Snapshot under fanexec_stats_lock (see the counters' comment):
+   * STATUS must never report a torn mix of responder-thread updates.
+   * Appended after scan_threads, so field indices 0-5 are byte-stable
+   * for existing parsers - the GUI's status() accepts both the 6-field
+   * row (older avd) and this 10-field row. */
+  unsigned long fan_allowed, fan_denied, fan_undecided, fan_overflows;
 
   pthread_mutex_lock(&queue_lock);
   qlen = queue_len;
   pthread_mutex_unlock(&queue_lock);
 
+  pthread_mutex_lock(&fanexec_stats_lock);
+  fan_allowed = fanexec_allowed;
+  fan_denied = fanexec_denied;
+  fan_undecided = fanexec_undecided;
+  fan_overflows = fanexec_overflows;
+  pthread_mutex_unlock(&fanexec_stats_lock);
+
   write_all(fd, "OK\n", 3);
   write_all(fd, "COUNT 1\n", 8);
-  snprintf(row, sizeof(row), "%ld\t%d\t%zu\t%zu\t%zu\t%d\n",
+  snprintf(row, sizeof(row), "%ld\t%d\t%zu\t%zu\t%zu\t%d\t%lu\t%lu\t%lu\t%lu\n",
            (long)(time(NULL) - start_time), compiled_rules ? 1 : 0,
-           fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads);
+           fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads,
+           fan_allowed, fan_denied, fan_undecided, fan_overflows);
   write_all(fd, row, strlen(row));
   write_all(fd, "END\n", 4);
 }
