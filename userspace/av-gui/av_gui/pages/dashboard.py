@@ -10,6 +10,7 @@ from .. import avd_client, path_validation, procfs_client
 _ROWS = [
     "avd status", "uptime", "rules loaded", "fuzzy corpus entries",
     "TLSH corpus entries", "scan queue depth", "scan worker threads",
+    "fanotify overflows",
     "signatures", "trusted binaries", "protected paths",
     "daemon-unavailable policy",
 ]
@@ -56,9 +57,13 @@ class Page:
             self._set("TLSH corpus entries", st["tlsh_corpus_count"])
             self._set("scan queue depth", st["scan_queue_len"])
             self._set("scan worker threads", st["scan_threads"])
+            # .get(): older daemons answer a 6-field STATUS with no
+            # fanotify counters - show "-" rather than failing the
+            # whole refresh against them.
+            self._set("fanotify overflows", st.get("fanexec_overflows", "-"))
         except avd_client.AvdError as exc:
             self._set("avd status", "unreachable")
-            for key in _ROWS[1:7]:
+            for key in _ROWS[1:8]:
                 self._set(key, "-")
             errors.append(path_validation.for_display(f"avd: {exc}"))
 
@@ -72,7 +77,7 @@ class Page:
                 path_validation.for_display(state["policy"] or "-"),
             )
         except procfs_client.ProcfsError as exc:
-            for key in _ROWS[7:]:
+            for key in _ROWS[8:]:
                 self._set(key, "-")
             errors.append(path_validation.for_display(f"avctl: {exc}"))
 

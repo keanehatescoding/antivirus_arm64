@@ -1195,8 +1195,17 @@ int main(int argc, char *const argv[]) {
 
       if (kill(fc_pid, SIGTERM) != 0)
         die("kill(fail-closed avd, SIGTERM)");
-      if (!wait_for_exit(fc_pid, 15000, &code, &sig)) {
-        outmsg("QEMU_TEST: FAIL: fail-closed avd did not exit within 15s "
+      /* 60s, not 15s: under TCG the fail-closed avd's orderly teardown
+       * takes ~14.5s (joining scan workers after a timed-out YARA
+       * scan, YARA teardown, gate stop - all wall-clock slow under
+       * emulation), so a 15s grace has under a second of margin and
+       * flakes red on ordinary run-to-run jitter. Observed: the same
+       * commit shut down in ~14.5s (pass) and ~15.2s (FAIL) on the
+       * 7.2.6 leg across two runs. A genuinely stuck shutdown still
+       * never exits, so the wider grace keeps the stuck-detection
+       * property while absorbing emulator slowness. */
+      if (!wait_for_exit(fc_pid, 60000, &code, &sig)) {
+        outmsg("QEMU_TEST: FAIL: fail-closed avd did not exit within 60s "
                "of SIGTERM and had to be SIGKILLed\n");
         outmsg("QEMU_TEST: --- avd stdout ---\n%s\n",
                drain_pipe(fc_pipe[0]));
