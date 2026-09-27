@@ -34,9 +34,18 @@ pkgbase=hyprav
 pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
 pkgver=0.9.0.r134.g849b462
 pkgrel=1
-# aarch64 only, same as the Arch variant: the module hooks
-# __arm64_sys_execve by symbol name. CachyOS publishes arm64 spins, so
-# this is a real target, not a theoretical one.
+# aarch64 only - forced by the MODULE, not by the distro: av.ko hooks
+# __arm64_sys_execve by symbol name and will not build on x86_64 (see
+# SECURITY.md), exactly as in the Arch variant. Note CachyOS itself is
+# x86_64-focused - its linux-cachyos PKGBUILD targets x86_64, tuned for
+# x86-64-v3/v4, and there is no official CachyOS aarch64 repo. This
+# variant is therefore for an aarch64 host running a CachyOS-flavoured
+# kernel (e.g. CachyOS's kernel PKGBUILDs rebuilt for arm64) where
+# linux-cachyos-headers for the RUNNING aarch64 kernel is installed. On a
+# stock x86_64 CachyOS box the module cannot be built at all, so there is
+# deliberately no x86_64 entry here (makepkg will refuse this PKGBUILD
+# there, which is correct - use the userspace-only pieces via another
+# route if you only want avd/avctl on x86_64).
 arch=('aarch64')
 url="https://github.com/keanehatescoding/antivirus"
 license=('GPL-3.0-only')

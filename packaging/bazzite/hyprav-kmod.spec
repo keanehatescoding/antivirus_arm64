@@ -82,13 +82,25 @@ arm64 only as shipped - hooks __arm64_sys_execve by symbol name.
 %build
 # Build av.ko once per target kernel. kmodtool packs %{kernel_versions}
 # as "VER___/path/to/kernel/build" tokens; strip to the KDIR after ___.
-# av/Makefile takes KDIR directly. If a target kernel is Clang/LTO-built,
-# add CC=clang LLVM=1 here (Fedora's stock kernel is GCC-built).
+# av/Makefile takes KDIR directly.
+#
+# Per-kernel toolchain selection: if THIS target kernel was Clang/LTO-built,
+# build the module with CC=clang LLVM=1 (av/Makefile supports it), detected
+# from the target's own .config - the same check packaging/cachyos/PKGBUILD's
+# dkms.conf uses. Fedora's stock kernel is GCC-built, so the default path is
+# unchanged; a Clang-built target additionally needs clang/llvm present
+# (add them to BuildRequires, or ensure they are installed on the akmods
+# host, when building for such a kernel).
 for kernel_version in %{?kernel_versions}; do
+    ver="${kernel_version%%___*}"
     kbuild="${kernel_version##*___}"
-    rm -rf _kmodbuild_"${kernel_version%%___*}"
-    cp -a av _kmodbuild_"${kernel_version%%___*}"
-    make -C _kmodbuild_"${kernel_version%%___*}" KDIR="${kbuild}"
+    extra=""
+    if grep -qs '^CONFIG_CC_IS_CLANG=y' "${kbuild}/.config"; then
+        extra="CC=clang LLVM=1"
+    fi
+    rm -rf _kmodbuild_"${ver}"
+    cp -a av _kmodbuild_"${ver}"
+    make -C _kmodbuild_"${ver}" KDIR="${kbuild}" ${extra}
 done
 
 %install

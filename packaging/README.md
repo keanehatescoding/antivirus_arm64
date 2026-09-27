@@ -39,6 +39,13 @@ top of `cachyos/PKGBUILD`:
    passes `CC=clang LLVM=1` (which `av/Makefile` already supports). A
    GCC-built spin is unaffected.
 
+Note the module is **aarch64-only** (it hooks `__arm64_sys_execve`) while
+CachyOS is **x86_64-focused** — there is no official CachyOS aarch64 repo.
+So this variant targets an aarch64 host running a CachyOS-flavoured kernel
+(CachyOS kernel PKGBUILDs rebuilt for arm64); on a stock x86_64 CachyOS box
+the module can't be built at all, and `makepkg` will (correctly) refuse the
+`arch=('aarch64')` PKGBUILD there.
+
 ### `fedora/` vs `bazzite/`
 
 `fedora/hyprav.spec` targets a **traditional, mutable** Fedora where DKMS
@@ -56,5 +63,21 @@ client (`hyprav-kmod.spec`). Its userspace still comes from
 `cachyos/` and `bazzite/` variants are **not** wired into CI yet — no
 CachyOS or aarch64-Atomic container is available in this project's CI
 environment (the same limitation the Arch-ARM leg already notes for its
-`menci/archlinuxarm` image). They carry the honesty caveat in their own
-comments and are validated by hand / on real hardware for now.
+`menci/archlinuxarm` image). Their validation status, honestly, differs by
+path:
+
+- **`cachyos/PKGBUILD`** — its packaging logic is a near-copy of the
+  CI-tested `arch/PKGBUILD`, and `namcap PKGBUILD` output is identical to
+  it (same lone `W:`, no `E:`). The Clang-detecting `dkms.conf` was checked
+  by simulating dkms sourcing it under bash. Not yet built end-to-end on a
+  real aarch64 CachyOS host.
+- **`bazzite/Containerfile`** — the build steps mirror
+  `packaging/fedora/hyprav.spec`'s own `%build`/`%install`, but it has not
+  been `podman build`-verified against a live aarch64 Atomic base here.
+- **`bazzite/hyprav-kmod.spec`** — follows the RPM Fusion `kmodtool`
+  template but has **not** been build-verified against a live
+  `akmods`/`kmodtool` host. Treat the Containerfile as the route to prefer
+  until this has had a real akmods run.
+
+Each file repeats its own caveat in-comment. Corrections from anyone who
+runs these on real hardware are welcome.
