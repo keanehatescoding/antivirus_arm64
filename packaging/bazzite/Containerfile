@@ -1,0 +1,78 @@
+# HyprAV baked into a Fedora Atomic / Bazzite image (Path 1 in README.md).
+#
+# Builds av.ko ONCE against the image's own kernel at image-build time and
+# installs it into the deployment, plus the avd/avctl/av-gui userspace -
+# no client-side DKMS, no compiler on the running host, fully
+# deterministic. Then `rpm-ostree rebase` onto the result.
+#
+# This is an EXAMPLE you adapt: set BASE_IMAGE to the aarch64 Atomic
+# image you actually rebase from, and HYPRAV_REF to the commit/tag you
+# want. It is deliberately a single stage - the module must land in the
+# SAME image that carries the matching kernel, so there is nothing to
+# copy out to a scratch stage.
+#
+# aarch64 only: av.ko hooks __arm64_sys_execve (see SECURITY.md). BASE_IMAGE
+# must therefore be an aarch64 Atomic image.
+
+# Pick an aarch64 Fedora Atomic base. Fedora Silverblue/Kinoite publish
+# aarch64; substitute an aarch64 Bazzite image here if you have one.
+ARG BASE_IMAGE=quay.io/fedora-ostree-desktops/silverblue:latest
+FROM ${BASE_IMAGE}
+
+# Commit or tag to build. Override with --build-arg HYPRAV_REF=vX.Y.Z.
+ARG HYPRAV_REF=master
+ARG HYPRAV_GIT=https://github.com/keanehatescoding/antivirus.git
+
+# rpm-ostree, not dnf, is the package manager on an Atomic base image;
+# `rpm-ostree install` inside a Containerfile layers into /usr for the
+# built image. The build toolchain (kernel-devel/gcc/make/...) is only
+# needed HERE, at image build time - it is not carried into the final
+# module's runtime the way a DKMS layer would carry it into every
+# deployment.
+RUN rpm-ostree install --idempotent \
+        git make gcc pkgconfig \
+        kernel-devel yara-devel ssdeep-devel libnl3-devel \
+        systemd-rpm-macros python3-gobject gtk4 && \
+    rm -rf /var/cache /var/lib/rpm-ostree
+
+# Build + install everything against the kernel this image actually
+# ships. `rpm -q kernel` on an Atomic image reports the deployed kernel;
+# kernel-devel for it provides /usr/src/kernels/<kver>. We point av's
+# KDIR there explicitly rather than trusting `uname -r` (a container has
+# no running kernel of its own).
+RUN set -eux; \
+    git clone --depth 1 --branch "${HYPRAV_REF}" "${HYPRAV_GIT}" /tmp/hyprav || \
+      git clone "${HYPRAV_GIT}" /tmp/hyprav; \
+    cd /tmp/hyprav; \
+    if [ "${HYPRAV_REF}" != "master" ]; then git checkout "${HYPRAV_REF}"; fi; \
+    KVER="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel | tail -n1)"; \
+    KDIR="/usr/src/kernels/${KVER}"; \
+    test -d "${KDIR}" || { echo "no kernel-devel for ${KVER}"; ls /usr/src/kernels; exit 1; }; \
+    # av.ko: build against the image's kernel, install to /extra, depmod.
+    # If this image's kernel is Clang/LTO-built, add CC=clang LLVM=1 here
+    # (and clang/llvm to the rpm-ostree install above) - Fedora's stock
+    # kernel is GCC-built, so the default is correct as shipped.
+    make -C av KDIR="${KDIR}"; \
+    install -Dm644 av/av.ko "/usr/lib/modules/${KVER}/extra/av.ko"; \
+    depmod -a "${KVER}"; \
+    # Userspace installs straight into the image root (/).
+    make -C userspace/avd install PREFIX=/usr UNITDIR=/usr/lib/systemd/system CC=gcc; \
+    make -C userspace/avctl install PREFIX=/usr POLKIT_ACTIONDIR=/usr/share/polkit-1/actions CC=gcc; \
+    make -C userspace/av-gui install PREFIX=/usr; \
+    cd /; rm -rf /tmp/hyprav
+
+# No /var/lib/av-quarantine baked in on purpose: on rpm-ostree /var is
+# populated from the image at deploy time, not carried in the read-only
+# /usr tree, so an `install -d` here would not reliably persist anyway.
+# avd creates it itself at runtime with mkdir(quarantine_dir, 0700) - the
+# same fallback every other packaging variant relies on.
+
+# avd.service ships disabled; enable it in your image if you want HyprAV
+# active on first boot (an Atomic image can `systemctl enable` at build
+# time via a preset or an explicit symlink). Left to the image author on
+# purpose - baking in an always-on root daemon should be a deliberate choice.
+
+# NOTE: not end-to-end build-verified in this project's environment (no
+# aarch64 Atomic build host here) - same honesty caveat as the Arch-ARM
+# CI leg. The build steps mirror packaging/fedora/hyprav.spec's own
+# %build/%install; validate against your target base before relying on it.

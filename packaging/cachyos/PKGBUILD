@@ -1,0 +1,158 @@
+# Maintainer: keanehatescoding <keanembae@gmail.com>
+#
+# CachyOS variant of packaging/arch/PKGBUILD. CachyOS is Arch-based and
+# uses the exact same makepkg/split-package machinery, so this file is a
+# near-copy - the packaging *logic* (DKMS source shipping, the CC pin
+# for avd/avctl, the quarantine dir mode, the namcap-driven makedepends)
+# is identical and the reasoning for all of it lives in the comments of
+# packaging/arch/PKGBUILD, not duplicated here. Only the two things that
+# actually differ on CachyOS are called out below:
+#
+#   1. Kernel headers. CachyOS does not run Arch's stock `linux`; it
+#      ships its own `linux-cachyos` (and -lto/-hardened/-rt/... spins),
+#      each with its OWN -headers package. Vanilla `linux-headers`
+#      provides headers for Arch's kernel only - it does NOT satisfy
+#      /lib/modules/$(uname -r)/build on a linux-cachyos host - so this
+#      variant build-depends on `linux-cachyos-headers` instead. If you
+#      run a different CachyOS spin, swap this for the matching
+#      -headers package (e.g. linux-cachyos-lto-headers).
+#
+#   2. Clang/LLVM-built kernels. CachyOS's LTO spins are built with
+#      Clang, and a kernel module built with a different compiler family
+#      than the target kernel breaks under LTO/CFI. av/Makefile already
+#      supports `make CC=clang LLVM=1` for exactly this; the DKMS
+#      MAKE/CLEAN lines below auto-detect a Clang-built target from its
+#      own .config and pass LLVM=1 only then, so a GCC-built spin (the
+#      linux-cachyos default) is unaffected.
+#
+# Everything else - overriding the git source via HYPRAV_CI_SOURCE,
+# skipping the av.ko compile-sanity check via HYPRAV_SKIP_AV_KO_CHECK,
+# the split into hyprav-dkms/hyprav/hyprav-gui - behaves exactly as in
+# packaging/arch/PKGBUILD; see there for the full rationale.
+
+pkgbase=hyprav
+pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
+pkgver=0.9.0.r134.g849b462
+pkgrel=1
+# aarch64 only, same as the Arch variant: the module hooks
+# __arm64_sys_execve by symbol name. CachyOS publishes arm64 spins, so
+# this is a real target, not a theoretical one.
+arch=('aarch64')
+url="https://github.com/keanehatescoding/antivirus"
+license=('GPL-3.0-only')
+# Same list as packaging/arch/PKGBUILD, with `linux-headers` swapped for
+# `linux-cachyos-headers` (see header comment #1). 'dkms'/'polkit' are
+# here only to satisfy namcap's split-package makedepends rule, and
+# python-gobject/gtk4 are BUILD-time deps of package_hyprav-gui()'s
+# install - both documented at length in the Arch PKGBUILD.
+makedepends=('git' 'linux-cachyos-headers' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4' 'dkms' 'polkit')
+source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus.git}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd hyprav
+  git describe --long --tags | sed 's/^v//; s/-/.r/; s/-/./'
+}
+
+build() {
+  cd hyprav
+
+  # Compile-sanity check only - NOT what gets installed (hyprav-dkms
+  # ships module source; dkms rebuilds per-kernel). See the Arch
+  # PKGBUILD for why HYPRAV_SKIP_AV_KO_CHECK exists.
+  #
+  # On CachyOS the running kernel may be Clang-built (LTO spins). Detect
+  # that from the target kernel's own .config and pass CC=clang LLVM=1
+  # so this check builds with the same toolchain family the kernel did -
+  # otherwise a GCC-built av.o against a Clang/LTO kernel fails or, worse,
+  # loads and misbehaves. A GCC-built spin has CONFIG_CC_IS_CLANG unset,
+  # so _llvm stays empty and this is byte-for-byte the Arch behavior.
+  if [ -z "$HYPRAV_SKIP_AV_KO_CHECK" ]; then
+    local _kbuild="/lib/modules/$(uname -r)/build"
+    local _llvm=""
+    if grep -qs '^CONFIG_CC_IS_CLANG=y' "$_kbuild/.config"; then
+      _llvm="CC=clang LLVM=1"
+    fi
+    make -C av clean
+    # Word-split $_llvm on purpose (it is either empty or the two
+    # tokens "CC=clang LLVM=1") - do not quote it.
+    make -C av $_llvm
+  fi
+
+  # avd/avctl are plain userspace with no kernel-ABI tie: pin gcc, clean
+  # first to avoid a stale object from a prior CC. Identical to Arch.
+  make -C userspace/avd clean
+  make -C userspace/avd CC=gcc
+  make -C userspace/avctl clean
+  make -C userspace/avctl CC=gcc
+}
+
+package_hyprav-dkms() {
+  pkgdesc="HyprAV kprobe-based execve/file-event kernel module (DKMS source package, CachyOS)"
+  depends=('dkms')
+
+  # No install= script - the `dkms` package's own pacman hooks handle
+  # add/remove generically. See packaging/arch/PKGBUILD for the full
+  # note on why a custom postinst here would be wrong.
+  local _dkmsdir="$pkgdir/usr/src/hyprav-av-$pkgver"
+  install -dm755 "$_dkmsdir"
+  cp -r hyprav/av/* "$_dkmsdir/"
+  rm -f "$_dkmsdir"/*.o "$_dkmsdir"/*.ko "$_dkmsdir"/.*.cmd \
+        "$_dkmsdir"/Module.symvers "$_dkmsdir"/modules.order
+  rm -rf "$_dkmsdir"/.tmp_versions
+
+  # Same KDIR override as every other packaging variant (dkms may target
+  # a kernel that isn't `uname -r`), PLUS the Clang autodetect the Arch
+  # variant doesn't need: dkms evaluates MAKE[0]/CLEAN as shell, so the
+  # `$(grep ... && echo ...)` runs at build time against the specific
+  # kernel dkms is building for and appends `CC=clang LLVM=1` only for a
+  # Clang-built target. ${kernel_source_dir} is set by dkms before these
+  # lines are evaluated; it is escaped (\$) so it is expanded by dkms at
+  # build time, not by makepkg while writing this file.
+  cat > "$_dkmsdir/dkms.conf" <<'EOF'
+PACKAGE_NAME="hyprav-av"
+PACKAGE_VERSION="__PKGVER__"
+BUILT_MODULE_NAME[0]="av"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/misc"
+AUTOINSTALL="yes"
+MAKE[0]="make KDIR=${kernel_source_dir} $(grep -qs '^CONFIG_CC_IS_CLANG=y' ${kernel_source_dir}/.config && echo CC=clang LLVM=1)"
+CLEAN="make KDIR=${kernel_source_dir} $(grep -qs '^CONFIG_CC_IS_CLANG=y' ${kernel_source_dir}/.config && echo CC=clang LLVM=1) clean"
+EOF
+  # Substitute the version after the fact so the heredoc above can stay
+  # fully single-quoted (needed so ${kernel_source_dir} and $(grep ...)
+  # survive verbatim for dkms to expand at build time, not now).
+  sed -i "s/__PKGVER__/$pkgver/" "$_dkmsdir/dkms.conf"
+
+  install -Dm644 hyprav/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_hyprav() {
+  pkgdesc="HyprAV userspace scanning daemon (avd) and control CLI (avctl) - YARA/entropy/fuzzy-hash detection, quarantine"
+  depends=('libnl' 'yara' 'ssdeep' 'polkit' 'systemd')
+  optdepends=('hyprav-dkms: kernel-level execve/file interception; avd refuses to start without av.ko loaded')
+  backup=('etc/hyprav/rules/heuristics.yar'
+          'etc/hyprav/rules/elf_analysis.yar'
+          'etc/hyprav/rules/entropy.yar'
+          'etc/hyprav/fuzzy_hashes.txt'
+          'etc/hyprav/tlsh_hashes.txt')
+
+  cd hyprav
+  make -C userspace/avd install DESTDIR="$pkgdir" PREFIX=/usr CC=gcc
+  make -C userspace/avctl install DESTDIR="$pkgdir" PREFIX=/usr CC=gcc
+
+  # 0700 matches avd.c's own mkdir(quarantine_dir, 0700) - it holds
+  # quarantined malware; 0755 would fight that on every install.
+  install -dm700 "$pkgdir/var/lib/av-quarantine"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_hyprav-gui() {
+  pkgdesc="GTK4 management console for HyprAV (dashboard, detections, quarantine, signatures/trust/policy)"
+  depends=('python-gobject' 'gtk4' 'hyprav')
+
+  cd hyprav/userspace/av-gui
+  make install DESTDIR="$pkgdir" PREFIX=/usr
+
+  install -Dm644 ../../LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
