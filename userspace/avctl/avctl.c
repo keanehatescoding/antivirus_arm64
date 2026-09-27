@@ -997,7 +997,7 @@ static int validate_sig_or_trust_fields(const char *kind, const char *rest)
 static int open_load_file(const char *path)
 {
     struct save_dest dest;
-    int fd;
+    int fd, fl;
     struct stat st;
     uid_t euid = geteuid();
 
@@ -1014,7 +1014,13 @@ static int open_load_file(const char *path)
         close(dest.parent_fd);
         return -1;
     }
-    fd = openat(dest.parent_fd, dest.base, O_RDONLY | O_NOFOLLOW);
+    /* O_NONBLOCK so a FIFO planted at the path can't park root inside
+     * openat() waiting for a writer before the S_ISREG check below ever
+     * runs; O_NOCTTY so a tty named here can't become our controlling
+     * terminal. O_NONBLOCK is cleared again once the inode is known to
+     * be a regular file. */
+    fd = openat(dest.parent_fd, dest.base,
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
     close(dest.parent_fd);
     if (fd < 0) {
         if (errno == ELOOP)
@@ -1036,6 +1042,13 @@ static int open_load_file(const char *path)
         fprintf(stderr,
                 "avctl: load: \"%s\" is not a regular file - refusing\n",
                 path);
+        close(fd);
+        return -1;
+    }
+    fl = fcntl(fd, F_GETFL);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) != 0) {
+        fprintf(stderr, "avctl: load: cannot reset flags on \"%s\": %s\n",
+                path, strerror(errno));
         close(fd);
         return -1;
     }
