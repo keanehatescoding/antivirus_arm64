@@ -386,9 +386,8 @@ fi
 # survives that shape of change. The tunable half is the point (the
 # fail-closed QEMU case sets a 1s budget): SCAN_TIMEOUT_SECS) must stay
 # absent so a hardcoded compiled-in default still fails here.
-if grep -q 'yara_callback, &ctx,' <<<"$SCAN_BODY" \
-    && grep -q 'avd_scan_timeout_secs' <<<"$SCAN_BODY" \
-    && ! grep -q 'SCAN_TIMEOUT_SECS)' <<<"$SCAN_BODY"; then
+if grep -A2 -m1 'yara_callback, &ctx,' <<<"$SCAN_BODY" | grep -q 'avd_scan_timeout_secs' \
+    && ! grep -A2 -m1 'yara_callback, &ctx,' <<<"$SCAN_BODY" | grep -q 'SCAN_TIMEOUT_SECS)'; then
     pass "perform_scan() scans under the tunable budget, not the compiled-in default"
 else
     fail "perform_scan() does not use avd_scan_timeout_secs as its YARA budget"
