@@ -376,7 +376,17 @@ if grep -q 'parse_tunable_env("AVD_SCAN_TIMEOUT_SECS"' <<<"$TUNABLE_CALL" \
 else
     fail "AVD_SCAN_TIMEOUT_SECS is not wired with its default and bounds - the fail-closed QEMU case cannot set its budget"
 fi
-if grep -q 'yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,' <<<"$SCAN_BODY" \
+# Matched on the stable call tail, not the head: the #60 size-cap fix
+# (PR #67) migrated perform_scan() from
+# yr_rules_scan_fd(compiled_rules, fd, 0, ...) over the whole
+# descriptor to a bounded pread() snapshot via
+# yr_rules_scan_mem(compiled_rules, snap, total, 0, ...), keeping the
+# same (callback, ctx, timeout) tail. Matching the head re-staled this
+# check on a scan-plumbing change that kept the invariant; the tail
+# survives that shape of change. The tunable half is the point (the
+# fail-closed QEMU case sets a 1s budget): SCAN_TIMEOUT_SECS) must stay
+# absent so a hardcoded compiled-in default still fails here.
+if grep -q 'yara_callback, &ctx,' <<<"$SCAN_BODY" \
     && grep -q 'avd_scan_timeout_secs' <<<"$SCAN_BODY" \
     && ! grep -q 'SCAN_TIMEOUT_SECS)' <<<"$SCAN_BODY"; then
     pass "perform_scan() scans under the tunable budget, not the compiled-in default"
