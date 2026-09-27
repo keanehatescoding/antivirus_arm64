@@ -381,6 +381,21 @@ jobs:
           # and a case deleted or #if'd out of init.c would still
           # produce a perfectly green PASS. Assert the marker
           # explicitly so removing the case has to be a deliberate edit
+
+          # Issue #45: the exec-time TOCTOU case - the second half of #2,
+          # the half that had no CI coverage at all before this. A green
+          # PASS without this marker means the race case was skipped or
+          # removed and the only exec-time gap still under test is the
+          # cold-page one.
+          if ! grep -q "QEMU_TEST: TOCTOU regression check passed" \
+               serial.log; then
+            echo "::error::init reported PASS but the exec-time TOCTOU" \
+                 "case (#45) never printed its marker - the case was" \
+                 "skipped or removed. A green run without it leaves the" \
+                 "TOCTOU half of #2 with no runtime coverage."
+            exit 1
+          fi
+
           if ! grep -q "QEMU_TEST: fanotify exec gate integration check passed" \
                serial.log; then
             echo "::error::init reported PASS but the fanotify exec gate" \
