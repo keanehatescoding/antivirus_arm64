@@ -2,13 +2,13 @@
  * netlink_chan.c - kernel-side Generic Netlink channel to avd.
  * See docs/netlink-protocol.md for the full protocol design/rationale.
  *
- * UNTESTED AGAINST REAL KERNEL HEADERS AT TIME OF WRITING - the genl
- * API (particularly where .policy lives on struct genl_family vs.
- * struct genl_ops) has moved across kernel versions. This targets the
- * layout used in 5.10+ kernels (covers all three CI targets: 6.12,
- * 6.18, 7.1.4). Build and test this carefully in your VM before
- * trusting it - see the testing checklist in the PR/commit this ships
- * with.
+ * Uses the family-level .policy layout on struct genl_family (policy
+ * attached to the family, not per-op): .policy/.maxattr/.ops/.n_ops/
+ * .module are still genl_family members on every kernel listed in
+ * .github/kernel-versions.json, and the build-matrix.yml tier compiles
+ * this file against all of them (gcc and clang, -Werror), so a layout
+ * migration would fail the build instead of shipping silently - there
+ * is no pending per-op-policy migration here.
  */
 
 #include <linux/module.h>
