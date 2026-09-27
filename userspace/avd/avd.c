@@ -1302,12 +1302,21 @@ static int read_quarantine_meta(const char *meta_path,
 }
 
 /*
- * Writes the sidecar `<dest>.meta` next to a quarantined file, called
+ * Writes the sidecar `<name>.meta` next to a quarantined file, called
  * from quarantine_file() before that function chmod's the quarantine
  * copy to 0000 - see quarantine_file()'s own comment for why this has
  * to happen first. `orig_st` (may be NULL if the pre-quarantine fstat()
  * failed) supplies the mode/uid/gid to restore later; without it,
  * restore falls back to 0600/root:root rather than failing outright.
+ *
+ * Created through the quarantine dirfd (`qdirfd`/`name`), not a full
+ * path: the same pinning as the linkat()/copy/chmod steps, so content
+ * and sidecar always land in the same directory object even if
+ * quarantine_dir is renamed or replaced after open_quarantine_dir().
+ * A path-based sidecar could instead land in the replacement
+ * directory - or fail - while the content stayed pinned, leaving an
+ * unrestorable entry (restore needs the sidecar for the original
+ * path) that non-root QUARANTINE LIST clients can't see either.
  *
  * ORIGINAL_PATH is written LAST and has no field after it - kept from
  * the days when the raw path was written verbatim: a Linux filename
@@ -1319,14 +1328,16 @@ static int read_quarantine_meta(const char *meta_path,
  * item 2), since escaping also protects the wire rows built from the
  * same value, which last-line placement alone could never do.
  */
-static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
+static int write_quarantine_meta(int qdirfd, const char *name,
+                                 const struct stat *orig_st,
                                  const char *orig_path, const char *rule_name,
                                  const char *sha256_hex) {
-  /* PATH_MAX + 8, not PATH_MAX - `dest` is itself a PATH_MAX buffer, so
-   * appending ".meta" needs headroom beyond it for gcc's
+  /* NAME_MAX is not the bound here - `name` is the PATH_MAX buffer
+   * built by quarantine_file() ("<pid>_<nanotime>_<base>.quarantined"),
+   * so appending ".meta" needs headroom beyond it for gcc's
    * -Wformat-truncation to prove this can't overflow (same margin
    * avctl.c's do_save() uses for its own "%s.tmp" append). */
-  char meta_path[PATH_MAX + 8];
+  char meta_name[PATH_MAX + 8];
   FILE *f;
   int mfd;
   int mn;
@@ -1341,33 +1352,40 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
   char esc_rule[sizeof(((struct quarantine_meta *)0)->rule_name) *
                 WIRE_ESCAPE_MAX_EXPANSION + 1];
 
-  /* Fail closed on truncation: a silently-truncated meta path would
+  /* Fail closed on truncation: a silently-truncated meta name would
    * attach the sidecar to the wrong file (or a different directory)
-   * with no error, leaving a quarantine entry unrestorable. */
-  mn = snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
-  if (mn < 0 || (size_t)mn >= sizeof(meta_path))
+   * with no error, leaving a quarantine entry unrestorable. `name`
+   * holds no '/' (quarantine_file() builds it from fixed fields plus
+   * a basename), so the openat() below cannot escape the pinned
+   * directory - refuse rather than rely on the caller if that ever
+   * stops holding. */
+  if (strchr(name, '/') != NULL)
     return -1;
-  /* O_EXCL|O_NOFOLLOW, not fopen("w"): dest itself is an
+  mn = snprintf(meta_name, sizeof(meta_name), "%s.meta", name);
+  if (mn < 0 || (size_t)mn >= sizeof(meta_name))
+    return -1;
+  /* O_EXCL|O_NOFOLLOW, not fopen("w"): name itself is an
    * unpredictable pid+nanotime name (see quarantine_file()), so a
-   * planted symlink here is impractical - but fopen() would still
+   * planted symlink here is impractical - but openat() would still
    * follow one if it ever existed, and O_EXCL also turns a
    * same-nanosecond collision into a loud failure instead of a
    * silent clobber. Best-effort either way (caller logs, quarantine
    * itself still stands). */
-  mfd = open(meta_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  mfd = openat(qdirfd, meta_name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+               0600);
   if (mfd < 0)
     return -1;
   f = fdopen(mfd, "w");
   if (!f) {
     close(mfd);
-    unlink(meta_path);
+    unlinkat(qdirfd, meta_name, 0);
     return -1;
   }
 
   if (wire_escape(orig_path ? orig_path : "", esc_path, sizeof(esc_path)) != 0 ||
       wire_escape(rule_name ? rule_name : "", esc_rule, sizeof(esc_rule)) != 0) {
     close(mfd);
-    unlink(meta_path);
+    unlinkat(qdirfd, meta_name, 0);
     return -1;
   }
 
@@ -1379,12 +1397,12 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
       fprintf(f, "SHA256=%s\n", sha256_hex ? sha256_hex : "") < 0 ||
       fprintf(f, "ORIGINAL_PATH=%s\n", esc_path) < 0) {
     fclose(f);
-    unlink(meta_path);
+    unlinkat(qdirfd, meta_name, 0);
     return -1;
   }
 
   if (fclose(f) != 0) {
-    unlink(meta_path);
+    unlinkat(qdirfd, meta_name, 0);
     return -1;
   }
   return 0;
@@ -1536,10 +1554,12 @@ static int dir_hierarchy_trusted(const char *label, const char *dir,
  * closed, this confirms ownership/mode of what was actually opened):
  * directory, owned by our euid or root, no group/other write access.
  * Ancestor trust still rests on the chain validation above - the fd
- * pins the final component, not the whole path; sidecar meta and the
- * restore/delete/list paths still resolve quarantine_dir by string
- * (their opens are O_EXCL|O_NOFOLLOW and id-validated respectively),
- * which is the documented residual, not a second pinning. */
+ * pins the final component, not the whole path; the restore/delete/
+ * list paths still resolve quarantine_dir by string (id-validated),
+ * which is the documented residual, not a second pinning. The
+ * sidecar is NOT part of that residual: write_quarantine_meta()
+ * takes this fd plus a relative "<name>.meta", so content and sidecar
+ * always land in the same directory object. */
 static int open_quarantine_dir(void) {
   int dirfd;
   struct stat st;
@@ -1690,10 +1710,11 @@ static int copy_fd_to_at(int fd, int dirfd, const char *name) {
 static void quarantine_file(int fd, const char *path, const char *rule_name,
                             const char *sha256_hex) {
   /* `name` is the entry created through the pinned quarantine dirfd
-   * (linkat/copy/chmod/cleanup all go through it - #64 item 1, so the
-   * validated directory and the used one are the same object); `dest`
-   * is the same entry as a full path, for the sidecar meta (which
-   * opens "<dest>.meta" itself) and for log messages. */
+   * (linkat/copy/chmod/cleanup AND the "<name>.meta" sidecar all go
+   * through it - #64 item 1, so the validated directory and the used
+   * one are the same object even if quarantine_dir is renamed or
+   * replaced afterwards); `dest` is the same entry as a full path,
+   * for log messages only. */
   char dest[PATH_MAX];
   char name[PATH_MAX];
   const char *base;
@@ -1784,8 +1805,9 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
    * unrestorable-by-GUI quarantine is still a successful quarantine,
    * same "logging failure isn't a quarantine failure" stance as
    * everywhere else in this function. */
-  if (write_quarantine_meta(dest, have_orig_st ? &orig_st : NULL, path,
-                            rule_name, sha256_hex) != 0)
+  if (write_quarantine_meta(qdirfd, name,
+                              have_orig_st ? &orig_st : NULL, path,
+                              rule_name, sha256_hex) != 0)
     fprintf(stderr,
             "avd: could not write quarantine metadata for \"%s\" - restore "
             "via avctl will not be possible for this file\n",

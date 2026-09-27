@@ -2,8 +2,10 @@
 #
 # tests/test_hardening_63_64.sh - static regression checks pinning the
 # fixes for #63 (behavior_gc_fn() two-pass sweep: no single
-# behavior_lock hold across the whole table) and the remaining #64
-# items (item 1: quarantine link creation through a pinned dirfd;
+# behavior_lock hold across the whole table, with intra-bucket resume
+# so overfull bucket tails are eventually sampled) and the remaining #64
+# items (item 1: quarantine link/copy/chmod/cleanup/sidecar creation
+# through a pinned dirfd;
 # item 3: netlink_chan.c UNTESTED banner refresh; item 4: fanotify
 # exec-gate counters in STATUS). #64 item 2 (sidecar escaping) already
 # landed with its own coverage in tests/test_wire_escape.sh via #68.
@@ -72,6 +74,17 @@ else
     pass "no single-sweep count epilogue (per-delete accounting)"
 fi
 
+# A batch that fills mid-bucket must resume inside that same bucket
+# next batch: without an intra-bucket cursor the outer loop advances
+# past the bucket's unsampled tail, and every later sweep samples the
+# same first BEHAVIOR_GC_BATCH entries - dead entries past them are
+# never reclaimed and pin behavior_table_count toward eviction.
+if echo "$GC_BODY" | grep -q "cut_short"; then
+    pass "sweep resumes inside a partially sampled bucket (no tail skip)"
+else
+    fail "no intra-bucket resume in behavior_gc_fn() - overfull bucket tails starve"
+fi
+
 # --- #64 item 1: quarantine link through a pinned dirfd ---
 
 section "#64 item 1: quarantine creation through pinned dirfd"
@@ -94,6 +107,55 @@ if echo "$QFILE_BODY" | grep -qE '(linkat|openat|fchmodat|unlinkat)\([^;]*AT_FDC
     fail "quarantine_file() still resolves paths via AT_FDCWD"
 else
     pass "no AT_FDCWD path resolution in quarantine_file()"
+fi
+
+# The linkat() check above pins only the fast path: the copy
+# fallback, the lockdown chmod, and the chmod-failure cleanup must
+# stay dirfd-relative too, or a regression in any of them passes
+# while linkat() is unchanged. (The original's unlink(path) and the
+# restore/delete/list paths are intentionally path-based and are NOT
+# covered here - see quarantine_file()'s own comment.)
+if echo "$QFILE_BODY" | grep -q "copy_fd_to_at(fd, qdirfd, name)"; then
+    pass "copy fallback receives the pinned dirfd"
+else
+    fail "quarantine_file() does not pass qdirfd to copy_fd_to_at()"
+fi
+
+if echo "$QFILE_BODY" | grep -q "fchmodat(qdirfd, name,"; then
+    pass "chmod goes through the pinned dirfd"
+else
+    fail "fchmodat() does not go through the pinned dirfd"
+fi
+
+if echo "$QFILE_BODY" | grep -q "unlinkat(qdirfd, name, 0)"; then
+    pass "chmod-failure cleanup goes through the pinned dirfd"
+else
+    fail "cleanup unlinkat() does not go through the pinned dirfd"
+fi
+
+COPY_BODY="$(extract_c_func "$AVD" copy_fd_to_at)"
+
+if echo "$COPY_BODY" | grep -q "openat(dirfd, name,"; then
+    pass "copy fallback creates through the pinned dirfd"
+else
+    fail "copy_fd_to_at() does not openat() through the pinned dirfd"
+fi
+
+if echo "$COPY_BODY" | grep -q "unlinkat(dirfd, name, 0)"; then
+    pass "copy fallback cleans up through the pinned dirfd"
+else
+    fail "copy_fd_to_at() does not unlinkat() through the pinned dirfd"
+fi
+
+# Content and sidecar must land in the same directory object: a
+# path-based sidecar could be created in a replacement directory (or
+# fail) while the content stays pinned, leaving an unrestorable entry.
+META_BODY="$(extract_c_func "$AVD" write_quarantine_meta)"
+
+if echo "$META_BODY" | grep -q "openat(qdirfd, meta_name,"; then
+    pass "sidecar is created through the pinned dirfd"
+else
+    fail "write_quarantine_meta() does not openat() through the pinned dirfd"
 fi
 
 # --- #64 item 3: stale UNTESTED banner gone ---

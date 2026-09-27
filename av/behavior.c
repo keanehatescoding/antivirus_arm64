@@ -1348,9 +1348,13 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
  *
  * 1. Under the lock, sample (pid, start_time) into a bounded stack
  *    batch, bucket by bucket (the table hash has a fixed bucket
- *    count, so the resume cursor is just the bucket index - no
- *    allocation, no re-walk). No liveness calls here, so each
- *    critical section is short and bounded by BEHAVIOR_GC_BATCH.
+ *    count, so the resume cursor is just the bucket index plus a
+ *    skip count for the position inside the current bucket - no
+ *    allocation, no re-walk). A batch that fills mid-bucket resumes
+ *    inside that same bucket next batch, so an overfull bucket's
+ *    tail is sampled on a later batch rather than skipped forever.
+ *    No liveness calls here, so each critical section is short and
+ *    bounded by BEHAVIOR_GC_BATCH.
  * 2. Lock dropped, resolve liveness per sample with
  *    find_vpid()/pid_task() (RCU only, no mutex needed).
  * 3. Re-take the lock and re-verify each sample before acting: look
@@ -1401,12 +1405,14 @@ static void behavior_gc_fn(struct work_struct *w) {
   struct hlist_node *tmp;
   unsigned int removed = 0;
   /* Resume cursor across pass-1 batches: bucket index into the fixed
-   * hashtable, so each batch continues where the previous one stopped
+   * hashtable, plus a skip count for the position inside the current
+   * bucket, so each batch continues where the previous one stopped
    * without re-walking. Entries added, evicted, or recycled between
    * batches only shift which sweep reclaims them - every action still
    * goes through the pass-3 recheck, so resume imprecision can delay
    * but never corrupt. */
   unsigned int bkt = 0;
+  unsigned int skip = 0;
   bool table_done = false;
 
   while (!table_done) {
@@ -1419,13 +1425,38 @@ static void behavior_gc_fn(struct work_struct *w) {
     for (; bkt < HASH_SIZE(behavior_table) &&
            nsamples < BEHAVIOR_GC_BATCH;
          bkt++) {
+      /* Position inside this bucket: entries already sampled from it
+       * by an earlier batch of this sweep. hlist order can shift
+       * between batches (pass-3 deletes below, concurrent add/evict
+       * from the detection hooks), so this skip is approximate - but
+       * every action still goes through the pass-3 recheck, so
+       * imprecision delays reclamation, never corrupts. */
+      unsigned int pos = 0;
+      unsigned int sampled_here = 0;
+      bool cut_short = false;
+
       hlist_for_each_entry_safe(e, tmp, &behavior_table[bkt], node) {
-        if (nsamples >= BEHAVIOR_GC_BATCH)
+        if (nsamples >= BEHAVIOR_GC_BATCH) {
+          /* Batch full mid-bucket: resume inside this bucket next
+           * batch instead of advancing past its unsampled tail. */
+          skip += sampled_here;
+          cut_short = true;
           break;
+        }
+        if (pos++ < skip)
+          continue;
         samples[nsamples].pid = e->pid;
         samples[nsamples].start_time = e->start_time;
         nsamples++;
+        sampled_here++;
       }
+      if (cut_short)
+        break; /* stay on bkt; skip resumes inside it next batch */
+      /* Bucket fully walked - even if the batch filled on its last
+       * entry, this bucket is done, so the next bucket starts
+       * unskipped. Without this, an exactly-full final batch would
+       * re-sample the same bucket forever. */
+      skip = 0;
     }
     table_done = (bkt >= HASH_SIZE(behavior_table));
     mutex_unlock(&behavior_lock);
