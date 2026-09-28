@@ -37,7 +37,7 @@ userspace/avd/       scanning/quarantine daemon — see wiki: avd-Daemon
 userspace/av-gui/    GTK4 management console — see wiki: av-gui
 docs/                protocol specs + evasion findings (mirrored in the wiki)
 packaging/           systemd unit, polkit policy, Flatpak/AppImage manifests
-debian/, packaging/{arch,fedora}/  distro packages — see wiki: CI-and-Packaging
+debian/, packaging/{arch,cachyos,fedora,bazzite}/  distro packages — see packaging/README.md
 tests/               automated + evasion + QEMU-boot CI tests — see wiki: Testing
 scripts/             setup-hooks.sh, av-reload.sh
 ```
