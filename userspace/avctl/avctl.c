@@ -1,7 +1,7 @@
 /*
  * avctl - userspace CLI for /proc/kernel_av_signatures,
- * /proc/kernel_av_trusted, /proc/kernel_av_protected, and
- * /proc/kernel_av_daemon_policy.
+ * /proc/kernel_av_trusted, /proc/kernel_av_protected,
+ * /proc/kernel_av_sensitive, and /proc/kernel_av_daemon_policy.
  *
  * Usage:
  *   avctl add <md5|sha1|sha256> <hex> <name>
@@ -13,6 +13,9 @@
  *   avctl protect add <absolute-path>
  *   avctl protect del <absolute-path>
  *   avctl protect list
+ *   avctl sensitive add <substring|prefix> <absolute-path>
+ *   avctl sensitive del <absolute-path>
+ *   avctl sensitive list
  *   avctl policy get
  *   avctl policy set <fail-open|fail-closed>
  *   avctl save <file>
@@ -22,13 +25,14 @@
  *   avctl quarantine restore <id>
  *   avctl quarantine delete <id>
  *
- * The four /proc-backed groups above (sig/trust/protect/policy) talk
- * directly to the av kernel module, same as always. scan/quarantine
- * are different: they talk to avd's control socket instead (see
- * docs/avd-socket-protocol.md) - avd, not the kernel module, is what
- * runs YARA/fuzzy/TLSH scanning and owns the quarantine directory.
- * `avd` must be running for these three commands; the /proc-backed
- * ones only need the kernel module loaded, independent of avd.
+ * The five /proc-backed groups above (sig/trust/protect/sensitive/
+ * policy) talk directly to the av kernel module, same as always.
+ * scan/quarantine are different: they talk to avd's control socket
+ * instead (see docs/avd-socket-protocol.md) - avd, not the kernel
+ * module, is what runs YARA/fuzzy/TLSH scanning and owns the
+ * quarantine directory. `avd` must be running for these three
+ * commands; the /proc-backed ones only need the kernel module loaded,
+ * independent of avd.
  *
  * This is a plain userspace program (built with the host's regular gcc,
  * NOT the kernel headers/toolchain - see Makefile in this directory).
@@ -58,6 +62,7 @@
 #define PROC_PATH "/proc/kernel_av_signatures"
 #define TRUST_PROC_PATH "/proc/kernel_av_trusted"
 #define PROTECTED_PROC_PATH "/proc/kernel_av_protected"
+#define SENSITIVE_PROC_PATH "/proc/kernel_av_sensitive"
 #define POLICY_PROC_PATH "/proc/kernel_av_daemon_policy"
 
 /* Matches avd's own DEFAULT_CONTROL_SOCK_PATH (userspace/avd/avd.c) -
@@ -174,6 +179,9 @@ static void usage(const char *prog)
         "  %s protect add <absolute-path>\n"
         "  %s protect del <absolute-path>\n"
         "  %s protect list\n"
+        "  %s sensitive add <substring|prefix> <absolute-path>\n"
+        "  %s sensitive del <absolute-path>\n"
+        "  %s sensitive list\n"
         "  %s policy get\n"
         "  %s policy set <fail-open|fail-closed>\n"
         "  %s save <file|->\n"
@@ -183,7 +191,7 @@ static void usage(const char *prog)
         "  %s quarantine restore <id>\n"
         "  %s quarantine delete <id>\n",
         prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog,
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 /* Every /proc read below goes through here so the failure hint names
@@ -268,6 +276,41 @@ static int do_protect_list(void)
             line[len - 1] = '\0';
         if (line[0])
             printf("%s\n", line);
+    }
+    fclose(f);
+    return 0;
+}
+
+/* Not do_list_generic(): the sensitive-path list emits one
+ * "<kind> <path>" pair per line, not a hash/name pair or a bare
+ * path - see sensitive_proc_show() in av/behavior.c. Parses `kind`
+ * off the front rather than dumping the whole line, so the header
+ * lines up as two columns instead of relying on the kernel-side
+ * format's own spacing. */
+static int do_sensitive_list(void)
+{
+    FILE *f = open_proc_read(SENSITIVE_PROC_PATH);
+    char line[PATH_MAX + 32];
+
+    if (!f)
+        return 1;
+
+    printf("%-10s %s\n", "KIND", "PATH");
+    while (fgets(line, sizeof(line), f)) {
+        char kind[16];
+        char path[PATH_MAX + 8];
+
+        /* "%15s %<PATH_MAX+7>[^\n]": kind bounded to 15 chars, path
+         * takes the rest of the line up to the newline. A kernel-
+         * side entry with kind or path longer than these limits is
+         * silently dropped from the display rather than falsely
+         * printed - the kernel /proc writers reject those at write
+         * time (see av_behavior_sensitive_add()'s SENSITIVE_PATH_LEN
+         * check), so a live entry that exceeds them here would only
+         * come from an intentional kernel misbehavior we're not
+         * going to speculatively pretty-print. */
+        if (sscanf(line, "%15s %4103[^\n]", kind, path) == 2)
+            printf("%-10s %s\n", kind, path);
     }
     fclose(f);
     return 0;
@@ -659,7 +702,7 @@ static int do_save(const char *path)
     FILE *in;
     char line[PATH_MAX + 16];
     char tmp_path[PATH_MAX + 8];
-    int sig_count = 0, trust_count = 0, protect_count = 0;
+    int sig_count = 0, trust_count = 0, protect_count = 0, sensitive_count = 0;
     int werr = 0;
     int to_stdout = !strcmp(path, "-");
     /* Identity of the tmp file captured while its stream is still open
@@ -793,6 +836,28 @@ static int do_save(const char *path)
     }
     fclose(in);
 
+    in = open_proc_read(SENSITIVE_PROC_PATH);
+    if (!in) {
+        save_abort(out, &dest, tmp_path, to_stdout);
+        return 1;
+    }
+
+    while (fgets(line, sizeof(line), in)) {
+        char kind[16];
+        char spath[PATH_MAX + 8];
+
+        /* Kernel side (sensitive_proc_show()) prints `<kind> <path>\n`
+         * with a single space; parse them apart so save emits the
+         * replayable `sensitive add <kind> <path>` shape that
+         * do_load()/do_sensitive() expect. Field widths track the
+         * receive buffers, one shorter to leave room for the NUL. */
+        if (sscanf(line, "%15s %4103[^\n]", kind, spath) == 2) {
+            werr |= fprintf(out, "sensitive add %s %s\n", kind, spath) < 0;
+            sensitive_count++;
+        }
+    }
+    fclose(in);
+
     in = open_proc_read(POLICY_PROC_PATH);
     if (!in) {
         save_abort(out, &dest, tmp_path, to_stdout);
@@ -818,9 +883,10 @@ static int do_save(const char *path)
         }
         fprintf(stderr,
                 "saved %d signature(s), %d trusted entr%s, %d protected path%s, "
-                "and the daemon-unavailable policy to stdout\n",
+                "%d sensitive path%s, and the daemon-unavailable policy to stdout\n",
                 sig_count, trust_count, trust_count == 1 ? "y" : "ies",
-                protect_count, protect_count == 1 ? "" : "s");
+                protect_count, protect_count == 1 ? "" : "s",
+                sensitive_count, sensitive_count == 1 ? "" : "s");
         return 0;
     }
 
@@ -931,9 +997,10 @@ static int do_save(const char *path)
     close(dest.parent_fd);
 
     printf("saved %d signature(s), %d trusted entr%s, %d protected path%s, "
-           "and the daemon-unavailable policy to %s\n",
+           "%d sensitive path%s, and the daemon-unavailable policy to %s\n",
            sig_count, trust_count, trust_count == 1 ? "y" : "ies",
-           protect_count, protect_count == 1 ? "" : "s", path);
+           protect_count, protect_count == 1 ? "" : "s",
+           sensitive_count, sensitive_count == 1 ? "" : "s", path);
     return 0;
 }
 
@@ -1140,13 +1207,16 @@ static int do_load(const char *path)
         } else if (!strncmp(line, "protect ", 8)) {
             rest = line + 8;
             ret = write_command_to(PROTECTED_PROC_PATH, rest);
+        } else if (!strncmp(line, "sensitive ", 10)) {
+            rest = line + 10;
+            ret = write_command_to(SENSITIVE_PROC_PATH, rest);
         } else if (!strncmp(line, "policy ", 7)) {
             rest = line + 7;
             ret = write_command_to(POLICY_PROC_PATH, rest);
         } else {
             fprintf(stderr, "avctl: load: malformed line (expected "
-                             "'sig ', 'trust ', 'protect ', or 'policy ' "
-                             "prefix): %s\n",
+                             "'sig ', 'trust ', 'protect ', 'sensitive ', "
+                             "or 'policy ' prefix): %s\n",
                     line);
             errors++;
             continue;
@@ -1322,6 +1392,89 @@ static int do_protect(int argc, char **argv)
         if (write_command_to(PROTECTED_PROC_PATH, cmd))
             return 1;
         printf("unprotected: %s\n", argv[3]);
+    } else {
+        usage(argv[0]);
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Same shape as do_protect() above, plus the substring/prefix kind
+ * token for `add` (see the AV_SENSITIVE_KIND_* comment in behavior.h
+ * and sensitive_proc_write() in behavior.c). `del` doesn't need the
+ * kind - a path uniquely identifies an entry across kinds, refused
+ * as a duplicate at add time. */
+static int do_sensitive(int argc, char **argv)
+{
+    if (argc < 3) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    if (!strcmp(argv[2], "list")) {
+        return do_sensitive_list();
+    } else if (!strcmp(argv[2], "add")) {
+        char cmd[PATH_MAX + 32];
+        int n;
+
+        if (argc < 5) {
+            usage(argv[0]);
+            return 1;
+        }
+        /* Reject the kind token here up front rather than letting
+         * the kernel side answer -EINVAL: the caller gets a message
+         * that names the actual mistake ("unknown kind ...") instead
+         * of a bare `write: Invalid argument`. Case-insensitive to
+         * match the kernel side's own strcasecmp() acceptance. */
+        if (strcasecmp(argv[3], "substring") &&
+            strcasecmp(argv[3], "prefix")) {
+            fprintf(stderr,
+                    "avctl: unknown sensitive kind \"%s\" "
+                    "(expected substring or prefix)\n", argv[3]);
+            return 1;
+        }
+        if (argv[4][0] != '/') {
+            fprintf(stderr, "avctl: sensitive add requires an absolute path\n");
+            return 1;
+        }
+        /* Same rationale as do_protect() add: check_field_len() (not
+         * a bare length check) so that an oversized path or one
+         * containing an embedded newline is rejected up front rather
+         * than getting silently truncated by the kernel's line-
+         * oriented proc parser, and a truncated write can't ask the
+         * kernel to install a DIFFERENT (shorter) path than the one
+         * printed back to the caller. */
+        if (check_field_len("path", argv[4], PATH_MAX - 1))
+            return 1;
+        n = snprintf(cmd, sizeof(cmd), "add %s %s", argv[3], argv[4]);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "avctl: kind/path too long to format\n");
+            return 1;
+        }
+        if (write_command_to(SENSITIVE_PROC_PATH, cmd))
+            return 1;
+        printf("sensitive %s: %s\n", argv[3], argv[4]);
+    } else if (!strcmp(argv[2], "del")) {
+        char cmd[PATH_MAX + 8];
+        int n;
+
+        if (argc < 4) {
+            usage(argv[0]);
+            return 1;
+        }
+        /* See the "add" branch above / do_protect() for why this is
+         * check_field_len() and not a bare length check. */
+        if (check_field_len("path", argv[3], PATH_MAX - 1))
+            return 1;
+        n = snprintf(cmd, sizeof(cmd), "del %s", argv[3]);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "avctl: path too long to format\n");
+            return 1;
+        }
+        if (write_command_to(SENSITIVE_PROC_PATH, cmd))
+            return 1;
+        printf("desensitized: %s\n", argv[3]);
     } else {
         usage(argv[0]);
         return 1;
@@ -1960,6 +2113,8 @@ int main(int argc, char **argv)
         return do_trust(argc, argv);
     } else if (!strcmp(argv[1], "protect")) {
         return do_protect(argc, argv);
+    } else if (!strcmp(argv[1], "sensitive")) {
+        return do_sensitive(argc, argv);
     } else if (!strcmp(argv[1], "policy")) {
         return do_policy(argc, argv);
     } else if (!strcmp(argv[1], "save")) {
