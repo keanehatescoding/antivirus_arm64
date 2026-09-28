@@ -1,0 +1,107 @@
+# HyprAV baked into a Fedora Atomic / Bazzite image (Path 1 in README.md).
+#
+# Builds av.ko ONCE against the image's own kernel at image-build time and
+# ships it inside the deployment, plus the avd/avctl/av-gui userspace - no
+# client-side DKMS, no compiler on the running host, fully deterministic.
+# Then `rpm-ostree rebase` onto the result.
+#
+# Two stages on purpose: the builder stage carries gcc/make/kernel-devel
+# and the -devel headers, compiles everything, and stages the artifacts
+# under /staging; the final stage starts clean from the SAME base and only
+# COPYs those artifacts in, so the build toolchain never ends up in the
+# published image. The builder derives FROM the same ${BASE_IMAGE} so the
+# kernel it builds against is exactly the one the final image ships (a
+# module built against a different kernel would not load).
+#
+# This is an EXAMPLE you adapt: set BASE_IMAGE to the aarch64 Atomic image
+# you actually rebase from, and HYPRAV_REF to the commit/tag you want.
+#
+# aarch64 only: av.ko hooks __arm64_sys_execve (see SECURITY.md). BASE_IMAGE
+# must therefore be an aarch64 Atomic image.
+
+# Pick an aarch64 Fedora Atomic base. Fedora Silverblue/Kinoite publish
+# aarch64; substitute an aarch64 Bazzite image here if you have one.
+ARG BASE_IMAGE=quay.io/fedora-ostree-desktops/silverblue:latest
+
+# ---------------------------------------------------------------------------
+# Builder stage - throwaway. Everything installed here (compiler, headers,
+# kernel-devel) stays in this stage and is never copied into the final image.
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS builder
+
+# Commit or tag to build. Override with --build-arg HYPRAV_REF=vX.Y.Z.
+ARG HYPRAV_REF=master
+ARG HYPRAV_GIT=https://github.com/keanehatescoding/antivirus.git
+
+# rpm-ostree is the package manager on an Atomic base; `rpm-ostree install`
+# in a container build applies straight into this stage's /usr. These are
+# BUILD-only - they never reach the final image (that is the whole point of
+# the second stage below).
+RUN rpm-ostree install --idempotent \
+        git make gcc pkgconfig \
+        kernel-devel yara-devel ssdeep-devel libnl3-devel \
+        systemd-rpm-macros python3-gobject gtk4
+
+# Build + stage everything against the kernel this base actually ships.
+# `rpm -q kernel` reports the deployed kernel; kernel-devel for it provides
+# /usr/src/kernels/<kver>. We point av's KDIR there (a container has no
+# running kernel of its own, so `uname -r` is meaningless here).
+RUN set -eux; \
+    git clone --depth 1 --branch "${HYPRAV_REF}" "${HYPRAV_GIT}" /tmp/hyprav || \
+      git clone "${HYPRAV_GIT}" /tmp/hyprav; \
+    cd /tmp/hyprav; \
+    if [ "${HYPRAV_REF}" != "master" ]; then git checkout "${HYPRAV_REF}"; fi; \
+    KVER="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel | tail -n1)"; \
+    KDIR="/usr/src/kernels/${KVER}"; \
+    test -d "${KDIR}" || { echo "no kernel-devel for ${KVER}"; ls /usr/src/kernels; exit 1; }; \
+    # If this image's kernel is Clang/LTO-built, build the module with the
+    # matching toolchain - detect it from the kernel's own .config, the same
+    # way packaging/cachyos/PKGBUILD's dkms.conf does. Fedora's stock kernel
+    # is GCC-built, so EXTRA stays empty there. (A Clang kernel would also
+    # need clang/llvm added to the rpm-ostree install above.)
+    EXTRA=""; \
+    if grep -qs '^CONFIG_CC_IS_CLANG=y' "${KDIR}/.config"; then EXTRA="CC=clang LLVM=1"; fi; \
+    make -C av KDIR="${KDIR}" ${EXTRA}; \
+    install -Dm644 av/av.ko "/staging/usr/lib/modules/${KVER}/extra/av.ko"; \
+    # Userspace staged under /staging (copied into the final image below).
+    make -C userspace/avd   install DESTDIR=/staging PREFIX=/usr UNITDIR=/usr/lib/systemd/system CC=gcc; \
+    make -C userspace/avctl install DESTDIR=/staging PREFIX=/usr POLKIT_ACTIONDIR=/usr/share/polkit-1/actions CC=gcc; \
+    make -C userspace/av-gui install DESTDIR=/staging PREFIX=/usr; \
+    echo "${KVER}" > /staging/usr/lib/modules/.hyprav-kver; \
+    cd /; rm -rf /tmp/hyprav
+
+# ---------------------------------------------------------------------------
+# Final image - clean base + only the built artifacts and RUNTIME libs.
+# No gcc/make/kernel-devel/-devel headers here.
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE}
+
+# Runtime libraries the staged binaries link against (the -devel packages
+# were builder-only). Names may differ on your base - adjust as needed.
+RUN rpm-ostree install --idempotent \
+        yara ssdeep-libs libnl3 python3-gobject gtk4 && \
+    rm -rf /var/cache /var/lib/rpm-ostree
+
+COPY --from=builder /staging/ /
+
+# depmod for the kernel the module was built against (recorded by the
+# builder - identical to this stage's kernel since both share BASE_IMAGE).
+RUN set -eux; \
+    KVER="$(cat /usr/lib/modules/.hyprav-kver)"; \
+    rm -f /usr/lib/modules/.hyprav-kver; \
+    depmod -a "${KVER}"
+
+# No /var/lib/av-quarantine baked in on purpose: on rpm-ostree /var is
+# populated from the image at deploy time, not carried in the read-only
+# /usr tree, so an `install -d` here would not reliably persist anyway.
+# avd creates it itself at runtime with mkdir(quarantine_dir, 0700) - the
+# same fallback every other packaging variant relies on.
+
+# avd.service ships disabled; enable it in your image if you want HyprAV
+# active on first boot. Left to the image author on purpose - baking in an
+# always-on root daemon should be a deliberate choice.
+
+# NOTE: not end-to-end build-verified in this project's environment (no
+# aarch64 Atomic build host here) - same honesty caveat as the Arch-ARM
+# CI leg. The build steps mirror packaging/fedora/hyprav.spec's own
+# %build/%install; validate against your target base before relying on it.
