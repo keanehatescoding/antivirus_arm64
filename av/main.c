@@ -64,6 +64,7 @@
 #include <linux/capability.h>
 #include <linux/crypto.h>
 #include <linux/dcache.h>
+#include <linux/delay.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -267,6 +268,31 @@ static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
 module_param(av_wq_max_active, int, 0444);
 MODULE_PARM_DESC(av_wq_max_active,
                  "Max concurrently-running kernel_av_wq workers (default 32; must be within [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling], otherwise reset to the default)");
+
+/* TEST-ONLY: milliseconds to sleep in av_work_fn() before the deferred
+ * hash open (see the KNOWN TOCTOU note on av_work_fn). This does NOT
+ * create or widen the race in any real sense - the window between the
+ * kprobe's string capture at execve() time and the workqueue's later
+ * open is inherent to the defer-to-workqueue design and exists at full
+ * width on every host; on a fast one it is simply too short for a
+ * userspace regression test to land a rename inside it deterministically.
+ * Holding the open by a fixed interval lets tests/qemu-boot/init.c's
+ * exec-time TOCTOU case exercise the EXISTING window reliably instead of
+ * racing a workqueue that opens within microseconds. It changes nothing
+ * an attacker could not already do by winning the race on a loaded box.
+ *
+ * Default 0 = disabled, so every production configuration is byte-for-byte
+ * unaffected (the sleep is not even entered). Writable (0644) so the test
+ * can enable it around its batch and clear it again via
+ * /sys/module/av/parameters/av_toctou_test_delay_ms; read once per work
+ * item and clamped, so a concurrent out-of-range write can never turn it
+ * into an unbounded sleep. The _test_ infix marks it as never an
+ * operational knob. */
+#define AV_TOCTOU_TEST_DELAY_MAX_MS 2000
+static int av_toctou_test_delay_ms; /* = 0: disabled unless a test sets it */
+module_param(av_toctou_test_delay_ms, int, 0644);
+MODULE_PARM_DESC(av_toctou_test_delay_ms,
+                 "TEST ONLY: ms to sleep before the deferred exec-hash open, to make the inherent exec-time TOCTOU window observable to a regression test (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1075,6 +1101,23 @@ static void av_work_fn(struct work_struct *w) {
   esc_path = kmalloc(PATH_MAX, GFP_KERNEL);
   log_path = esc_path ? av_escape_log_str(abs_path, esc_path, PATH_MAX)
                       : "<path-escape-oom>";
+
+  /* TEST-ONLY window widening (see av_toctou_test_delay_ms): a no-op
+   * whenever the knob is at its default 0, i.e. in every production
+   * configuration. Placed immediately before the deferred open below so
+   * it holds precisely the [kprobe string capture -> this open] interval
+   * that a regression test needs to land a rename inside. Read once and
+   * clamped so a racing sysfs write of a bogus value cannot stall a
+   * worker indefinitely. */
+  {
+    int delay_ms = READ_ONCE(av_toctou_test_delay_ms);
+
+    if (delay_ms > 0) {
+      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
+        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
+      msleep(delay_ms);
+    }
+  }
 
   ret = hash_file_multi(aw->path, &aw->pwd, &digest, &ident);
   if (ret) {

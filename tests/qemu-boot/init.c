@@ -90,27 +90,51 @@
  * path between the real execve() and the workqueue's open makes the scan
  * hash the decoy while their code is already running.
  *
- * The cold-page toggle is a property of a DETERMINISTIC fixture; this one
- * gates a genuine RACE, so it is phrased as "does at least one swap in a
- * batch win", not "does a single attempt win". The toctou case below runs
- * TOCTOU_SWAP_ATTEMPTS swap attempts interleaved with an equal number of
- * no-swap controls, in one boot.
+ * Earlier this case fired the rename from the parent "concurrent with"
+ * the child's execve() and counted any attempt whose verdict line carried
+ * the decoy's hash as a win. That was unsound (see #45): with no ordering
+ * between the rename and the exec, on the single-vCPU TCG leg CI runs the
+ * parent's rename usually completed BEFORE the child was even scheduled to
+ * exec, so the exec itself resolved the decoy. That is not a TOCTOU - the
+ * check and the use both saw the decoy - yet it produced a byte-identical
+ * decoy-hash line, so the metric could not tell a genuine kprobe->open
+ * race from a benign rename-before-exec, and the CLOSED==1 branch was
+ * unsatisfiable (a correctly fixed scanner hashing the executed inode
+ * still emits the decoy's hash whenever the rename beats the exec).
  *
- *   0 = the bypass reproduces here: at least one swap attempt got the
- *       scanner to hash the decoy instead of the exec'd EICAR. Current,
- *       measured on the TCG leg CI actually runs (KVM is not guaranteed
- *       on the hosted arm64 runner - see qemu-boot-test.yml), at ~50-75%
- *       per attempt across 6.12/6.18/7.2; over 64 attempts a genuine
- *       reproduction essentially cannot yield zero (P(0 wins) < 1e-6 even
- *       at a pessimistic 20%/attempt). If this stops being true, EITHER
- *       this harness got fast enough that the workqueue always wins the
- *       race (e.g. a future KVM-accelerated leg), OR the #2 TOCTOU was
- *       actually closed (a hook that scans the kernel's own resolved exec
- *       file - discussion #33's fanotify option - shuts it by
- *       construction). Both need a human; neither should pass quietly.
- *   1 = no swap attempt could get the decoy hashed. Set this only WITH
- *       evidence that the exec verdict now comes from the executed inode,
- *       and update #2/#45/SECURITY.md to match.
+ * This case is now DETERMINISTIC in both directions, on two mechanisms:
+ *
+ *   1. A sync pipe orders the swap. The child reports its execve() result
+ *      to the parent and only then does the parent rename; the parent
+ *      blocks on that report, so the rename is guaranteed to land AFTER
+ *      the exec has already resolved+opened EICAR (the kprobe has captured
+ *      the path with EICAR live). Every swap therefore exercises the real
+ *      window - exec saw EICAR - never the fork->exec window. The reported
+ *      errno (ENOEXEC: EICAR is not an ELF) is also checked as ground
+ *      truth that the exec resolved EICAR and nothing else.
+ *   2. av.ko's test-only av_toctou_test_delay_ms knob (set to
+ *      TOCTOU_WQ_DELAY_MS around this batch only, 0 everywhere else) holds
+ *      the workqueue's deferred open, so the post-exec rename reliably
+ *      lands before that open. Without it the workqueue opens within the
+ *      failing execve() syscall (measured: renaming after execve returns
+ *      is already too late), leaving no window a userspace rename can hit.
+ *      The knob widens the EXISTING window; it does not create the bug.
+ *
+ * With ordering pinned, a decoy-hash line is now unambiguous proof of the
+ * bug and the toggle is a clean per-attempt assertion, not a probability:
+ *
+ *   0 = the bypass reproduces: exec saw EICAR yet the scanner hashed the
+ *       decoy it was renamed to. With the ordering above this reproduces
+ *       on every non-dropped swap attempt while #2 is open. If it stops,
+ *       the #2 TOCTOU was closed (a hook that scans the kernel's own
+ *       resolved exec file - discussion #33's fanotify option - shuts it
+ *       by construction); confirm that, then set the toggle to 1.
+ *   1 = no swap attempt got the decoy hashed: every swap (exec saw EICAR)
+ *       was instead detected+killed, i.e. the verdict now comes from the
+ *       executed inode. Satisfiable precisely because the ordering removes
+ *       the benign rename-before-exec attempts that used to make decoy
+ *       hashes unavoidable. Set this only WITH that evidence, and update
+ *       #2/#45/SECURITY.md to match.
  *
  * Either way the no-swap control must be detected+killed every time - that
  * is the vacuity guard (#34/#45): without it a broken fixture that never
@@ -132,6 +156,18 @@
 #define TOCTOU_DECOY_SHA256                                                   \
   "fd0e0467cee410d82469da45e023e1f6ca372ff1968a5fccc621bd2b6482e4fb"
 #define TOCTOU_DECOY_BYTES "toctou decoy - nothing to see here\n"
+
+/* av.ko's test-only knob (av_toctou_test_delay_ms) that holds the
+ * workqueue's deferred open by this many ms, so the swap below lands in
+ * the kprobe->open window deterministically rather than by luck. Any
+ * value comfortably larger than the parent's post-handshake rename
+ * latency (sub-ms even under TCG) works; 150ms leaves a wide margin. The
+ * child must outlive the delayed open+hash so its verdict LINE is emitted
+ * against a still-live pid (no reuse), so its linger is the delay plus a
+ * generous hash/scheduling margin. */
+#define TOCTOU_WQ_DELAY_MS 150
+#define TOCTOU_LINGER_US ((TOCTOU_WQ_DELAY_MS + 400) * 1000)
+#define TOCTOU_DELAY_PARAM "/sys/module/av/parameters/av_toctou_test_delay_ms"
 
 static void outmsg(const char *fmt, ...) {
   static char buf[65536];
@@ -227,6 +263,29 @@ static void write_file(const char *path, const char *content) {
     die("open for write");
   if (write(fd, content, strlen(content)) < 0)
     die("write");
+  close(fd);
+}
+
+/* Set an integer sysfs/module-param attribute. Unlike write_file() this
+ * does NOT pass O_CREAT/O_TRUNC: the target is an existing kernel
+ * attribute, and a failure to open it is a real error worth reporting
+ * distinctly - most likely av.ko was built without the test-only knob
+ * (rebuild the module), or sysfs was not mounted. */
+static void write_param_int(const char *path, int val) {
+  char buf[16];
+  int fd = open(path, O_WRONLY);
+  int n;
+  if (fd < 0)
+    die("open module param (rebuild av.ko with the toctou test knob?)");
+  n = snprintf(buf, sizeof(buf), "%d", val);
+  if (n < 0 || (size_t)n >= sizeof(buf)) {
+    close(fd);
+    die("format module param value");
+  }
+  if (write(fd, buf, (size_t)n) != n) {
+    close(fd);
+    die("write module param");
+  }
   close(fd);
 }
 
@@ -531,6 +590,14 @@ int main(int argc, char *const argv[]) {
     die("mount /dev");
   if (mount("tmpfs", "/tmp", "tmpfs", 0, NULL) != 0)
     die("mount /tmp");
+  /* sysfs: the exec-time TOCTOU case below toggles av.ko's test-only
+   * window knob through /sys/module/av/parameters. The initramfs may not
+   * ship a /sys dir, and the rootfs is writable, so create the mountpoint
+   * if needed. EEXIST just means it was already there. */
+  if (mkdir("/sys", 0755) != 0 && errno != EEXIST)
+    die("mkdir /sys");
+  if (mount("sysfs", "/sys", "sysfs", 0, NULL) != 0 && errno != EBUSY)
+    die("mount /sys");
 
   outmsg("QEMU_TEST: init started\n");
 
@@ -732,26 +799,46 @@ int main(int argc, char *const argv[]) {
    * in the window between the real exec and that open, makes the scanner
    * hash the decoy while the EICAR that executed goes unreported.
    *
-   * Unlike the cold-page case this is a genuine race, so it is run as a
-   * batch: TOCTOU_SWAP_ATTEMPTS swap attempts, each interleaved with a
-   * no-swap control, and the verdict is over the batch. See
-   * AV_EXPECT_TOCTOU_CLOSED for the measured win rates and why the batch
-   * size makes a zero-win batch effectively impossible while the bug is
-   * open.
+   * Run as a batch: TOCTOU_SWAP_ATTEMPTS swap attempts, each interleaved
+   * with a no-swap control, verdict over the batch. Two mechanisms make
+   * every attempt DETERMINISTIC rather than a timing gamble (see
+   * AV_EXPECT_TOCTOU_CLOSED for the full rationale, and for why the
+   * earlier fire-from-the-parent-and-hope version was unsound):
    *
-   * The swap is driven from the PARENT the instant the child is forked,
-   * concurrent with the child's execve() - a rename() from the child
-   * after its own execve() returns is far too late (measured: 0/N, the
-   * workqueue always opens first). Same-directory rename is atomic, so
-   * the scanner's open sees exactly one of the two inodes, never a
-   * half-state. */
+   *   - A sync pipe orders the swap relative to the exec. The child
+   *     execve()s, then writes its resulting errno to the pipe; the parent
+   *     blocks reading that value and only then renames. The rename is
+   *     therefore guaranteed to land AFTER the exec has already resolved
+   *     EICAR (the kprobe captured the path with EICAR live), so the swap
+   *     always exercises the kprobe->open window and never the fork->exec
+   *     window. The errno (ENOEXEC - EICAR is not an ELF) is ground truth
+   *     that the exec resolved EICAR and not the decoy; the parent checks
+   *     it and refuses to draw any conclusion from an attempt that broke.
+   *
+   *   - av.ko's test-only av_toctou_test_delay_ms knob, set to
+   *     TOCTOU_WQ_DELAY_MS for the duration of this batch only (0 for
+   *     every other exec in this boot and in all production), holds the
+   *     workqueue's deferred open past the rename. Without it the
+   *     workqueue opens within the failing execve() syscall (measured:
+   *     renaming after execve returns is already too late), too fast for a
+   *     userspace rename to land inside. The knob widens the EXISTING
+   *     window; it does not create the bug.
+   *
+   * Same-directory rename is atomic, so the scanner's open sees exactly
+   * one of the two inodes, never a half-state. */
   {
     int i;
-    int decoy_wins = 0;    /* swap attempts where the scanner hashed the decoy */
-    int swap_kills = 0;    /* swap attempts where the workqueue won the race */
-    int swap_lost = 0;     /* swap attempts with neither outcome (see below) */
-    int control_kills = 0; /* no-swap controls detected+killed as they must be */
-    int control_bad = 0;   /* no-swap controls NOT killed - a broken fixture */
+    int decoy_wins = 0;    /* swap: exec saw EICAR, scanner hashed the decoy - the bug */
+    int swap_kills = 0;    /* swap: exec saw EICAR, scanner killed on it - closed behavior */
+    int swap_lost = 0;     /* swap: neither line for this pid (work dropped) */
+    int control_kills = 0; /* control: un-swapped EICAR detected+killed, as it must be */
+    int control_bad = 0;   /* control: un-swapped EICAR NOT killed - a broken fixture */
+    int exec_errno_bad = 0;/* either arm: exec did not fail ENOEXEC - a sync/fixture defect */
+
+    /* Widen the workqueue open window for this batch only, then restore
+     * production timing (below) before the #48 section - or anything else -
+     * execs. */
+    write_param_int(TOCTOU_DELAY_PARAM, TOCTOU_WQ_DELAY_MS);
 
     for (i = 0; i < TOCTOU_SWAP_ATTEMPTS; i++) {
       char target[64], decoy[64];
@@ -766,7 +853,10 @@ int main(int argc, char *const argv[]) {
        * busy would not be comparable. */
       for (swap = 0; swap <= 1; swap++) {
         pid_t pid;
-        int status, killed;
+        int status;
+        int sync_pipe[2];
+        int exec_errno = 0;
+        ssize_t r;
 
         snprintf(target, sizeof(target), "/tmp/tc_%s_%d",
                  swap ? "swap" : "ctl", i);
@@ -775,11 +865,17 @@ int main(int argc, char *const argv[]) {
         if (swap)
           write_file(decoy, TOCTOU_DECOY_BYTES);
 
+        if (pipe(sync_pipe) != 0)
+          die("pipe(toctou)");
+
         pid = fork();
         if (pid < 0)
           die("fork(toctou)");
         if (pid == 0) {
           char *const a[] = {target, NULL};
+          int e;
+
+          close(sync_pipe[0]); /* child only writes the exec result */
 
           /* Fault the pathname page in first (same reasoning as
            * run_and_wait()): this case is about the inode race, not the
@@ -787,34 +883,70 @@ int main(int argc, char *const argv[]) {
           volatile char t = target[0];
           (void)t;
           execv(target, a);
-          /* EICAR is not an ELF, so execv() always fails ENOEXEC. Linger
-           * briefly so the workqueue has time to open, hash and log its
-           * verdict for this path while the parent waits below - the
-           * verdict LINE is what this case reads, not the SIGKILL (see
-           * the classification note). ~40ms is the observed worker
-           * latency on the TCG leg; 400ms is an order of magnitude over
-           * that so a busy queue still lands in time, while keeping the
-           * whole batch well inside the boot timeout even when every
-           * decoy attempt lingers the full interval (a killed EICAR
-           * child exits as soon as the SIGKILL arrives, far sooner). */
-          usleep(400000);
+          e = errno; /* EICAR is not an ELF, so execv() always fails ENOEXEC */
+
+          /* Report the exec result, THEN linger. The write is both the
+           * ground-truth signal (which errno == which inode the kernel
+           * resolved for this exec) and the ordering edge the parent
+           * blocks on before renaming, so the rename cannot precede the
+           * exec. Sent before lingering (not via the exit status) so the
+           * parent has it even when the scanner SIGKILLs this child
+           * mid-linger - the fixed-scanner / CLOSED==1 case. */
+          if (write(sync_pipe[1], &e, sizeof(e)) != (ssize_t)sizeof(e))
+            _exit(2);
+          close(sync_pipe[1]);
+
+          /* Linger so the (delayed) workqueue opens, hashes and logs its
+           * verdict for this path while the pid is still live and cannot
+           * be reused. Must outlast the injected open delay plus the hash;
+           * TOCTOU_LINGER_US is TOCTOU_WQ_DELAY_MS + a wide margin. A
+           * killed EICAR child exits as soon as the SIGKILL arrives, far
+           * sooner. */
+          usleep(TOCTOU_LINGER_US);
           _exit(1);
         }
+        close(sync_pipe[1]); /* parent only reads */
 
-        /* The race itself. rename() returns immediately; whether it lands
-         * before or after the workqueue's open() is what this measures. */
-        if (swap)
-          rename(decoy, target);
+        /* Block until the child reports its execve result. This is the
+         * ordering edge that removes the old (A)-vs-(B) confound: the
+         * rename below cannot run until exec has already entered and
+         * resolved the path, so at exec-entry the path was still the
+         * original file. For a swap that file is EICAR (exec_errno ==
+         * ENOEXEC), so any later decoy hash is unambiguously ordering
+         * (B) - the kprobe->workqueue window - not a benign pre-exec
+         * swap. */
+        r = read(sync_pipe[0], &exec_errno, sizeof(exec_errno));
+        close(sync_pipe[0]);
+        if (r != (ssize_t)sizeof(exec_errno)) {
+          kill(pid, SIGKILL);
+          waitpid(pid, &status, 0);
+          die("read(toctou sync)");
+        }
+
+        /* The race itself, now strictly after exec-entry. rename()
+         * returns immediately; whether it lands before or after the
+         * (delay-widened) workqueue open() is what this measures. A
+         * failed rename is a fixture defect, not a data point: the swap
+         * would silently degrade into a second control, get a kill line,
+         * and be counted in swap_kills - i.e. a batch where every rename
+         * failed would pass as "bypass no longer reproduces" under
+         * AV_EXPECT_TOCTOU_CLOSED. Fail loudly instead (see the vacuity
+         * guard note below). */
+        if (swap && rename(decoy, target) != 0) {
+          int saved = errno;
+          kill(pid, SIGKILL);
+          waitpid(pid, &status, 0);
+          errno = saved;
+          die("rename(toctou decoy)");
+        }
 
         if (waitpid(pid, &status, 0) < 0)
           die("waitpid(toctou)");
-        killed = WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
-        (void)killed; /* the verdict LINE is the signal, not the SIGKILL:
-                       * whether the kill beats the child's own exit is a
-                       * separate race and irrelevant to which inode was
-                       * hashed. Classifying on `killed` would misfile a
-                       * detected control as broken whenever the child
-                       * happened to exit first. */
+        /* The verdict LINE is the signal, not the SIGKILL: whether the
+         * kill beats the child's own exit is a separate race and
+         * irrelevant to which inode was hashed. Classifying on the exit
+         * status would misfile a detected control as broken whenever the
+         * child happened to exit first. */
 
         log = read_kernel_log();
         snprintf(kill_line, sizeof(kill_line),
@@ -827,6 +959,19 @@ int main(int argc, char *const argv[]) {
                  "event=clean type=fail-open path=\"%s\" pid=%d "
                  "md5= sha1= sha256=%s",
                  target, (int)pid, TOCTOU_DECOY_SHA256);
+
+        /* Ground truth: which inode was live when the kernel entered this
+         * exec. Both samples are non-ELF, so the original file (EICAR, and
+         * the decoy too) yields ENOEXEC. Anything else means the child
+         * never reached a clean execve on the intended path - a sync or
+         * fixture defect that would make the swap/control tallies
+         * meaningless, so it is failed loudly rather than classified. The
+         * sync pipe guarantees the swap rename ran after exec-entry, so a
+         * swap must also see ENOEXEC. */
+        if (exec_errno != ENOEXEC) {
+          exec_errno_bad++;
+          continue;
+        }
 
         if (swap) {
           if (strstr(log, decoy_line))
@@ -844,12 +989,34 @@ int main(int argc, char *const argv[]) {
       }
     }
 
-    outmsg("QEMU_TEST: toctou batch: attempts=%d decoy_wins=%d "
-           "swap_kills=%d swap_lost=%d control_kills=%d control_bad=%d\n",
-           TOCTOU_SWAP_ATTEMPTS, decoy_wins, swap_kills, swap_lost,
-           control_kills, control_bad);
+    /* Restore production timing before anything else (e.g. #48) execs. */
+    write_param_int(TOCTOU_DELAY_PARAM, 0);
 
-    /* Vacuity guard first - if the control does not reliably detect and
+    outmsg("QEMU_TEST: toctou batch: attempts=%d decoy_wins=%d "
+           "swap_kills=%d swap_lost=%d control_kills=%d control_bad=%d "
+           "exec_errno_bad=%d\n",
+           TOCTOU_SWAP_ATTEMPTS, decoy_wins, swap_kills, swap_lost,
+           control_kills, control_bad, exec_errno_bad);
+
+    /* Ground-truth guard first - if any exec did not fail ENOEXEC, the
+     * child never cleanly reached execve on the intended path, so the
+     * sync-pipe ordering that the whole case rests on did not hold and no
+     * tally below can be trusted. This is distinct from a broken control:
+     * it says the experiment itself did not run, not that detection
+     * failed. */
+    if (exec_errno_bad != 0) {
+      outmsg("QEMU_TEST: FAIL: %d of %d toctou execs did not fail ENOEXEC "
+             "as expected - the child did not cleanly reach execve on the "
+             "intended path, so the sync-pipe ordering this case relies on "
+             "did not hold and the swap/control tallies are meaningless. "
+             "This is a harness defect, not evidence about the #2 TOCTOU.\n",
+             exec_errno_bad, TOCTOU_SWAP_ATTEMPTS * 2);
+      outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
+      poweroff_now();
+      return 1;
+    }
+
+    /* Vacuity guard - if the control does not reliably detect and
      * kill an un-swapped EICAR, nothing else in this case means anything
      * (see AV_EXPECT_TOCTOU_CLOSED). This is the #34/#45 lesson: a
      * fixture that cannot reproduce what it claims must fail loudly, not
@@ -884,11 +1051,14 @@ int main(int argc, char *const argv[]) {
     if (AV_EXPECT_TOCTOU_CLOSED) {
       if (decoy_wins != 0) {
         outmsg("QEMU_TEST: FAIL: %d swap attempt(s) got the scanner to "
-               "hash the decoy, but AV_EXPECT_TOCTOU_CLOSED says the exec "
-               "verdict is now taken from the executed inode. Either the "
-               "#2 TOCTOU is not actually closed, or this harness is "
-               "asserting a fix that has not landed - establish which "
-               "before touching the toggle.\n",
+               "hash the decoy even though exec saw EICAR at entry (all "
+               "execs failed ENOEXEC) and the swap was ordered strictly "
+               "after exec-entry - i.e. the real #2 window. "
+               "AV_EXPECT_TOCTOU_CLOSED says the exec verdict is now taken "
+               "from the executed inode, so either the #2 TOCTOU is not "
+               "actually closed, or this harness is asserting a fix that "
+               "has not landed - establish which before touching the "
+               "toggle.\n",
                decoy_wins);
         outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
         poweroff_now();
@@ -900,16 +1070,19 @@ int main(int argc, char *const argv[]) {
     } else {
       if (decoy_wins == 0) {
         outmsg("QEMU_TEST: FAIL: no swap attempt reproduced the TOCTOU "
-               "(decoy_wins=0 over %d attempts, swap_kills=%d). Every "
-               "kernel in the matrix reproduced it when AV_EXPECT_TOCTOU_"
-               "CLOSED was 0. So either exec-time detection stopped "
-               "re-opening the target by path (the #2 fix - update #2/#45/"
-               "SECURITY.md and flip the toggle to 1), or this harness got "
-               "fast enough that the workqueue always wins the race (e.g. "
-               "a KVM-accelerated leg) and the case needs a wider window. "
-               "Establish which; do not silence it by flipping the "
+               "(decoy_wins=0 over %d attempts, swap_kills=%d) even though "
+               "each swap was ordered strictly after exec-entry (via the "
+               "sync pipe) and the workqueue open was held open by "
+               "av_toctou_test_delay_ms=%dms. Every kernel in the matrix "
+               "reproduced it when AV_EXPECT_TOCTOU_CLOSED was 0. So either "
+               "exec-time detection stopped re-opening the target by path "
+               "(the #2 fix - update #2/#45/SECURITY.md and flip the toggle "
+               "to 1), or the delay knob did not take effect (av.ko built "
+               "without it, or the param write to " TOCTOU_DELAY_PARAM
+               " silently failed) so the workqueue still opened before the "
+               "rename. Establish which; do not silence it by flipping the "
                "toggle.\n",
-               TOCTOU_SWAP_ATTEMPTS, swap_kills);
+               TOCTOU_SWAP_ATTEMPTS, swap_kills, TOCTOU_WQ_DELAY_MS);
         outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
         poweroff_now();
         return 1;
