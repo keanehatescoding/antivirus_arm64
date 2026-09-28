@@ -82,12 +82,20 @@ not oversights. A *new* way to defeat one of them is still very welcome:
   exec'd pathname is captured relative to the exec itself. Three fixes were
   considered and rejected; full writeup in the comment above
   `handler_pre()` in `av/main.c`, and design options in issue #2 /
-  discussion #33. `tests/qemu-boot/cold_launcher.c` reproduces the
-  cold-page half of it on every CI run: it execve()s from a pathname
-  page it guarantees is cold (fresh file-backed mapping, never
-  faulted, `MADV_DONTNEED`'d before exec) so the kprobe handler's
-  atomic copy genuinely sees a non-resident page, and the case gates
-  on the bypass it observes.
+  discussion #33. Both halves are now reproduced on every CI run.
+  `tests/qemu-boot/cold_launcher.c` covers the cold-page half: it
+  execve()s from a pathname page it guarantees is cold (fresh
+  file-backed mapping, never faulted, `MADV_DONTNEED`'d before exec) so
+  the kprobe handler's atomic copy genuinely sees a non-resident page,
+  and the case gates on the bypass it observes. The TOCTOU half (issue
+  #45) is covered by the batch case in `tests/qemu-boot/init.c`: it
+  renames a clean decoy over an EICAR exec target concurrently with the
+  execve(), and gates on at least one attempt getting the workqueue to
+  hash the decoy (proved by the decoy's own sha256 appearing on a
+  fail-open line) while an interleaved no-swap control is detected and
+  killed every time. Both cases carry a toggle
+  (`AV_EXPECT_COLD_EXEC_DETECTED` / `AV_EXPECT_TOCTOU_CLOSED`) that flips
+  the assertion the day the gap is actually closed.
 
   Both halves of that gap share one cause — the verdict is computed from a
   pathname the module copied itself, not from the file the kernel already

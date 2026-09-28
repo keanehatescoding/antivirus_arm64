@@ -193,7 +193,15 @@ pathname. Both halves of that are evadable, and issue #2 tracks both:
 - **TOCTOU on the re-open.** `open_exec_target()` is a second, later
   open of the same name. Swapping what that name resolves to between
   the kernel's own resolution and ours means the verdict describes a
-  file that is not the one executing.
+  file that is not the one executing. The kprobe path's version of this
+  is reproduced on every CI run by the batch case in
+  `tests/qemu-boot/init.c` (issue #45): a clean decoy renamed over an
+  EICAR exec target, concurrent with the `execve()`, gets the workqueue
+  to hash and clear the decoy on ~50–75% of attempts (the target's
+  fail-open line carries the *decoy's* sha256), while an interleaved
+  no-swap control is caught every time. Unlike the fanotify version
+  below it is a genuine race, so it gates on "at least one of a batch
+  wins" rather than on a single deterministic attempt.
 
 Unlike findings #1, #2 and #4, this one is **not** an inherent limit of
 the technique — it is an artifact of *where the hook sits*. The verdict
