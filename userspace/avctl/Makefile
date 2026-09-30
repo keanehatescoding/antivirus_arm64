@@ -26,7 +26,7 @@ DESTDIR         ?=
 # it is not relocatable the way PREFIX-based installs are.
 POLKIT_ACTIONDIR ?= /usr/share/polkit-1/actions
 
-avctl: avctl.c
+avctl: avctl.c ../avd/wire_escape.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o avctl avctl.c
 
 clean:

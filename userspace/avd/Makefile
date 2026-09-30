@@ -92,7 +92,7 @@ avd: avd.o sha256.o tlsh_core.o tlsh_shim.o
 # checkdeps to run first without making a checkdeps timestamp change
 # trigger a needless rebuild of these objects (checkdeps has no file
 # output to have a timestamp in the first place).
-avd.o: avd.c ../../av/netlink_proto.h sha256.h tlsh_shim.h | checkdeps
+avd.o: avd.c ../../av/netlink_proto.h sha256.h tlsh_shim.h wire_escape.h | checkdeps
 	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -c avd.c -o avd.o
 
 # sha256.o needs none of avd's third-party deps (libnl/yara/fuzzy)
