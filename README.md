@@ -97,8 +97,9 @@ page for its tunables and for what fail-closed does and doesn't cover.
 tests/run_all.sh
 ```
 
-Runs nine suites in a fixed order: the four that need neither root nor a
-loaded module first, then the exec gate, then the ones that insmod `av.ko`.
+Runs ten suites in a fixed order: the five that need neither root nor a
+loaded module first (including the Python 3 avd_client regression), then
+the exec gate, then the ones that insmod `av.ko`.
 On a non-aarch64 host the module-dependent ones skip loudly and
 `test_detection.sh` cross-compiles and QEMU-boot-tests instead. Two scripts
 are deliberately **not** in `run_all.sh` (`test_avctl_timeouts.sh` and

@@ -65,6 +65,13 @@ echo "### test_sensitive_proc.sh (static checks pinning the #85/#86 fixes) ###"
 "$REPO_ROOT/tests/test_sensitive_proc.sh" || FAIL=1
 
 echo
+echo "### test_avd_client.py (GUI avd_client trickle-timeout, #79) ###"
+# Pure Python, unit-only: mock AF_UNIX peer, no root, no module, no GTK.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT/userspace/av-gui" \
+    python3 -m unittest discover -s "$REPO_ROOT/userspace/av-gui/tests" \
+    -p test_avd_client.py || FAIL=1
+
+echo
 echo "### test_fanotify_exec_gate.sh (avd's exec gate for #2's two gaps) ###"
 # Half static greps (no root) and half a live FAN_OPEN_EXEC_PERM
 # harness (root). It self-elevates the live half via pkexec when this
