@@ -142,6 +142,32 @@ else
     fail "do_save() emits \`sensitive del\` after (or does not emit it before) \`sensitive add\`"
 fi
 
+# --- #86 follow-up: kind change on a default path survives save/load ---
+
+section "#86 follow-up: do_save() del-diff is kind-aware"
+
+# av_behavior_sensitive_add()'s duplicate check is keyed on path alone,
+# so a `del <path>` + `add <other-kind> <path>` runtime change does not
+# survive a save -> module reload -> load cycle unless save's del-diff
+# also emits a `del` when the live kind for a default path differs from
+# the default's own kind: without it, replaying the add would hit
+# -EEXIST against the reseeded default-kind entry and the kind change
+# would be silently reverted. do_save() must therefore track default
+# kinds alongside paths and compare both.
+if echo "$SAVE_BODY" | grep -q 'def_kinds'; then
+    pass "do_save() captures default kinds for the diff"
+else
+    fail "do_save() does not capture default kinds - kind change on a default silently reverts through save/load"
+fi
+# The comparison itself: either direction of strcmp against live_kinds,
+# scoped to do_save() so an unrelated strcmp elsewhere in the file does
+# not satisfy it on its own.
+if echo "$SAVE_BODY" | grep -qE 'strcmp\(def_kinds\[[^]]+\], *live_kinds\[[^]]+\]\)|strcmp\(live_kinds\[[^]]+\], *def_kinds\[[^]]+\]\)'; then
+    pass "do_save() compares def kind against live kind on a path match"
+else
+    fail "do_save() does not compare def kind against live kind - only straight deletions get a del line"
+fi
+
 echo
 if [ "$FAIL" -ne 0 ]; then
     echo "=== $PASS passed, $FAIL failed ==="

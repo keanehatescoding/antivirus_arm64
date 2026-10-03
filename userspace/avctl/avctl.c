@@ -845,15 +845,20 @@ static int do_save(const char *path)
 
     /* #86: diff the kernel's compile-time default set against the live
      * table and emit a `sensitive del <path>\n` for every default an
-     * operator has deleted at runtime, BEFORE emitting the add block
-     * that replays live state. sensitive_seed_defaults() reseeds the
-     * full default set on every module init, so without this diff a
-     * save -> module reload -> load cycle silently resurrects every
-     * deleted default. Dels run first so load applies the correction
-     * against the fresh (reseeded) kernel state and then layers the
-     * operator's own live set on top. */
+     * operator has deleted OR whose kind they have changed at runtime,
+     * BEFORE emitting the add block that replays live state.
+     * sensitive_seed_defaults() reseeds the full default set on every
+     * module init, so without this diff a save -> module reload ->
+     * load cycle silently resurrects every deleted default; and
+     * because av_behavior_sensitive_add() is keyed on path alone,
+     * without the kind-mismatch arm a `del <path>; add <other-kind>
+     * <path>` pair would collide via -EEXIST on replay and silently
+     * revert back to the default kind. Dels run first so load applies
+     * the correction against the fresh (reseeded) kernel state and
+     * then layers the operator's own live set on top. */
     {
         char **def_paths = NULL;
+        char (*def_kinds)[16] = NULL;
         size_t n_defs = 0, cap_defs = 0;
         char (*live_kinds)[16] = NULL;
         char (*live_paths)[PATH_MAX] = NULL;
@@ -872,20 +877,32 @@ static int do_save(const char *path)
 
             /* Same `<kind> %<PATH_MAX-1>[^\n]` shape sensitive_proc_show()
              * uses for the live table - kernel-side defaults share the
-             * same show helper. We only need dpath for the diff; kinds
-             * are not stored because `sensitive del` is keyed on path
-             * alone. */
+             * same show helper. Kind is captured alongside path so the
+             * diff below can also detect operator-driven KIND CHANGES
+             * on default paths, not only straight deletions - the
+             * kernel's duplicate-detect in av_behavior_sensitive_add()
+             * is keyed on path alone, so without this a save -> reload
+             * -> load cycle would silently revert a kind change: the
+             * replayed add would hit -EEXIST against the reseeded
+             * default-kind entry and get skipped. */
             if (sscanf(line, "%15s %4095[^\n]", dkind, dpath) != 2)
                 continue;
             if (n_defs == cap_defs) {
                 size_t grow = cap_defs ? cap_defs * 2 : 16;
-                char **g = realloc(def_paths, grow * sizeof(*def_paths));
+                char **gp = realloc(def_paths, grow * sizeof(*def_paths));
+                void *gk;
 
-                if (!g) {
+                if (!gp) {
                     sens_err = 1;
                     break;
                 }
-                def_paths = g;
+                def_paths = gp;
+                gk = realloc(def_kinds, grow * sizeof(*def_kinds));
+                if (!gk) {
+                    sens_err = 1;
+                    break;
+                }
+                def_kinds = gk;
                 cap_defs = grow;
             }
             def_paths[n_defs] = strdup(dpath);
@@ -893,6 +910,7 @@ static int do_save(const char *path)
                 sens_err = 1;
                 break;
             }
+            memcpy(def_kinds[n_defs], dkind, sizeof(dkind));
             n_defs++;
         }
         fclose(in);
@@ -936,19 +954,27 @@ static int do_save(const char *path)
         if (sens_err)
             goto sens_cleanup;
 
-        /* Dels first: every default whose path is absent from live.
+        /* Dels first: every default whose path is absent from live,
+         * AND every default whose live kind differs from the default
+         * kind (operator ran `del <path>` + `add <other-kind> <path>`
+         * at runtime - that pair needs to replay as a del before the
+         * live add can take effect, because the reseeded default and
+         * the replayed add share a path and would collide via
+         * -EEXIST otherwise). Both cases emit the same `del` line;
+         * the add loop below then layers the live state on top.
          * O(n_defs * n_live) linear scan is fine - n_defs is a short
          * compile-time list on the kernel side. */
         for (i = 0; i < n_defs; i++) {
-            int present = 0;
+            size_t match = n_live;
 
             for (j = 0; j < n_live; j++) {
                 if (!strcmp(def_paths[i], live_paths[j])) {
-                    present = 1;
+                    match = j;
                     break;
                 }
             }
-            if (!present)
+            if (match == n_live ||
+                strcmp(def_kinds[i], live_kinds[match]))
                 werr |= fprintf(out, "sensitive del %s\n", def_paths[i]) < 0;
         }
 
@@ -965,6 +991,7 @@ sens_cleanup:
         for (i = 0; i < n_defs; i++)
             free(def_paths[i]);
         free(def_paths);
+        free(def_kinds);
         free(live_kinds);
         free(live_paths);
         if (sens_err) {
