@@ -141,6 +141,43 @@ int av_behavior_protect_del(const char *path);
 int av_behavior_protect_proc_init(void);
 void av_behavior_protect_proc_exit(void);
 
+/* Sensitive-path list: the substring/prefix set that
+ * av_behavior_check_openat()/_unlink()/_rename() flag as a strongest-
+ * single-event signal. Unlike the volume-based heuristics this list is
+ * NOT exempted for trusted processes - a match here always fires. Two
+ * kinds:
+ *   - AV_SENSITIVE_KIND_SUBSTRING: matches anywhere in the path,
+ *     bounded by a '/' or end-of-string on the right (see
+ *     path_has_bounded_substring() in behavior.c). Right for anchored
+ *     needles like "/etc/passwd" or "/.ssh/" whose false-positive risk
+ *     on a naive strstr() is negligible.
+ *   - AV_SENSITIVE_KIND_PREFIX: strict left-anchored prefix match at
+ *     the start of the path. Right for short, common needles like
+ *     "/boot/" whose bare substring would fire on any path containing
+ *     a directory literally named "boot" - see the comment on
+ *     sensitive_path_prefixes[]'s replacement in behavior.c.
+ *
+ * `path` is an absolute path (must start with '/'), size-capped at
+ * PATH_MAX-1 like the protected list. Returns 0 on success, -EINVAL
+ * for a malformed path or unknown kind, -ENOMEM on allocation failure,
+ * -EEXIST from _add on a duplicate, -ENOENT from _del if no such entry
+ * exists. Same duplicate/lookup semantics as
+ * av_behavior_protect_add()/_del() above. */
+#define AV_SENSITIVE_KIND_SUBSTRING 0
+#define AV_SENSITIVE_KIND_PREFIX    1
+
+int av_behavior_sensitive_add(const char *path, int kind);
+int av_behavior_sensitive_del(const char *path);
+
+/* Creates/removes /proc/kernel_av_sensitive for runtime management
+ * (add/del/list), same usage pattern as the trust and protected lists
+ * above. The compile-time default list (see behavior.c's
+ * sensitive_defaults[]) is seeded on init; operators can add or remove
+ * entries at runtime without a rebuild. Call after av_behavior_init()
+ * / before av_behavior_exit(). */
+int av_behavior_sensitive_proc_init(void);
+void av_behavior_sensitive_proc_exit(void);
+
 /* Resolves target_pid's own exe path (task->mm->exe_file - what the
  * process actually IS, not any path string a caller happens to be
  * passing around for logging) and checks it against the protected

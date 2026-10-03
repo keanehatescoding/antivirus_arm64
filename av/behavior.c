@@ -267,29 +267,18 @@ static bool path_is_rapid_write_noise(const char *path) {
   return false;
 }
 
-/* Substring match against these flags the corresponding heuristic.
- * Deliberately simple (no regex/glob) to keep this fully atomic-safe
- * if ever needed in a tighter path later, and easy to reason about. */
-static const char *const sensitive_path_substrings[] = {
-    "/etc/passwd",
-    "/etc/shadow",
-    "/.ssh/",
-};
-#define NUM_SENSITIVE_SUBSTRINGS ARRAY_SIZE(sensitive_path_substrings)
-
-/* Prefix match, not substring - "/boot/" as a bare substring flagged
- * any path containing a directory literally named "boot" anywhere
- * (Quasar/other web-framework src/boot/ directories, u-boot project
- * trees, etc.), which is a common legitimate directory name and not
- * remotely the same thing as the actual /boot filesystem. Unlike
- * /etc/passwd, /etc/shadow, and /.ssh/ - specific enough that a
- * substring match rarely fires outside the real path - "boot" alone
- * needed the same anchored-prefix treatment path_is_pseudo_fs() above
- * already uses for excluded_path_prefixes[]. */
-static const char *const sensitive_path_prefixes[] = {
-    "/boot/",
-};
-#define NUM_SENSITIVE_PREFIXES ARRAY_SIZE(sensitive_path_prefixes)
+/* The sensitive-path list itself used to be a pair of compile-time
+ * arrays (sensitive_path_substrings[] / sensitive_path_prefixes[])
+ * defined right here. Issue #62 flipped it over to a runtime-tunable
+ * hashtable-backed set (av_sensitive_entry) with a /proc/kernel_av_
+ * sensitive control entry, same shape as kernel_av_protected. The
+ * seed defaults + the substring-vs-prefix distinction are preserved
+ * (see sensitive_defaults[] and AV_SENSITIVE_KIND_* below, roughly
+ * 200 lines further down); operator additions/removals at runtime
+ * don't need a rebuild anymore. The substring/prefix helpers and
+ * path_is_sensitive() itself now walk the dynamic table instead of
+ * these arrays - both are down with the rest of the sensitive-list
+ * machinery. */
 
 struct av_behavior_entry {
   struct hlist_node node;
@@ -1060,6 +1049,480 @@ static void protected_table_destroy(void) {
   mutex_unlock(&protected_lock);
 }
 
+/* --- Sensitive-path list (runtime-tunable, issue #62) ----------------
+ *
+ * This used to be two compile-time arrays (sensitive_path_substrings[]
+ * / sensitive_path_prefixes[]) with no way to change them without
+ * rebuilding the module - the one detection input that required a
+ * recompile while every other threshold is at least a module
+ * parameter. This block replaces them with the same hashtable+proc
+ * shape as the protected list a few hundred lines up: a mutex-guarded
+ * hashtable keyed by path, a /proc/kernel_av_sensitive control entry
+ * with the same *ppos+trailing-terminator write contract, and a
+ * seed-defaults pass at init time so the effective list starts out
+ * identical to the pre-#62 hardcoded set. Substring vs. prefix is
+ * carried per-entry (kind field, AV_SENSITIVE_KIND_*) rather than by
+ * living in two separate arrays; path_is_sensitive() below walks the
+ * table once and dispatches on kind.
+ *
+ * path_is_sensitive() is called from av_behavior_check_openat/_unlink/
+ * _rename OUTSIDE behavior_lock (see those callers above), so
+ * sensitive_lock is an entirely independent lock - no nesting with
+ * behavior_lock or protected_lock is possible, and none of the write-
+ * side paths (add/del/proc_write) touch either of those locks either.
+ */
+
+#define SENSITIVE_PATH_LEN PATH_MAX
+
+struct av_sensitive_entry {
+  struct hlist_node node;
+  int kind;
+  char path[SENSITIVE_PATH_LEN];
+};
+
+static DEFINE_HASHTABLE(sensitive_table, TRUST_BITS);
+static DEFINE_MUTEX(sensitive_lock);
+
+static u32 sensitive_key(const char *path) {
+  return full_name_hash(NULL, path, strlen(path));
+}
+
+int av_behavior_sensitive_add(const char *path, int kind) {
+  /* Same NULL-initializer workaround as hash_is_trusted() above. */
+  struct av_sensitive_entry *existing = NULL;
+  struct av_sensitive_entry *e;
+
+  if (kind != AV_SENSITIVE_KIND_SUBSTRING && kind != AV_SENSITIVE_KIND_PREFIX)
+    return -EINVAL;
+  if (path[0] != '/' || strlen(path) >= SENSITIVE_PATH_LEN)
+    return -EINVAL;
+
+  e = kmalloc(sizeof(*e), GFP_KERNEL);
+  if (!e)
+    return -ENOMEM;
+
+  e->kind = kind;
+  strscpy(e->path, path, sizeof(e->path));
+
+  mutex_lock(&sensitive_lock);
+  /* Reject a duplicate rather than silently double-adding (same
+   * reasoning as av_behavior_protect_add() and av_sigtable_add()).
+   * Dup check is keyed on path alone - the same path with two
+   * different kinds is still one logical needle, so refuse the
+   * second regardless of kind. Checked under the same lock as the
+   * insert below, no TOCTOU. */
+  hash_for_each_possible(sensitive_table, existing, node, sensitive_key(e->path)) {
+    if (!strcmp(existing->path, e->path)) {
+      mutex_unlock(&sensitive_lock);
+      kfree(e);
+      return -EEXIST;
+    }
+  }
+  hash_add(sensitive_table, &e->node, sensitive_key(e->path));
+  mutex_unlock(&sensitive_lock);
+
+  return 0;
+}
+
+int av_behavior_sensitive_del(const char *path) {
+  /* Same NULL-initializer workaround as hash_is_trusted() above. */
+  struct av_sensitive_entry *e = NULL;
+  int ret = -ENOENT;
+
+  mutex_lock(&sensitive_lock);
+  hash_for_each_possible(sensitive_table, e, node, sensitive_key(path)) {
+    if (!strcmp(e->path, path)) {
+      hash_del(&e->node);
+      kfree(e);
+      ret = 0;
+      break;
+    }
+  }
+  mutex_unlock(&sensitive_lock);
+  return ret;
+}
+
+static int sensitive_proc_show(struct seq_file *m, void *v) {
+  struct av_sensitive_entry *e;
+  int bkt;
+
+  mutex_lock(&sensitive_lock);
+  /* One entry per line: "<kind> <path>\n", where <kind> is the
+   * "substring"/"prefix" token accepted by sensitive_proc_write()
+   * below and by `avctl sensitive add ...`, so the output is a
+   * round-trip-able input for the write side too - same shape
+   * sig_proc_show()/trust_proc_show() use for their own save/load
+   * cycles. */
+  hash_for_each(sensitive_table, bkt, e, node) {
+    seq_printf(m, "%s %s\n",
+               e->kind == AV_SENSITIVE_KIND_PREFIX ? "prefix" : "substring",
+               e->path);
+  }
+  mutex_unlock(&sensitive_lock);
+  return 0;
+}
+
+static int sensitive_proc_open(struct inode *inode, struct file *file) {
+  return single_open(file, sensitive_proc_show, NULL);
+}
+
+/* "add <kind> <path>\n" / "del <path>\n", same *ppos+terminator write
+ * contract as protected_proc_write() above and daemon_policy_proc_
+ * write() in main.c (issue #57). Sized to accept a full PATH_MAX-1
+ * path with slack for the "add substring " (or "add prefix ") verb
+ * pair and the mandatory trailing terminator, so an oversized path is
+ * rejected at the size cap rather than silently truncated by a
+ * fixed-width sscanf() field - same reasoning as
+ * PROTECTED_WRITE_MAXLEN. */
+#define SENSITIVE_WRITE_MAXLEN (PATH_MAX + 32)
+
+/* Same const-parameter-callback false positive as protected_proc_write()
+ * above (proc_ops's fixed non-const loff_t * signature). */
+/* cppcheck-suppress constParameterCallback */
+static ssize_t sensitive_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
+  /* Same rationale as protected_proc_write()'s heap-allocated kbuf/
+   * path: PATH_MAX-scale buffers do not belong on the kernel stack;
+   * this handler runs in ordinary process context so GFP_KERNEL is
+   * fine. */
+  char *kbuf;
+  char cmd[8];
+  char *path;
+  int n;
+  ssize_t ret;
+
+  /* Same DAC-vs-capability gap as trust_proc_write() above. */
+  if (!capable(CAP_SYS_ADMIN))
+    return -EPERM;
+
+  /* Reject any write past a freshly-opened fd's *ppos == 0 - same
+   * chunked-write / terminator reasoning as protected_proc_write() and
+   * daemon_policy_proc_write(); the trailing-terminator check below is
+   * what actually closes the truncation gap, not the size cap alone. */
+  if (*ppos != 0)
+    return -EINVAL;
+
+  if (count >= SENSITIVE_WRITE_MAXLEN)
+    return -EINVAL;
+
+  kbuf = kmalloc(SENSITIVE_WRITE_MAXLEN, GFP_KERNEL);
+  path = kmalloc(PATH_MAX, GFP_KERNEL);
+  if (!kbuf || !path) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  if (copy_from_user(kbuf, ubuf, count)) {
+    ret = -EFAULT;
+    goto out;
+  }
+  kbuf[count] = '\0';
+
+  /* Reject embedded NULs - same class as sig_proc_write()/
+   * trust_proc_write()/protected_proc_write(): the strcspn()/strspn()/
+   * strlen()/sscanf() parsing below stops at the first NUL, so an
+   * "add substring /path\n\0garbage" would otherwise pass the trailing-
+   * newline check against a truncated prefix while the raw write
+   * neither ends in newline nor equals what was parsed. */
+  if (memchr(kbuf, '\0', count) != NULL) {
+    ret = -EINVAL;
+    goto out;
+  }
+
+  n = sscanf(kbuf, "%7s", cmd);
+  if (n < 1) {
+    ret = -EINVAL;
+    goto out;
+  }
+
+  {
+    char *rest = kbuf + strcspn(kbuf, " \t");
+    size_t rest_len;
+
+    rest += strspn(rest, " \t");
+    rest_len = strlen(rest);
+
+    /* Same mandatory-trailing-terminator rule as
+     * protected_proc_write() - see its comment for the full rationale
+     * (multi-chunk truncation detection, plus stripping a shell's
+     * `echo`-inserted '\n' so entries don't become permanently
+     * inert). An optional preceding '\r' is stripped too. */
+    if (rest_len == 0 || rest[rest_len - 1] != '\n') {
+      ret = -EINVAL;
+      goto out;
+    }
+    rest[--rest_len] = '\0';
+    if (rest_len > 0 && rest[rest_len - 1] == '\r')
+      rest[--rest_len] = '\0';
+
+    if (rest_len == 0) {
+      ret = -EINVAL;
+      goto out;
+    }
+
+    /* With only the trailing terminator stripped, an embedded '\n' (or
+     * '\r') earlier in rest would survive into the stored path. The
+     * mandatory-terminator rule above would still accept
+     * `add substring /tmp/a\nb\n`, and sensitive_proc_show() would then
+     * emit that one entry across two lines - which `avctl save`'s
+     * per-line sscanf drops the continuation of, so the save/load
+     * round-trip silently loses data (closes #85). An embedded NUL is
+     * already caught by the memchr() guard above; this is the matching
+     * guard for the other line terminators. */
+    if (strchr(rest, '\n') != NULL || strchr(rest, '\r') != NULL) {
+      ret = -EINVAL;
+      goto out;
+    }
+
+    if (!strcasecmp(cmd, "add")) {
+      /* "add" takes an extra kind token before the path. Parse
+       * <kind> off the front of `rest`, then re-strip whitespace so
+       * `path` starts at the actual path byte. Reject if `kind` isn't
+       * one of the two recognized tokens, if the path portion is
+       * missing or oversized - all rejections here are -EINVAL,
+       * distinct from av_behavior_sensitive_add()'s own -EEXIST for a
+       * duplicate. */
+      char kind_tok[16];
+      size_t kind_len;
+      int kind;
+
+      kind_len = strcspn(rest, " \t");
+      if (kind_len == 0 || kind_len >= sizeof(kind_tok)) {
+        ret = -EINVAL;
+        goto out;
+      }
+      memcpy(kind_tok, rest, kind_len);
+      kind_tok[kind_len] = '\0';
+
+      if (!strcasecmp(kind_tok, "substring"))
+        kind = AV_SENSITIVE_KIND_SUBSTRING;
+      else if (!strcasecmp(kind_tok, "prefix"))
+        kind = AV_SENSITIVE_KIND_PREFIX;
+      else {
+        ret = -EINVAL;
+        goto out;
+      }
+
+      rest += kind_len;
+      rest += strspn(rest, " \t");
+      rest_len = strlen(rest);
+
+      if (rest_len == 0 || rest_len >= PATH_MAX) {
+        ret = -EINVAL;
+        goto out;
+      }
+      strscpy(path, rest, PATH_MAX);
+
+      /* Propagate the real error - specifically -EEXIST for a
+       * duplicate add, -EINVAL for a malformed path - rather than
+       * flattening every failure to a single code, same reasoning as
+       * sig_proc_write()/protected_proc_write(). */
+      ret = av_behavior_sensitive_add(path, kind);
+      if (ret)
+        goto out;
+    } else if (!strcasecmp(cmd, "del")) {
+      /* "del" takes only a path (kind is not part of the key -
+       * paths are unique across kinds by construction, see the dup
+       * check in av_behavior_sensitive_add()). */
+      if (rest_len >= PATH_MAX) {
+        ret = -EINVAL;
+        goto out;
+      }
+      strscpy(path, rest, PATH_MAX);
+
+      /* cppcheck-suppress knownConditionTrueFalse
+       * Same false positive as av_behavior_trust_del()'s call site
+       * above - cppcheck cannot expand hash_for_each_possible()
+       * without full kernel headers. */
+      if (av_behavior_sensitive_del(path)) {
+        ret = -ENOENT;
+        goto out;
+      }
+    } else {
+      ret = -EINVAL;
+      goto out;
+    }
+  }
+
+  ret = count;
+out:
+  kfree(path);
+  kfree(kbuf);
+  return ret;
+}
+
+static const struct proc_ops sensitive_proc_ops = {
+    .proc_open = sensitive_proc_open,
+    .proc_read = seq_read,
+    .proc_write = sensitive_proc_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static struct proc_dir_entry *sensitive_proc_entry;
+
+int av_behavior_sensitive_proc_init(void) {
+  sensitive_proc_entry =
+      proc_create("kernel_av_sensitive", 0600, NULL, &sensitive_proc_ops);
+  if (!sensitive_proc_entry)
+    return -ENOMEM;
+  return 0;
+}
+
+void av_behavior_sensitive_proc_exit(void) { proc_remove(sensitive_proc_entry); }
+
+static void sensitive_table_destroy(void) {
+  struct av_sensitive_entry *e;
+  struct hlist_node *tmp;
+  int bkt;
+
+  mutex_lock(&sensitive_lock);
+  hash_for_each_safe(sensitive_table, bkt, tmp, e, node) {
+    hash_del(&e->node);
+    kfree(e);
+  }
+  mutex_unlock(&sensitive_lock);
+}
+
+/* Compile-time defaults seeded at av_behavior_init() time. Two roles:
+ *
+ * 1. Preserves the pre-#62 behavior for anyone loading this module
+ *    without ever writing to /proc/kernel_av_sensitive: the effective
+ *    list at insmod time is identical to what the old hardcoded arrays
+ *    produced, plus the additions from #62 (sudoers/gshadow/gnupg/
+ *    cloud creds) that were always in-scope for the same detection
+ *    class but simply hadn't been listed yet.
+ * 2. Documents the intent of each needle in one place, so an operator
+ *    reading `avctl sensitive list` sees WHY each entry is there.
+ *
+ * kind = AV_SENSITIVE_KIND_SUBSTRING is the default for
+ * home-directory-relative or already-anchored needles ("/etc/passwd",
+ * "/.ssh/") whose bounded-substring match cannot false-positive on a
+ * differently-suffixed path (see path_has_bounded_substring()'s
+ * comment). kind = AV_SENSITIVE_KIND_PREFIX is used for short common
+ * directory names ("/boot/", "/etc/ssh/", "/etc/sudoers.d/") where
+ * a bare substring match would fire on any unrelated path containing
+ * a directory literally named the same thing anywhere - same
+ * reasoning that moved "/boot/" out of the substring set originally.
+ *
+ * Duplicate entries here (should never happen - checked once by hand)
+ * are refused at seed time with a warning, not a fatal init failure:
+ * the module still comes up with the remaining entries loaded, same
+ * fail-soft-on-init-noise stance as the threshold-out-of-range checks
+ * in av_behavior_init() below. */
+struct sensitive_default {
+  const char *path;
+  int kind;
+};
+
+static const struct sensitive_default sensitive_defaults[] = {
+    /* --- Original pre-#62 entries --- */
+    { "/etc/passwd", AV_SENSITIVE_KIND_SUBSTRING },
+    { "/etc/shadow", AV_SENSITIVE_KIND_SUBSTRING },
+    { "/.ssh/",      AV_SENSITIVE_KIND_SUBSTRING },
+    { "/boot/",      AV_SENSITIVE_KIND_PREFIX    },
+
+    /* --- Added by #62 --- */
+
+    /* Group-password hashes: exact analogue of /etc/shadow. */
+    { "/etc/gshadow", AV_SENSITIVE_KIND_SUBSTRING },
+
+    /* Root-authority databases. /etc/sudoers itself is a fixed file
+     * (substring), /etc/sudoers.d/ is a directory whose entries all
+     * carry sudoers weight (prefix, not substring, so an unrelated
+     * path with "sudoers.d" as a component elsewhere doesn't fire). */
+    { "/etc/sudoers",    AV_SENSITIVE_KIND_SUBSTRING },
+    { "/etc/sudoers.d/", AV_SENSITIVE_KIND_PREFIX    },
+
+    /* shadow(5) rotates old copies with a trailing '-' - same
+     * contents as the live files, so worth flagging identically.
+     * These are separate entries rather than a "/etc/shadow*" glob
+     * because the bounded-substring matcher requires a '/' or end-
+     * of-string after the match, and '-' is neither - "/etc/shadow"
+     * on its own does NOT match "/etc/shadow-". Same reasoning for
+     * /etc/passwd- and /etc/gshadow-. */
+    { "/etc/shadow-",  AV_SENSITIVE_KIND_SUBSTRING },
+    { "/etc/passwd-",  AV_SENSITIVE_KIND_SUBSTRING },
+    { "/etc/gshadow-", AV_SENSITIVE_KIND_SUBSTRING },
+
+    /* User-level long-lived key/credential material - same shape as
+     * the existing "/.ssh/" entry, matching under any home dir. */
+    { "/.gnupg/",        AV_SENSITIVE_KIND_SUBSTRING },
+    { "/.aws/",          AV_SENSITIVE_KIND_SUBSTRING },
+    { "/.config/gcloud/", AV_SENSITIVE_KIND_SUBSTRING },
+    { "/.kube/",         AV_SENSITIVE_KIND_SUBSTRING },
+
+    /* System-level ssh: host keys and sshd configuration. Distinct
+     * from the "/.ssh/" user-level entry above - prefix rather than
+     * substring for the same reason /boot/ was moved out of the
+     * substring set: "ssh" as a bare substring fires far too widely
+     * (any path with an "ssh" component anywhere). */
+    { "/etc/ssh/", AV_SENSITIVE_KIND_PREFIX },
+};
+
+#define NUM_SENSITIVE_DEFAULTS ARRAY_SIZE(sensitive_defaults)
+
+static void sensitive_seed_defaults(void) {
+  size_t i;
+
+  for (i = 0; i < NUM_SENSITIVE_DEFAULTS; i++) {
+    int ret = av_behavior_sensitive_add(sensitive_defaults[i].path,
+                                        sensitive_defaults[i].kind);
+    if (ret)
+      pr_warn("kernel-av: could not seed sensitive default \"%s\": %d\n",
+              sensitive_defaults[i].path, ret);
+  }
+}
+
+/* Read-only /proc/kernel_av_sensitive_defaults: exposes the compile-
+ * time default set in the same `<kind> <path>\n` format
+ * sensitive_proc_show() uses for the live table, so `avctl save` can
+ * compare "defaults" vs. "live" and emit `sensitive del <path>` lines
+ * for every default an operator has deleted - carrying the delete
+ * across a save -> module reload -> load cycle (sensitive_seed_
+ * defaults() reseeds on every init) that would otherwise silently
+ * resurrect it (closes #86). The content is literally compile-time
+ * constants - no runtime state, no mutex - but we keep it 0400 to
+ * match the rest of the av/ /proc namespace rather than exposing it
+ * to unprivileged readers for no reason. */
+static int sensitive_defaults_proc_show(struct seq_file *m, void *v) {
+  size_t i;
+
+  for (i = 0; i < NUM_SENSITIVE_DEFAULTS; i++) {
+    seq_printf(m, "%s %s\n",
+               sensitive_defaults[i].kind == AV_SENSITIVE_KIND_PREFIX
+                   ? "prefix"
+                   : "substring",
+               sensitive_defaults[i].path);
+  }
+  return 0;
+}
+
+static int sensitive_defaults_proc_open(struct inode *inode, struct file *file) {
+  return single_open(file, sensitive_defaults_proc_show, NULL);
+}
+
+static const struct proc_ops sensitive_defaults_proc_ops = {
+    .proc_open = sensitive_defaults_proc_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static struct proc_dir_entry *sensitive_defaults_proc_entry;
+
+static int sensitive_defaults_proc_init(void) {
+  sensitive_defaults_proc_entry = proc_create(
+      "kernel_av_sensitive_defaults", 0400, NULL,
+      &sensitive_defaults_proc_ops);
+  if (!sensitive_defaults_proc_entry)
+    return -ENOMEM;
+  return 0;
+}
+
+static void sensitive_defaults_proc_exit(void) {
+  proc_remove(sensitive_defaults_proc_entry);
+}
+
 /* Returns the raw key for hash_add()/hash_for_each_possible() to hash
  * themselves via hash_min() - same convention as hex_key() above.
  * Previously pre-hashed with hash_32(pid, BEHAVIOR_BITS), which already
@@ -1206,20 +1669,39 @@ static bool path_has_bounded_substring(const char *path, const char *needle) {
 }
 
 static bool path_is_sensitive(const char *path) {
-  size_t i;
+  /* Same NULL-initializer workaround as hash_is_trusted() above. */
+  struct av_sensitive_entry *e = NULL;
+  bool sensitive = false;
+  int bkt;
 
-  for (i = 0; i < NUM_SENSITIVE_PREFIXES; i++) {
-    size_t len = strlen(sensitive_path_prefixes[i]);
-
-    if (!strncmp(path, sensitive_path_prefixes[i], len))
-      return true;
+  /* Walks every entry regardless of bucket: the match against a
+   * needle is not a hash lookup of an exact path but a substring/
+   * prefix scan against the caller's path, so bucketed hash lookup
+   * on the entry's own key doesn't help - it would only pick out
+   * duplicates of the caller's path itself, not entries the caller's
+   * path CONTAINS or STARTS WITH. Cost is O(entries), same class as
+   * the old two-array scan; TRUST_BITS gives 256 buckets over the
+   * ~15 seeded defaults plus whatever the operator adds, so even
+   * a nontrivial deployment fits well inside the sub-microsecond
+   * budget every caller here already sits in. */
+  mutex_lock(&sensitive_lock);
+  hash_for_each(sensitive_table, bkt, e, node) {
+    if (e->kind == AV_SENSITIVE_KIND_PREFIX) {
+      size_t len = strlen(e->path);
+      if (!strncmp(path, e->path, len)) {
+        sensitive = true;
+        break;
+      }
+    } else {
+      /* AV_SENSITIVE_KIND_SUBSTRING */
+      if (path_has_bounded_substring(path, e->path)) {
+        sensitive = true;
+        break;
+      }
+    }
   }
-
-  for (i = 0; i < NUM_SENSITIVE_SUBSTRINGS; i++) {
-    if (path_has_bounded_substring(path, sensitive_path_substrings[i]))
-      return true;
-  }
-  return false;
+  mutex_unlock(&sensitive_lock);
+  return sensitive;
 }
 
 static const char *path_basename(const char *path) {
@@ -1750,6 +2232,7 @@ int av_behavior_init(void) {
   hash_init(behavior_table);
   hash_init(trust_table);
   hash_init(protected_table);
+  hash_init(sensitive_table);
 
   ret = av_behavior_trust_proc_init();
   if (ret)
@@ -1761,8 +2244,36 @@ int av_behavior_init(void) {
     return ret;
   }
 
+  ret = av_behavior_sensitive_proc_init();
+  if (ret) {
+    av_behavior_protect_proc_exit();
+    av_behavior_trust_proc_exit();
+    return ret;
+  }
+
+  ret = sensitive_defaults_proc_init();
+  if (ret) {
+    av_behavior_sensitive_proc_exit();
+    av_behavior_protect_proc_exit();
+    av_behavior_trust_proc_exit();
+    return ret;
+  }
+
+  /* Seeded AFTER the /proc entry exists so an operator racing to
+   * `avctl sensitive list` right at insmod cannot observe an empty
+   * list. sensitive_seed_defaults() only issues per-entry warnings on
+   * failure (see its comment) and never returns an error, so init
+   * itself cannot fail here. */
+  sensitive_seed_defaults();
+
   behavior_gc_wq = alloc_workqueue("kernel_av_behavior_gc", WQ_UNBOUND, 0);
   if (!behavior_gc_wq) {
+    /* Cleanup mirrors the init order above in reverse: the sensitive
+     * table's own entries are freed by sensitive_table_destroy() so a
+     * seeded-then-init-failed path doesn't leak them. */
+    sensitive_defaults_proc_exit();
+    av_behavior_sensitive_proc_exit();
+    sensitive_table_destroy();
     av_behavior_protect_proc_exit();
     av_behavior_trust_proc_exit();
     return -ENOMEM;
@@ -1794,6 +2305,9 @@ void av_behavior_exit(void) {
   }
   mutex_unlock(&behavior_lock);
 
+  sensitive_defaults_proc_exit();
+  av_behavior_sensitive_proc_exit();
+  sensitive_table_destroy();
   av_behavior_protect_proc_exit();
   protected_table_destroy();
   av_behavior_trust_proc_exit();
