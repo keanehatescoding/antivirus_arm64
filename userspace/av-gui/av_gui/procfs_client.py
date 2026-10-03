@@ -8,6 +8,7 @@ here as ProcfsError) and only the 0644 daemon-policy entry stays
 world-readable. See docs/avd-socket-protocol.md's note on why the GUI
 reuses this format instead of adding a second read protocol.
 """
+import os
 import subprocess
 
 from . import avctl_path, host_exec
@@ -26,28 +27,32 @@ def read_state():
     (list of {hash, name}), protected (list of path strings), policy
     (str, "fail-open"/"fail-closed", or None if unavailable)."""
     try:
+        # Capture raw bytes: os.fsdecode below preserves non-UTF-8 names
+        # without replacement characters, and skipping text= avoids the
+        # universal-newline conversion that would turn a literal \r or
+        # \r\n inside a filename into the protocol's record separator.
         result = subprocess.run(
             host_exec.host_argv(
                 [avctl_path.resolve_unprivileged_avctl_path(), "save", "-"]
             ),
-            capture_output=True, text=True, timeout=10, check=False,
-            # os.fsdecode parity: never fail the whole read on a
-            # non-UTF-8 name, and never mangle distinct byte sequences
-            # into the same U+FFFD (see avd_client._request below).
-            errors="surrogateescape",
+            capture_output=True, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ProcfsError(f"could not run avctl: {exc}") from exc
 
     if result.returncode != 0:
-        raise ProcfsError(result.stderr.strip() or "avctl save - failed")
+        raise ProcfsError(os.fsdecode(result.stderr).strip() or "avctl save - failed")
 
     signatures = []
     trust = []
     protected = []
     policy = None
 
-    for line in result.stdout.splitlines():
+    # Split only on the protocol's LF. str.splitlines() also treats legal
+    # filename codepoints (\r, \v, \f, \x1c-\x1e, \x85, U+2028, U+2029,
+    # lone surrogates) as record boundaries, which silently drops the
+    # remainder of any record whose name contains one (issue #80).
+    for line in os.fsdecode(result.stdout).split("\n"):
         if not line or line.startswith("#"):
             continue
         if line.startswith("sig add "):
