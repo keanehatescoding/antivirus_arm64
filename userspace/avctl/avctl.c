@@ -1334,6 +1334,24 @@ static int do_load(const char *path)
         } else if (!strncmp(line, "sensitive ", 10)) {
             rest = line + 10;
             ret = write_command_to(SENSITIVE_PROC_PATH, rest);
+            /* Symmetric to the -EEXIST-is-benign case below: a
+             * `sensitive del <path>` whose target is already absent
+             * leaves the kernel in exactly the state the load file
+             * is asking for. This matters because save emits a
+             * `sensitive del` for every seeded default the operator
+             * pruned (see #86 and the default-walk in do_save()), so
+             * replaying the same file twice - or replaying it onto
+             * a module whose compiled-in defaults have since changed
+             * - would otherwise count the second run's dels as
+             * errors even though the resulting state matches. Scoped
+             * to sensitive-del specifically rather than normalized
+             * for every table: a `sig del`/`trust del`/`protect del`
+             * that hits -ENOENT points at a hand-edited load file
+             * out of sync with reality, and surfacing that is the
+             * right default - this case only exists because save
+             * itself emits del lines, which only sensitive does. */
+            if (ret == -ENOENT && !strncmp(rest, "del ", 4))
+                ret = -EEXIST;
         } else if (!strncmp(line, "policy ", 7)) {
             rest = line + 7;
             ret = write_command_to(POLICY_PROC_PATH, rest);
@@ -1350,8 +1368,13 @@ static int do_load(const char *path)
             /* Expected on a re-load: the module always seeds the
              * default EICAR test signature at insmod time, so
              * replaying a save file taken after that seed will hit
-             * this for that one entry specifically. Not a failure. */
-            printf("already present, skipping: %s\n", rest);
+             * this for that one entry specifically. Also the shape
+             * the sensitive-table branch above normalizes -ENOENT
+             * into for its own del lines - a del whose target is
+             * already absent leaves the kernel in the state the
+             * load is asking for, no different from an add whose
+             * target is already present. Not a failure either way. */
+            printf("already in desired state, skipping: %s\n", rest);
             skipped++;
         } else if (ret) {
             fprintf(stderr, "avctl: load: failed on line: %s\n", line);
