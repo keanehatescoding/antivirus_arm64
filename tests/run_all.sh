@@ -59,7 +59,7 @@ echo "### test_regression_10_14.sh (static checks pinning the #10/#14 fixes) ###
 "$REPO_ROOT/tests/test_regression_10_14.sh" || FAIL=1
 
 echo
-echo "### test_sensitive_proc.sh (static checks pinning the #85 fixes) ###"
+echo "### test_sensitive_proc.sh (static checks pinning the #85/#86 fixes) ###"
 # Same no-root-needed reasoning as test_regression_10_14.sh above -
 # pure source-level greps, no module, no VM.
 "$REPO_ROOT/tests/test_sensitive_proc.sh" || FAIL=1

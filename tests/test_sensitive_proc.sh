@@ -2,10 +2,12 @@
 #
 # tests/test_sensitive_proc.sh - static regression checks pinning the
 # fixes for #85 (do_load() buffer sized for the longest `sensitive add`
-# line; sensitive_proc_write() rejects embedded line terminators).
-# Extended by #86 (`avctl save` emits `sensitive del` lines so
-# default-entry deletions survive a save -> module reload -> load
-# cycle) once that lands.
+# line; sensitive_proc_write() rejects embedded line terminators) and
+# #86 (`avctl save` emits `sensitive del` lines for default entries an
+# operator deleted at runtime, so those deletions survive a save ->
+# module reload -> load cycle instead of silently resurrecting on the
+# reseed; the kernel exposes the compile-time default set via a new
+# read-only /proc/kernel_av_sensitive_defaults so save can diff).
 #
 # Pure source-level greps, so unlike most of tests/ this needs no
 # root, no ARM64 VM, and no loaded module:
@@ -87,6 +89,57 @@ if [ -n "$STRCHR_LINE" ] && [ -n "$ADD_BRANCH_LINE" ] && [ "$STRCHR_LINE" -lt "$
     pass "embedded-terminator reject precedes the add/del dispatch"
 else
     fail "embedded-terminator reject is not positioned before add/del"
+fi
+
+# --- #86: kernel exposes compile-time defaults via a new /proc entry ---
+
+section "#86: /proc/kernel_av_sensitive_defaults is registered RO"
+
+# proc_create() for the defaults list has to use the exact name
+# `kernel_av_sensitive_defaults` (do_save() reads it by that path) and
+# mode 0400 (read-only - the entry exposes compile-time constants, no
+# runtime management writes, unlike the 0600 sibling kernel_av_
+# sensitive / _trusted / _protected entries). A regression that
+# renamed the file, dropped the init call, or widened the mode to
+# 0444/0600 would be caught here before anything insmods the module.
+# The name/mode may wrap onto a second line after the `proc_create(`
+# token, so lines are joined for the match (same technique the lint
+# comment-stripper in .github/workflows/lint.yml uses).
+BEHAVIOR_JOINED="$(tr '\n' ' ' < "$BEHAVIOR")"
+if echo "$BEHAVIOR_JOINED" | \
+   grep -qE 'proc_create\([[:space:]]*"kernel_av_sensitive_defaults",[[:space:]]+0400[[:space:]]*,'; then
+    pass "proc_create() names the defaults file \"kernel_av_sensitive_defaults\" with mode 0400"
+else
+    fail "defaults proc entry is missing, misnamed, or has the wrong mode"
+fi
+
+# --- #86: do_save() reads defaults and emits del lines before adds ---
+
+section "#86: do_save() diffs defaults vs. live and emits del before add"
+
+SAVE_BODY="$(extract_c_func "$AVCTL" do_save)"
+
+# The diff only works if save actually opens the defaults file. Scoped
+# to do_save()'s body so the SENSITIVE_DEFAULTS_PROC_PATH macro
+# definition at the top of the file does not satisfy this on its own.
+if echo "$SAVE_BODY" | grep -q 'open_proc_read(SENSITIVE_DEFAULTS_PROC_PATH)'; then
+    pass "do_save() reads SENSITIVE_DEFAULTS_PROC_PATH"
+else
+    fail "do_save() does not read SENSITIVE_DEFAULTS_PROC_PATH"
+fi
+
+# `sensitive del` MUST be printed before `sensitive add` in the dump:
+# load replays sequentially against the freshly-reseeded kernel state,
+# so emitting an add first and then a del of the same path would just
+# undo the add. Both prints live inside do_save() so this check is
+# scoped to its body, not the whole file (which also has do_sensitive()
+# with its own `del` string).
+DEL_LINE="$(echo "$SAVE_BODY" | grep -n '"sensitive del %s' | head -1 | cut -d: -f1)"
+ADD_LINE="$(echo "$SAVE_BODY" | grep -n '"sensitive add %s' | head -1 | cut -d: -f1)"
+if [ -n "$DEL_LINE" ] && [ -n "$ADD_LINE" ] && [ "$DEL_LINE" -lt "$ADD_LINE" ]; then
+    pass "do_save() emits \`sensitive del\` before \`sensitive add\`"
+else
+    fail "do_save() emits \`sensitive del\` after (or does not emit it before) \`sensitive add\`"
 fi
 
 echo

@@ -63,6 +63,13 @@
 #define TRUST_PROC_PATH "/proc/kernel_av_trusted"
 #define PROTECTED_PROC_PATH "/proc/kernel_av_protected"
 #define SENSITIVE_PROC_PATH "/proc/kernel_av_sensitive"
+/* Read-only sibling of SENSITIVE_PROC_PATH that lists the kernel's
+ * compile-time default set in the same `<kind> <path>\n` shape - used
+ * by do_save() to detect default entries an operator has deleted and
+ * emit replayable `sensitive del` lines for them, which otherwise
+ * silently resurrect on the next module reload because
+ * sensitive_seed_defaults() reseeds unconditionally (closes #86). */
+#define SENSITIVE_DEFAULTS_PROC_PATH "/proc/kernel_av_sensitive_defaults"
 #define POLICY_PROC_PATH "/proc/kernel_av_daemon_policy"
 
 /* Matches avd's own DEFAULT_CONTROL_SOCK_PATH (userspace/avd/avd.c) -
@@ -836,27 +843,137 @@ static int do_save(const char *path)
     }
     fclose(in);
 
-    in = open_proc_read(SENSITIVE_PROC_PATH);
-    if (!in) {
-        save_abort(out, &dest, tmp_path, to_stdout);
-        return 1;
-    }
+    /* #86: diff the kernel's compile-time default set against the live
+     * table and emit a `sensitive del <path>\n` for every default an
+     * operator has deleted at runtime, BEFORE emitting the add block
+     * that replays live state. sensitive_seed_defaults() reseeds the
+     * full default set on every module init, so without this diff a
+     * save -> module reload -> load cycle silently resurrects every
+     * deleted default. Dels run first so load applies the correction
+     * against the fresh (reseeded) kernel state and then layers the
+     * operator's own live set on top. */
+    {
+        char **def_paths = NULL;
+        size_t n_defs = 0, cap_defs = 0;
+        char (*live_kinds)[16] = NULL;
+        char (*live_paths)[PATH_MAX] = NULL;
+        size_t n_live = 0, cap_live = 0;
+        size_t i, j;
+        int sens_err = 0;
 
-    while (fgets(line, sizeof(line), in)) {
-        char kind[16];
-        char spath[PATH_MAX + 8];
+        in = open_proc_read(SENSITIVE_DEFAULTS_PROC_PATH);
+        if (!in) {
+            save_abort(out, &dest, tmp_path, to_stdout);
+            return 1;
+        }
+        while (fgets(line, sizeof(line), in)) {
+            char dkind[16];
+            char dpath[PATH_MAX];
 
-        /* Kernel side (sensitive_proc_show()) prints `<kind> <path>\n`
-         * with a single space; parse them apart so save emits the
-         * replayable `sensitive add <kind> <path>` shape that
-         * do_load()/do_sensitive() expect. Field widths track the
-         * receive buffers, one shorter to leave room for the NUL. */
-        if (sscanf(line, "%15s %4103[^\n]", kind, spath) == 2) {
-            werr |= fprintf(out, "sensitive add %s %s\n", kind, spath) < 0;
+            /* Same `<kind> %<PATH_MAX-1>[^\n]` shape sensitive_proc_show()
+             * uses for the live table - kernel-side defaults share the
+             * same show helper. We only need dpath for the diff; kinds
+             * are not stored because `sensitive del` is keyed on path
+             * alone. */
+            if (sscanf(line, "%15s %4095[^\n]", dkind, dpath) != 2)
+                continue;
+            if (n_defs == cap_defs) {
+                size_t grow = cap_defs ? cap_defs * 2 : 16;
+                char **g = realloc(def_paths, grow * sizeof(*def_paths));
+
+                if (!g) {
+                    sens_err = 1;
+                    break;
+                }
+                def_paths = g;
+                cap_defs = grow;
+            }
+            def_paths[n_defs] = strdup(dpath);
+            if (!def_paths[n_defs]) {
+                sens_err = 1;
+                break;
+            }
+            n_defs++;
+        }
+        fclose(in);
+        if (sens_err)
+            goto sens_cleanup;
+
+        in = open_proc_read(SENSITIVE_PROC_PATH);
+        if (!in) {
+            sens_err = 1;
+            goto sens_cleanup;
+        }
+        while (fgets(line, sizeof(line), in)) {
+            char lkind[16];
+            char lpath[PATH_MAX];
+
+            if (sscanf(line, "%15s %4095[^\n]", lkind, lpath) != 2)
+                continue;
+            if (n_live == cap_live) {
+                size_t grow = cap_live ? cap_live * 2 : 16;
+                void *gk = realloc(live_kinds, grow * sizeof(*live_kinds));
+                void *gp;
+
+                if (!gk) {
+                    sens_err = 1;
+                    break;
+                }
+                live_kinds = gk;
+                gp = realloc(live_paths, grow * sizeof(*live_paths));
+                if (!gp) {
+                    sens_err = 1;
+                    break;
+                }
+                live_paths = gp;
+                cap_live = grow;
+            }
+            memcpy(live_kinds[n_live], lkind, sizeof(lkind));
+            memcpy(live_paths[n_live], lpath, sizeof(lpath));
+            n_live++;
+        }
+        fclose(in);
+        if (sens_err)
+            goto sens_cleanup;
+
+        /* Dels first: every default whose path is absent from live.
+         * O(n_defs * n_live) linear scan is fine - n_defs is a short
+         * compile-time list on the kernel side. */
+        for (i = 0; i < n_defs; i++) {
+            int present = 0;
+
+            for (j = 0; j < n_live; j++) {
+                if (!strcmp(def_paths[i], live_paths[j])) {
+                    present = 1;
+                    break;
+                }
+            }
+            if (!present)
+                werr |= fprintf(out, "sensitive del %s\n", def_paths[i]) < 0;
+        }
+
+        /* Adds: every live entry, same shape do_load()/do_sensitive()
+         * expect. Kinds come from the kernel side so we trust them as
+         * printed. */
+        for (i = 0; i < n_live; i++) {
+            werr |= fprintf(out, "sensitive add %s %s\n",
+                            live_kinds[i], live_paths[i]) < 0;
             sensitive_count++;
         }
+
+sens_cleanup:
+        for (i = 0; i < n_defs; i++)
+            free(def_paths[i]);
+        free(def_paths);
+        free(live_kinds);
+        free(live_paths);
+        if (sens_err) {
+            fprintf(stderr,
+                    "avctl: could not read sensitive state for save\n");
+            save_abort(out, &dest, tmp_path, to_stdout);
+            return 1;
+        }
     }
-    fclose(in);
 
     in = open_proc_read(POLICY_PROC_PATH);
     if (!in) {

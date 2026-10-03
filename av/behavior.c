@@ -1473,6 +1473,56 @@ static void sensitive_seed_defaults(void) {
   }
 }
 
+/* Read-only /proc/kernel_av_sensitive_defaults: exposes the compile-
+ * time default set in the same `<kind> <path>\n` format
+ * sensitive_proc_show() uses for the live table, so `avctl save` can
+ * compare "defaults" vs. "live" and emit `sensitive del <path>` lines
+ * for every default an operator has deleted - carrying the delete
+ * across a save -> module reload -> load cycle (sensitive_seed_
+ * defaults() reseeds on every init) that would otherwise silently
+ * resurrect it (closes #86). The content is literally compile-time
+ * constants - no runtime state, no mutex - but we keep it 0400 to
+ * match the rest of the av/ /proc namespace rather than exposing it
+ * to unprivileged readers for no reason. */
+static int sensitive_defaults_proc_show(struct seq_file *m, void *v) {
+  size_t i;
+
+  for (i = 0; i < NUM_SENSITIVE_DEFAULTS; i++) {
+    seq_printf(m, "%s %s\n",
+               sensitive_defaults[i].kind == AV_SENSITIVE_KIND_PREFIX
+                   ? "prefix"
+                   : "substring",
+               sensitive_defaults[i].path);
+  }
+  return 0;
+}
+
+static int sensitive_defaults_proc_open(struct inode *inode, struct file *file) {
+  return single_open(file, sensitive_defaults_proc_show, NULL);
+}
+
+static const struct proc_ops sensitive_defaults_proc_ops = {
+    .proc_open = sensitive_defaults_proc_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static struct proc_dir_entry *sensitive_defaults_proc_entry;
+
+static int sensitive_defaults_proc_init(void) {
+  sensitive_defaults_proc_entry = proc_create(
+      "kernel_av_sensitive_defaults", 0400, NULL,
+      &sensitive_defaults_proc_ops);
+  if (!sensitive_defaults_proc_entry)
+    return -ENOMEM;
+  return 0;
+}
+
+static void sensitive_defaults_proc_exit(void) {
+  proc_remove(sensitive_defaults_proc_entry);
+}
+
 /* Returns the raw key for hash_add()/hash_for_each_possible() to hash
  * themselves via hash_min() - same convention as hex_key() above.
  * Previously pre-hashed with hash_32(pid, BEHAVIOR_BITS), which already
@@ -2201,6 +2251,14 @@ int av_behavior_init(void) {
     return ret;
   }
 
+  ret = sensitive_defaults_proc_init();
+  if (ret) {
+    av_behavior_sensitive_proc_exit();
+    av_behavior_protect_proc_exit();
+    av_behavior_trust_proc_exit();
+    return ret;
+  }
+
   /* Seeded AFTER the /proc entry exists so an operator racing to
    * `avctl sensitive list` right at insmod cannot observe an empty
    * list. sensitive_seed_defaults() only issues per-entry warnings on
@@ -2213,6 +2271,7 @@ int av_behavior_init(void) {
     /* Cleanup mirrors the init order above in reverse: the sensitive
      * table's own entries are freed by sensitive_table_destroy() so a
      * seeded-then-init-failed path doesn't leak them. */
+    sensitive_defaults_proc_exit();
     av_behavior_sensitive_proc_exit();
     sensitive_table_destroy();
     av_behavior_protect_proc_exit();
@@ -2246,6 +2305,7 @@ void av_behavior_exit(void) {
   }
   mutex_unlock(&behavior_lock);
 
+  sensitive_defaults_proc_exit();
   av_behavior_sensitive_proc_exit();
   sensitive_table_destroy();
   av_behavior_protect_proc_exit();
