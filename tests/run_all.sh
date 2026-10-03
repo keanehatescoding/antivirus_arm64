@@ -59,6 +59,12 @@ echo "### test_regression_10_14.sh (static checks pinning the #10/#14 fixes) ###
 "$REPO_ROOT/tests/test_regression_10_14.sh" || FAIL=1
 
 echo
+echo "### test_sensitive_proc.sh (static checks pinning the #85 fixes) ###"
+# Same no-root-needed reasoning as test_regression_10_14.sh above -
+# pure source-level greps, no module, no VM.
+"$REPO_ROOT/tests/test_sensitive_proc.sh" || FAIL=1
+
+echo
 echo "### test_fanotify_exec_gate.sh (avd's exec gate for #2's two gaps) ###"
 # Half static greps (no root) and half a live FAN_OPEN_EXEC_PERM
 # harness (root). It self-elevates the live half via pkexec when this

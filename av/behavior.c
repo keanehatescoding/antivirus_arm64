@@ -1259,6 +1259,20 @@ static ssize_t sensitive_proc_write(struct file *file, const char __user *ubuf, 
       goto out;
     }
 
+    /* With only the trailing terminator stripped, an embedded '\n' (or
+     * '\r') earlier in rest would survive into the stored path. The
+     * mandatory-terminator rule above would still accept
+     * `add substring /tmp/a\nb\n`, and sensitive_proc_show() would then
+     * emit that one entry across two lines - which `avctl save`'s
+     * per-line sscanf drops the continuation of, so the save/load
+     * round-trip silently loses data (closes #85). An embedded NUL is
+     * already caught by the memchr() guard above; this is the matching
+     * guard for the other line terminators. */
+    if (strchr(rest, '\n') != NULL || strchr(rest, '\r') != NULL) {
+      ret = -EINVAL;
+      goto out;
+    }
+
     if (!strcasecmp(cmd, "add")) {
       /* "add" takes an extra kind token before the path. Parse
        * <kind> off the front of `rest`, then re-strip whitespace so

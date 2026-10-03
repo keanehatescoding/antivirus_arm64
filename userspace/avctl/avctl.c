@@ -1138,7 +1138,14 @@ static int open_load_file(const char *path)
 
 static int do_load(const char *path)
 {
-    char line[PATH_MAX + 16];
+    /* Sized to the longest line do_save() can emit, which is
+     * `sensitive add substring <path>\n` - 24 bytes of prefix plus a
+     * PATH_MAX-1 path and the newline (closes #85). The shorter
+     * `sig `/`trust `/`protect `/`policy ` prefixes all fit the same
+     * buffer with room to spare, and this matches SENSITIVE_WRITE_MAXLEN
+     * on the kernel side so an entry the kernel is willing to accept
+     * can always be read back here as one fgets() line. */
+    char line[PATH_MAX + 32];
     int loaded = 0, skipped = 0, errors = 0;
     int load_fd;
     FILE *f;
