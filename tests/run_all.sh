@@ -72,6 +72,13 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT/userspace/av-gui" \
     -p test_avd_client.py || FAIL=1
 
 echo
+echo "### test_procfs_client.py (GUI procfs_client filename mangling, #80) ###"
+# Pure Python, unit-only: subprocess-mocked avctl, no root, no module.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT/userspace/av-gui" \
+    python3 -m unittest discover -s "$REPO_ROOT/userspace/av-gui/tests" \
+    -p test_procfs_client.py || FAIL=1
+
+echo
 echo "### test_fanotify_exec_gate.sh (avd's exec gate for #2's two gaps) ###"
 # Half static greps (no root) and half a live FAN_OPEN_EXEC_PERM
 # harness (root). It self-elevates the live half via pkexec when this
