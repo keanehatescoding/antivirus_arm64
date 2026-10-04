@@ -51,6 +51,12 @@ jobs:
           mapfile -t SHFILES < <(git ls-files '*.sh' '.githooks/pre-commit' '.githooks/pre-push')
           shellcheck "${SHFILES[@]}"
 
+      - name: GUI avd_client regression tests (#79)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=userspace/av-gui \
+            python3 -m unittest discover -s userspace/av-gui/tests \
+            -p test_avd_client.py -v
+
       - name: cppcheck av/ (kernel module)
         run: |
           cppcheck --quiet --enable=warning,style,performance \
