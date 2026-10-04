@@ -71,7 +71,8 @@ fi
 section "#10: IOC /proc entries are 0600"
 for entry in "kernel_av_signatures:$SIGTABLE" \
              "kernel_av_trusted:$BEHAVIOR" \
-             "kernel_av_protected:$BEHAVIOR"; do
+             "kernel_av_protected:$BEHAVIOR" \
+             "kernel_av_sensitive:$BEHAVIOR"; do
     name="${entry%%:*}"
     file="${entry##*:}"
     if grep -q "proc_create(\"$name\", 0600" "$file"; then
