@@ -9,6 +9,7 @@ GUI process even if we sent them directly.
 """
 import os
 import socket
+import time
 
 DEFAULT_SOCK_PATH = "/run/avd/control.sock"
 # avd bounds a control connection's idle wait for its request line to
@@ -85,7 +86,16 @@ def _request(cmd):
             sock.shutdown(socket.SHUT_WR)
             chunks = []
             total = 0
+            # A per-recv timeout alone resets after each arriving chunk,
+            # so a trickling peer can block the GTK main loop indefinitely
+            # (issue #79). Like avctl, budget the entire response from
+            # request completion.
+            deadline = time.monotonic() + SOCKET_TIMEOUT_SECS
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AvdError("avd control response timed out")
+                sock.settimeout(remaining)
                 chunk = sock.recv(65536)
                 if not chunk:
                     break

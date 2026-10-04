@@ -117,7 +117,7 @@ not a path, must not contain `/`.
 
 Gated **per command, not per connection** - the kernel's IOC `/proc`
 entries (`kernel_av_signatures`, `kernel_av_trusted`,
-`kernel_av_protected`) are `0600` owner-only reads with writes
+`kernel_av_protected`, `kernel_av_sensitive`) are `0600` owner-only reads with writes
 additionally checked against `CAP_SYS_ADMIN`, so this socket stays
 reachable by any peer and enforces its own per-command rules
 instead of relying on two sockets with two different modes. Right

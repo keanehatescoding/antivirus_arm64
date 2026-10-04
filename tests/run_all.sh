@@ -59,6 +59,19 @@ echo "### test_regression_10_14.sh (static checks pinning the #10/#14 fixes) ###
 "$REPO_ROOT/tests/test_regression_10_14.sh" || FAIL=1
 
 echo
+echo "### test_sensitive_proc.sh (static checks pinning the #85/#86 fixes) ###"
+# Same no-root-needed reasoning as test_regression_10_14.sh above -
+# pure source-level greps, no module, no VM.
+"$REPO_ROOT/tests/test_sensitive_proc.sh" || FAIL=1
+
+echo
+echo "### test_avd_client.py (GUI avd_client trickle-timeout, #79) ###"
+# Pure Python, unit-only: mock AF_UNIX peer, no root, no module, no GTK.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT/userspace/av-gui" \
+    python3 -m unittest discover -s "$REPO_ROOT/userspace/av-gui/tests" \
+    -p test_avd_client.py || FAIL=1
+
+echo
 echo "### test_procfs_client.py (GUI procfs_client filename mangling, #80) ###"
 # Pure Python, unit-only: subprocess-mocked avctl, no root, no module.
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT/userspace/av-gui" \
