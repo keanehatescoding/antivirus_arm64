@@ -85,11 +85,15 @@ See the wiki's **Building and Running**, **avd Daemon**, **avctl CLI**, and
 `DESTDIR`), the systemd unit's security model, and the Flatpak/AppImage
 builds.
 
-`avd` can additionally run a fanotify `FAN_OPEN_EXEC_PERM` exec gate, which
+`avd` additionally runs a fanotify `FAN_OPEN_EXEC_PERM` exec gate, which
 scans the kernel-supplied fd instead of a pathname and so closes the kprobe
-path's TOCTOU/cold-page gaps on the mounts it covers. It is **off by
-default** and opt-in per deployment — see the wiki's **Fanotify Exec Gate**
-page for its tunables and for what fail-closed does and doesn't cover.
+path's TOCTOU/cold-page gaps on the mounts it covers. The gate is **on by
+default** and activates as soon as `AVD_FANOTIFY_MARK=<mountpoint>[:...]`
+names at least one mount (no default mark set — marking a mount suspends
+every exec on it until `avd` answers, so the scope is yours to pick);
+`AVD_FANOTIFY_EXEC=0` disables it entirely. See the wiki's **Fanotify Exec
+Gate** page for its tunables and for what fail-closed does and doesn't
+cover.
 
 ## Testing
 
@@ -129,7 +133,7 @@ still a known gap).
 **Design**
 - [Architecture](../../wiki/Architecture) — kernel vs. userspace split, the two exec paths, kernel taint checks
 - [Kernel Module](../../wiki/Kernel-Module) / [avd Daemon](../../wiki/avd-Daemon) / [avctl CLI](../../wiki/avctl-CLI) / [av-gui](../../wiki/av-gui) — per-component internals
-- [Fanotify Exec Gate](../../wiki/Fanotify-Exec-Gate) — the opt-in `FAN_OPEN_EXEC_PERM` path, and the limits of its fail-closed mode
+- [Fanotify Exec Gate](../../wiki/Fanotify-Exec-Gate) — the `FAN_OPEN_EXEC_PERM` path (on by default, activates on `AVD_FANOTIFY_MARK`), and the limits of its fail-closed mode
 
 **Detection**
 - [Detection Rules](../../wiki/Detection-Rules) — weighted YARA scoring, entropy/ELF tiers, fuzzy-hash corpora
