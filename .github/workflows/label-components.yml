@@ -45,14 +45,21 @@ jobs:
             }
             const body = issue.body || '';
 
+            // Strip fenced code blocks before matching, so a ticked
+            // checkbox pasted into a reproduction example cannot
+            // trigger a label the reporter never intended.
+            const scan = body
+              .replace(/```[\s\S]*?```/g, '')
+              .replace(/~~~[\s\S]*?~~~/g, '');
+
             // Match a ticked checkbox whose first backtick-quoted token
             // is `component:<slug>`. Tolerates leading whitespace and
             // either `[x]` or `[X]`. Deliberately strict about the
-            // backticks so free-form "component: foo" prose in a
-            // reproduction block cannot trigger a label.
+            // backticks so free-form "component: foo" prose cannot
+            // trigger a label.
             const re = /^\s*-\s*\[[xX]\]\s*`(component:[a-z0-9][a-z0-9_-]*)`/gm;
             const wanted = new Set();
-            for (const m of body.matchAll(re)) {
+            for (const m of scan.matchAll(re)) {
               wanted.add(m[1]);
             }
             if (wanted.size === 0) {
