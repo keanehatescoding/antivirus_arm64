@@ -72,6 +72,13 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT/userspace/av-gui" \
     -p test_avd_client.py || FAIL=1
 
 echo
+echo "### test_procfs_client.py (GUI procfs_client filename mangling, #80) ###"
+# Pure Python, unit-only: subprocess-mocked avctl, no root, no module.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT/userspace/av-gui" \
+    python3 -m unittest discover -s "$REPO_ROOT/userspace/av-gui/tests" \
+    -p test_procfs_client.py || FAIL=1
+
+echo
 echo "### test_build_dependencies.py (Make dry-run wire_escape.h deps, #81) ###"
 # Pure Python + make dry-run: no compiler, no libnl/yara/fuzzy needed
 # (the deps are stubbed via variable overrides). Catches a Makefile

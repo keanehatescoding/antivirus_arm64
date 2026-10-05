@@ -57,6 +57,12 @@ jobs:
             python3 -m unittest discover -s userspace/av-gui/tests \
             -p test_avd_client.py -v
 
+      - name: GUI procfs_client regression tests (#80)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=userspace/av-gui \
+            python3 -m unittest discover -s userspace/av-gui/tests \
+            -p test_procfs_client.py -v
+
       - name: Incremental-build header-dependency test (#81)
         run: |
           PYTHONDONTWRITEBYTECODE=1 \
