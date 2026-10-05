@@ -230,10 +230,13 @@ launcher is likewise delivered and blocked, because no pathname was
 copied in atomic context for it to defeat.
 
 **Worth being precise about the residual risk**, since this is the one
-finding here with a fix rather than an acceptance: the gate is off
-unless `AVD_FANOTIFY_EXEC=1`, covers only the mounts named in
-`AVD_FANOTIFY_MARK`, and the kprobe path it sits beside is unchanged
-and still has both gaps. Its own remaining fail-open surface is queue
+finding here with a fix rather than an acceptance: the gate is on by
+default but inactive until `AVD_FANOTIFY_MARK=<mountpoint>[:...]` names
+at least one mount (no default mark set — marking a mount suspends every
+exec on it), it covers only those mounts, and the kprobe path it sits
+beside is unchanged and still has both gaps. `AVD_FANOTIFY_EXEC=0`
+disables the gate; an install that never configures marks is in the same
+state it was in before the gate was flipped default-on. Its own remaining fail-open surface is queue
 overflow (`FAN_Q_OVERFLOW`), where events are dropped and the execs
 behind them proceed unchecked — logged loudly rather than silently
 tolerated, but a real ceiling set by `fs/fanotify/max_queued_events`.

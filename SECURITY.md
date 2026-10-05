@@ -101,18 +101,22 @@ not oversights. A *new* way to defeat one of them is still very welcome:
   pathname the module copied itself, not from the file the kernel already
   resolved — and a module cannot fix it, because `security_add_hooks()` is
   `__init` and unexported, so nothing loaded with `insmod` can ever
-  register `bprm_check_security`. `avd` therefore ships an **opt-in
-  fanotify exec gate** (`FAN_OPEN_EXEC_PERM`, discussion #33 option C)
-  that scans the kernel-supplied event fd instead. On marked mounts it
-  closes both halves: there is no second `open()` to race, and no
-  pathname is copied in atomic context for a cold page to defeat.
+  register `bprm_check_security`. `avd` therefore ships a **fanotify
+  exec gate** (`FAN_OPEN_EXEC_PERM`, discussion #33 option C) that scans
+  the kernel-supplied event fd instead. On marked mounts it closes both
+  halves: there is no second `open()` to race, and no pathname is copied
+  in atomic context for a cold page to defeat.
 
-  It is **off unless `AVD_FANOTIFY_EXEC=1` and `AVD_FANOTIFY_MARK=...`
-  are set**, it covers only the mounts named there, and the kprobe path
-  is unchanged and still has both gaps. So this is not yet a reason to
-  consider the gap closed on a default install — please still don't
-  report the gap itself, but a way to defeat the *gate* on a mount it
-  covers is very much in scope.
+  The gate is **on by default and activates as soon as
+  `AVD_FANOTIFY_MARK=<mountpoint>[:...]` names at least one mount** —
+  there is deliberately no default mark set, since marking a mount
+  suspends every exec on it until `avd` answers, so the scope is the
+  operator's call. `AVD_FANOTIFY_EXEC=0` turns the gate off entirely.
+  On an install with no `AVD_FANOTIFY_MARK` set the gate is inactive
+  and the kprobe path is still the only exec check, so both gaps
+  described above are present in full on that install — don't report
+  them, but a way to defeat the *gate* on a mount it covers (or to
+  evade it via a mount it does not cover) is very much in scope.
 - **arm64 only.** The module hooks `__arm64_sys_execve` by symbol name and
   will not build or load on x86_64.
 

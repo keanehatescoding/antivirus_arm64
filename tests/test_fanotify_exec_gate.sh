@@ -224,12 +224,31 @@ else
     fail "main()'s netlink loop no longer polls - libnl swallows EINTR, so SIGTERM would not be noticed until the next message and the gate would hold its mark meanwhile"
 fi
 
-section "#2: the gate stays off unless it is asked for, and fails loudly"
+section "#2: AVD_FANOTIFY_EXEC is a tri-state knob (default on, with marks)"
 
-if grep -q 'fanexec_enabled = avd_env_flag("AVD_FANOTIFY_EXEC")' "$AVD"; then
-    pass "the gate is opt-in via AVD_FANOTIFY_EXEC"
+# The gate defaults to on so a configured AVD_FANOTIFY_MARK is enough
+# to activate it, but AVD_FANOTIFY_EXEC=0 still turns it off and
+# AVD_FANOTIFY_EXEC=1 without marks still hard-fails - the three
+# properties that make the knob honest.
+if grep -q 'fanexec_want = fanexec_parse_want(getenv("AVD_FANOTIFY_EXEC"))' "$AVD"; then
+    pass "AVD_FANOTIFY_EXEC is parsed as tri-state (DEFAULT/ON/OFF)"
 else
-    fail "AVD_FANOTIFY_EXEC no longer gates the feature"
+    fail "AVD_FANOTIFY_EXEC is no longer parsed as a tri-state knob - a typo or an unset default could now flip the gate silently"
+fi
+if grep -q 'fanexec_enabled = (fanexec_want != FANEXEC_WANT_OFF)' "$AVD"; then
+    pass "the gate defaults to on; AVD_FANOTIFY_EXEC=0 is the opt-out"
+else
+    fail "the default is not clearly on - a reader cannot tell what AVD_FANOTIFY_EXEC unset does"
+fi
+# The default-on branch has to stay soft so an install that never
+# configured AVD_FANOTIFY_MARK keeps starting; the explicit-on branch
+# has to stay loud so an operator who asked for the gate learns their
+# config is broken rather than silently running unprotected.
+INIT_BODY="$(extract_c_func "$AVD" fanexec_init | strip_c_comments)"
+if grep -q 'fanexec_want == FANEXEC_WANT_ON' <<<"$INIT_BODY"; then
+    pass "an explicit AVD_FANOTIFY_EXEC=1 without marks still hard-fails"
+else
+    fail "fanexec_init() no longer distinguishes explicit-on from default-on - a requested gate can go silent on a mark misconfig"
 fi
 if grep -q 'startup_failed = true' "$AVD"; then
     pass "a requested-but-unstartable gate aborts avd instead of running open"

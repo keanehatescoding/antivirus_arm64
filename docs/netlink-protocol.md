@@ -191,10 +191,13 @@ by watching your own shell die.
   alongside it, not on it:** `avd` can additionally run a fanotify
   `FAN_OPEN_EXEC_PERM` gate that scans the kernel-supplied event fd
   directly, which sidesteps this channel entirely for execs on the
-  mounts it covers. Opt-in and off by default -
-  `AVD_FANOTIFY_EXEC=1`, `AVD_FANOTIFY_MARK=/:/home` (required, no
-  default), optionally `AVD_FANOTIFY_FAIL_CLOSED=1` and
-  `AVD_FANOTIFY_THREADS=N`. The per-scan YARA budget is tunable via
+  mounts it covers. On by default; activates as soon as
+  `AVD_FANOTIFY_MARK=/:/home` (no default, since marking a mount
+  suspends every exec on it until `avd` answers) names at least one
+  mount. `AVD_FANOTIFY_EXEC=0` disables the gate entirely; `=1` is
+  still accepted and additionally makes a missing `AVD_FANOTIFY_MARK` a
+  hard startup failure instead of a soft "gate inactive" line.
+  Optionally `AVD_FANOTIFY_FAIL_CLOSED=1` and `AVD_FANOTIFY_THREADS=N`. The per-scan YARA budget is tunable via
   `AVD_SCAN_TIMEOUT_SECS` (default 10, range 1-10: the tunable only
   shortens - a longer budget would outrun av/main.c's daemon_timeout_ms
   headroom and avctl's slow-verb budget; 0 is refused because YARA

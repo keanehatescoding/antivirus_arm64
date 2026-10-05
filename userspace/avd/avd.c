@@ -2560,15 +2560,22 @@ static void *scan_worker_main(void *arg) {
  * rename hooks - because fanotify has no equivalent with the same
  * semantics. Only the exec verdict moves here.
  *
- * Deliberately opt-in and off by default (AVD_FANOTIFY_EXEC=1). A
- * fanotify permission mark suspends every matching exec until this
- * daemon answers, so switching it on is an operational decision about
- * a machine, not a packaging default:
+ * On whenever marks are configured. AVD_FANOTIFY_EXEC is tri-state:
+ * unset means "default", explicit "0"/"false"/"no"/"off" disables, and
+ * explicit "1"/"true"/"yes"/"on" demands marks (hard-fails without
+ * them). An AVD_FANOTIFY_MARK on its own is enough to activate the
+ * gate, so an operator who configures mounts does not also have to
+ * flip a second knob. There is still no default mark set: marking a
+ * mount suspends every exec on it until this daemon answers, so the
+ * scope is deliberately the operator's call. If no marks are set and
+ * nothing was asked for explicitly, fanexec_init() prints one line and
+ * leaves the gate inactive - avd keeps running the rest of its
+ * pipeline, exactly as it did when the gate was opt-in.
  *
- *   AVD_FANOTIFY_EXEC=1          enable this gate
+ *   AVD_FANOTIFY_EXEC=0          disable this gate (default: on)
  *   AVD_FANOTIFY_MARK=/:/home    ':'-separated mount points to mark.
- *                                Required - see fanexec_init(); there
- *                                is deliberately no default.
+ *                                No default - the gate stays inactive
+ *                                until at least one is set.
  *   AVD_FANOTIFY_FAIL_CLOSED=1   deny execs this gate could not reach
  *                                a verdict on (default: allow, matching
  *                                the module's own default and
@@ -2604,6 +2611,16 @@ static void *scan_worker_main(void *arg) {
 
 static int fanexec_fd = -1;
 static bool fanexec_enabled;
+/* Tri-state request from AVD_FANOTIFY_EXEC. Separate from
+ * fanexec_enabled because fanexec_init() needs to tell "operator asked
+ * for the gate and we could not start it" (hard fail) from "no one
+ * asked and there are no marks to watch" (soft off, keep running). */
+enum fanexec_want {
+  FANEXEC_WANT_DEFAULT, /* env unset or unrecognised */
+  FANEXEC_WANT_ON,      /* explicit 1/true/yes/on */
+  FANEXEC_WANT_OFF,     /* explicit 0/false/no/off */
+};
+static enum fanexec_want fanexec_want;
 static bool fanexec_fail_closed;
 static int fanexec_threads = AVD_FANEXEC_THREADS_DEFAULT;
 static pthread_t *fanexec_tids;
@@ -2979,11 +2996,24 @@ static int fanexec_init(void) {
 
   marks_env = getenv("AVD_FANOTIFY_MARK");
   if (!marks_env || !marks_env[0]) {
-    fprintf(stderr,
-            "avd: AVD_FANOTIFY_EXEC=1 needs AVD_FANOTIFY_MARK=<mountpoint>[:...]\n"
-            "avd: (no default on purpose - marking a mount suspends every exec\n"
-            "avd:  on it until this daemon answers, so the scope is yours to pick)\n");
-    return -1;
+    /* Hard-fail only when an operator explicitly asked for the gate.
+     * The default-on path takes the soft-off branch instead so an
+     * install that never configured marks keeps starting - the gate
+     * covers nothing without them, so turning on and immediately
+     * exiting would just be a regression on every current deployment
+     * for no security gain. */
+    if (fanexec_want == FANEXEC_WANT_ON) {
+      fprintf(stderr,
+              "avd: AVD_FANOTIFY_EXEC=1 needs AVD_FANOTIFY_MARK=<mountpoint>[:...]\n"
+              "avd: (no default on purpose - marking a mount suspends every exec\n"
+              "avd:  on it until this daemon answers, so the scope is yours to pick)\n");
+      return -1;
+    }
+    printf("avd: fanotify exec gate: AVD_FANOTIFY_MARK is unset, gate "
+           "inactive (set AVD_FANOTIFY_MARK=<mountpoint>[:...] to enable, "
+           "or AVD_FANOTIFY_EXEC=0 to silence this line)\n");
+    fanexec_enabled = false;
+    return 0;
   }
 
   /* FAN_CLASS_CONTENT, not a non-existent FAN_CLASS_PERM: permission
@@ -4369,6 +4399,25 @@ static bool avd_env_flag(const char *env_name) {
          !strcasecmp(v, "yes") || !strcasecmp(v, "on");
 }
 
+/* Tri-state env parser for knobs whose default is not the same as off.
+ * Unset and unrecognised both map to DEFAULT so the caller can pick its
+ * own default behavior - the alternative would silently flip to off on
+ * a typo. Recognised affirmative/negative words win over DEFAULT.
+ * Only used by AVD_FANOTIFY_EXEC today; add callers rather than
+ * generalising avd_env_flag() so that knob's old plain-bool callers
+ * (AVD_FANOTIFY_FAIL_CLOSED, ...) keep their fail-safe default-off. */
+static enum fanexec_want fanexec_parse_want(const char *v) {
+  if (!v || !v[0])
+    return FANEXEC_WANT_DEFAULT;
+  if (!strcasecmp(v, "1") || !strcasecmp(v, "true") ||
+      !strcasecmp(v, "yes") || !strcasecmp(v, "on"))
+    return FANEXEC_WANT_ON;
+  if (!strcasecmp(v, "0") || !strcasecmp(v, "false") ||
+      !strcasecmp(v, "no") || !strcasecmp(v, "off"))
+    return FANEXEC_WANT_OFF;
+  return FANEXEC_WANT_DEFAULT;
+}
+
 static int parse_tunable_env(const char *env_name, int default_val,
                              int min_val, int max_val) {
   const char *val = getenv(env_name);
@@ -4478,8 +4527,17 @@ int main(int argc, char **argv) {
   /* The fanotify exec gate (issue #2 / discussion #33 option C) - see
    * the block comment above fanexec_init(). Read here, acted on just
    * before the receive loop, so a misconfiguration is reported after
-   * the rest of the daemon is known-good rather than during it. */
-  fanexec_enabled = avd_env_flag("AVD_FANOTIFY_EXEC");
+   * the rest of the daemon is known-good rather than during it.
+   *
+   * Tri-state, not avd_env_flag()'s plain bool: unset defaults to on so
+   * the gate activates whenever AVD_FANOTIFY_MARK is set, without
+   * requiring both knobs. An explicit "0"/"false"/"no"/"off" still
+   * disables it (an operator can opt out), and an explicit on still
+   * demands marks (fanexec_init() hard-fails without them, same as
+   * before). An unrecognised value trips the same fallback as "unset"
+   * so a typo in a unit file does not silently disable the feature. */
+  fanexec_want = fanexec_parse_want(getenv("AVD_FANOTIFY_EXEC"));
+  fanexec_enabled = (fanexec_want != FANEXEC_WANT_OFF);
   fanexec_fail_closed = avd_env_flag("AVD_FANOTIFY_FAIL_CLOSED");
   fanexec_threads = parse_tunable_env("AVD_FANOTIFY_THREADS",
                                       AVD_FANEXEC_THREADS_DEFAULT,
