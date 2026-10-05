@@ -79,6 +79,15 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT/userspace/av-gui" \
     -p test_procfs_client.py || FAIL=1
 
 echo
+echo "### test_build_dependencies.py (Make dry-run wire_escape.h deps, #81) ###"
+# Pure Python + make dry-run: no compiler, no libnl/yara/fuzzy needed
+# (the deps are stubbed via variable overrides). Catches a Makefile
+# regression that would silently leave avctl/avd stale after a shared
+# wire-format header change.
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+    -s "$REPO_ROOT/tests" -p test_build_dependencies.py || FAIL=1
+
+echo
 echo "### test_fanotify_exec_gate.sh (avd's exec gate for #2's two gaps) ###"
 # Half static greps (no root) and half a live FAN_OPEN_EXEC_PERM
 # harness (root). It self-elevates the live half via pkexec when this

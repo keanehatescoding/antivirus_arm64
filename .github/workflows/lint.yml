@@ -63,6 +63,12 @@ jobs:
             python3 -m unittest discover -s userspace/av-gui/tests \
             -p test_procfs_client.py -v
 
+      - name: Incremental-build header-dependency test (#81)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 -m unittest discover -s tests \
+            -p test_build_dependencies.py -v
+
       - name: cppcheck av/ (kernel module)
         run: |
           cppcheck --quiet --enable=warning,style,performance \
