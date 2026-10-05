@@ -20,17 +20,18 @@ it fixes if there is one (e.g. `Closes #NN`). -->
 
 ## Component(s) touched
 
-<!-- Tick the ones that apply, delete the rest. -->
+<!-- Tick the ones that apply. Each ticked box auto-applies the matching
+label via `.github/workflows/label-components.yml`. -->
 
-- [ ] `av/` — kernel module
-- [ ] `userspace/avd/` — root daemon
-- [ ] `userspace/avctl/` — CLI
-- [ ] `userspace/av-gui/` — GTK4 console
-- [ ] `rules/` or `corpus/` — detection content
-- [ ] `tests/`
-- [ ] `debian/` / `packaging/`
-- [ ] `.github/workflows/` — CI
-- [ ] Docs — README / wiki / `docs/` / `SECURITY.md`
+- [ ] `component:kernel` — `av/`
+- [ ] `component:daemon` — `userspace/avd/`
+- [ ] `component:cli` — `userspace/avctl/`
+- [ ] `component:gui` — `userspace/av-gui/`
+- [ ] `component:rules` — `rules/` or `corpus/`
+- [ ] `component:tests` — `tests/`
+- [ ] `component:packaging` — `debian/` or `packaging/`
+- [ ] `component:ci` — `.github/workflows/`
+- [ ] `component:docs` — README / wiki / `docs/` / `SECURITY.md`
 
 ## Test plan
 

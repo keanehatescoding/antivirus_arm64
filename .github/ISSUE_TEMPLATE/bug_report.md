@@ -27,19 +27,23 @@ code. -->
 
 ## Which component
 
-<!-- Tick the ones that apply. Delete the rest. Multiple can apply (a
-netlink regression is both av/ and avd/, for example). -->
+<!-- Tick the ones that apply. Multiple can apply (a netlink regression is
+both kernel and daemon, for example). Each ticked box auto-applies the
+matching label via `.github/workflows/label-components.yml`. -->
 
-- [ ] `av/` — kernel module (`av.ko`, kprobes, netlink, `/proc` interfaces)
-- [ ] `userspace/avd/` — root daemon (scan pipeline, quarantine, fanotify gate, control socket)
-- [ ] `userspace/avctl/` — CLI and its polkit actions
-- [ ] `userspace/av-gui/` — GTK4 console
-- [ ] `rules/` or `corpus/` — detection content (YARA rules, ssdeep/TLSH corpora)
-- [ ] `tests/` — a test is wrong, flaky, or asserting the wrong thing
-- [ ] `debian/` / `packaging/` — distro package build or install scripts
-- [ ] `.github/workflows/` — CI
-- [ ] Docs — README / wiki / `docs/` / `SECURITY.md`
-- [ ] Other / unsure
+- [ ] `component:kernel` — `av/` (av.ko, kprobes, netlink, `/proc` interfaces)
+- [ ] `component:daemon` — `userspace/avd/` (scan pipeline, quarantine, fanotify gate, control socket)
+- [ ] `component:cli` — `userspace/avctl/` and its polkit actions
+- [ ] `component:gui` — `userspace/av-gui/` (GTK4 console)
+- [ ] `component:rules` — `rules/` or `corpus/` (YARA rules, ssdeep/TLSH corpora)
+- [ ] `component:tests` — `tests/` (a test is wrong, flaky, or asserting the wrong thing)
+- [ ] `component:packaging` — `debian/` or `packaging/`
+- [ ] `component:ci` — `.github/workflows/`
+- [ ] `component:docs` — README / wiki / `docs/` / `SECURITY.md`
+
+<!-- If none of these fit, leave them all unticked and say so in "What
+happened" above. -->
+
 
 ## Reproduction
 
