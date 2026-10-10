@@ -22,8 +22,8 @@ bypass on the netlink or control-socket channel)? That goes through
 ## Getting set up
 
 ```bash
-git clone https://github.com/keanehatescoding/antivirus.git
-cd antivirus
+git clone https://github.com/keanehatescoding/antivirus_arm64.git
+cd antivirus_arm64
 scripts/setup-hooks.sh    # one-time: wires git to .githooks/
 ```
 
@@ -59,12 +59,16 @@ make CC=clang LLVM=1     # av/ only — build against a Clang-built kernel
 `tests/` scripts mostly need root, since they load/unload the module and
 start/stop `avd`:
 
-| Touched                | Run at least                                                         |
-| ----------------------- | --------------------------------------------------------------------- |
-| `av/`                    | `sudo tests/test_detection.sh`, `sudo tests/test_sigtable.sh`         |
-| `userspace/avd/`         | `sudo tests/test_avd_socket.sh`                                       |
-| hashing code (either)    | `tests/test_sha256.sh`, `tests/test_tlsh_core.sh` — no root needed    |
-| broader / not sure       | `sudo tests/run_all.sh` — builds everything, runs the full set        |
+| Touched                   | Run at least                                                                  |
+| -------------------------- | ----------------------------------------------------------------------------- |
+| `av/`                       | `sudo tests/test_detection.sh`, `sudo tests/test_sigtable.sh`                 |
+| `userspace/avd/`            | `sudo tests/test_avd_socket.sh`                                               |
+| fanotify gate in `avd/`     | `sudo tests/test_fanotify_exec_gate.sh` — see [Fanotify Exec Gate wiki page](https://github.com/keanehatescoding/antivirus_arm64/wiki/Fanotify-Exec-Gate#testing) |
+| `userspace/avctl/`          | `tests/test_avctl_timeouts.sh` (no root for this one — it mocks the socket)   |
+| `userspace/av-gui/`         | `python3 -m unittest discover -s userspace/av-gui/tests` — no root            |
+| `rules/` or `corpus/`       | compile + the per-rule positive sample and `/bin/ls`/`/bin/bash` negatives (see below) |
+| hashing code (either)       | `tests/test_sha256.sh`, `tests/test_tlsh_core.sh` — no root needed            |
+| broader / not sure          | `sudo tests/run_all.sh` — builds everything, runs the full set                |
 
 CI re-runs a version of this on every push across three tiers: compile
 across gcc/clang against the kernel versions pinned in
@@ -81,7 +85,12 @@ that loads the module and checks clean-vs-EICAR detection
   `shellcheck` on scripts. Quick, no build, no `insmod`.
 - **On push** — `.githooks/pre-push` runs the full suite
   (`pkexec tests/run_all.sh`), but only when the push touches `av/`,
-  `userspace/avctl/`, or `userspace/avd/`. Docs-only pushes skip it.
+  `userspace/avctl/`, `userspace/avd/`, `userspace/av-gui/`, `rules/`,
+  `corpus/`, or `packaging/`. Docs-only pushes skip it. On an x86_64
+  dev host `run_all.sh` self-detects and runs unprivileged: the
+  module build is cross-compiled and boot-tested under QEMU rather
+  than `insmod`'d, and the tests that need a loaded module on the
+  host are skipped rather than failed.
 
 Both accept `--no-verify` if you really need to skip them, but that's
 best avoided — particularly right before a tag.
