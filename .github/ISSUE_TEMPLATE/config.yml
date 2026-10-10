@@ -1,0 +1,22 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability (please do not file publicly)
+    url: https://github.com/keanehatescoding/antivirus_arm64/security/advisories/new
+    about: >-
+      Kernel panics reachable from an unprivileged process, privilege
+      escalation, auth bypass on netlink or the control socket, quarantine
+      escapes — these are in scope for private reporting. See SECURITY.md
+      for the full scope and what to include.
+  - name: SECURITY.md — scope, known tradeoffs, how to report
+    url: https://github.com/keanehatescoding/antivirus_arm64/blob/master/SECURITY.md
+    about: >-
+      Includes already-accepted tradeoffs (fail-open-by-default, the kprobe
+      TOCTOU/cold-page gaps, arm64-only). Please don't file an issue for
+      these — a new way to defeat the fanotify gate on a mount it covers is
+      still welcome, but goes through private reporting too.
+  - name: Question or discussion
+    url: https://github.com/keanehatescoding/antivirus_arm64/discussions
+    about: >-
+      For "how does X work" / "why does the design look like this" /
+      "would you consider Y" — issues are reserved for actionable bugs
+      and specific feature requests.

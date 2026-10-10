@@ -1,0 +1,127 @@
+name: Label components from template checkboxes
+
+# Reads the `component:*` checkbox list in an issue or PR body
+# (populated from `.github/ISSUE_TEMPLATE/bug_report.md` and
+# `.github/pull_request_template.md`) and applies the matching
+# `component:<name>` label for each ticked box.
+#
+# Design notes:
+#  - `pull_request_target` (not `pull_request`) so this works for
+#    forks: the base repo context is what has permission to label.
+#    No PR branch is ever checked out, no PR code runs here, and the
+#    only input consumed is `github.event.*.body` (a string), so the
+#    standard pull_request_target footgun does not apply.
+#  - Additive only. A ticked box ADDS its label; unticking does NOT
+#    remove it. That avoids fighting a maintainer who labelled by
+#    hand, and avoids wiping labels off issues predating this file.
+#  - Only labels that already exist on the repo are applied. The
+#    `component:*` set was created out-of-band (same colour on both
+#    arm64 and x86-64); the workflow will not auto-create new ones.
+
+on:
+  issues:
+    types: [opened, edited]
+  pull_request_target:
+    types: [opened, edited]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  apply-component-labels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply component:* labels from ticked checkboxes
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const payload = context.payload;
+            const issue = payload.issue || payload.pull_request;
+            if (!issue) {
+              core.info('No issue or pull_request on this event; nothing to label.');
+              return;
+            }
+            const body = issue.body || '';
+
+            // Strip fenced code blocks before matching, so a ticked
+            // checkbox pasted into a reproduction example cannot
+            // trigger a label the reporter never intended. Fences
+            // follow CommonMark: an opener is a line of 3+ backticks
+            // or tildes (indented up to 3 spaces), and the closer
+            // must use the same character, be at least as long, and
+            // have only whitespace after the marker — so a `````
+            // block containing a bare ``` line is not closed early.
+            const scanLines = [];
+            let fence = null;
+            for (const line of body.split('\n')) {
+              if (fence) {
+                const close = line.match(/^ {0,3}(`+|~+)\s*$/);
+                if (close && close[1][0] === fence.char && close[1].length >= fence.len) {
+                  fence = null;
+                }
+                continue;
+              }
+              const open = line.match(/^ {0,3}(`{3,}|~{3,})/);
+              if (open) {
+                fence = { char: open[1][0], len: open[1].length };
+                continue;
+              }
+              scanLines.push(line);
+            }
+            const scan = scanLines.join('\n');
+
+            // Match a ticked checkbox whose first backtick-quoted token
+            // is `component:<slug>`. Caps the leading indent at 3
+            // spaces (CommonMark treats 4+ as an indented code block,
+            // which is not a list item) and uses horizontal whitespace
+            // only ([ \t], not \s) so a match never consumes a newline.
+            // Accepts either `[x]` or `[X]`. Deliberately strict about
+            // the backticks so free-form "component: foo" prose cannot
+            // trigger a label.
+            const re = /^ {0,3}-[ \t]*\[[xX]\][ \t]*`(component:[a-z0-9][a-z0-9_-]*)`/gm;
+            const wanted = new Set();
+            for (const m of scan.matchAll(re)) {
+              wanted.add(m[1]);
+            }
+            if (wanted.size === 0) {
+              core.info('No ticked component:* checkboxes found.');
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            const number = issue.number;
+
+            // Only apply labels that already exist on the repo, so a
+            // typo in a template or a renamed component does not spam
+            // the API with "label not found" failures. One page is
+            // enough: there are nine component:* labels today and the
+            // list is not expected to grow past a dozen.
+            const existing = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              { owner, repo, per_page: 100 }
+            );
+            const existingComponent = new Set(
+              existing.map(l => l.name).filter(n => n.startsWith('component:'))
+            );
+
+            const toAdd = [...wanted].filter(l => existingComponent.has(l));
+            const missing = [...wanted].filter(l => !existingComponent.has(l));
+            if (missing.length) {
+              core.warning(
+                `Ticked but not present on repo (skipped): ${missing.join(', ')}`
+              );
+            }
+            if (toAdd.length === 0) {
+              core.info('Nothing to add after filtering against repo labels.');
+              return;
+            }
+
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: number,
+              labels: toAdd,
+            });
+            core.info(`Applied: ${toAdd.join(', ')}`);
