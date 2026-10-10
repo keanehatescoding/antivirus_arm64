@@ -49,8 +49,10 @@ pkgrel=1
 arch=('aarch64')
 url="https://github.com/keanehatescoding/antivirus"
 # Dual-licensed per LICENSE (GPL-2.0-only OR MIT) - matches
-# packaging/arch/PKGBUILD. See LICENSE at the repo root.
-license=('GPL-2.0-only' 'MIT')
+# packaging/arch/PKGBUILD. Expressed as a single SPDX "A OR B" entry
+# because Arch treats multiple array entries as license AND; see
+# packaging/arch/PKGBUILD's own comment for the full rationale.
+license=('GPL-2.0-only OR MIT')
 # Same list as packaging/arch/PKGBUILD, with `linux-headers` swapped for
 # `linux-cachyos-headers` (see header comment #1). 'dkms'/'polkit' are
 # here only to satisfy namcap's split-package makedepends rule, and

@@ -37,9 +37,11 @@ url="https://github.com/keanehatescoding/antivirus"
 # SPDX identifier (namcap E-errors on anything else - confirmed by a
 # real CI run rejecting 'GPL3'). Matches LICENSE and
 # packaging/fedora/hyprav.spec's own License: field. Dual-licensed
-# per LICENSE (GPL-2.0-only OR MIT); listed here as a multi-license
-# array so pacman's -Qi/-Si both show the choice.
-license=('GPL-2.0-only' 'MIT')
+# per LICENSE (GPL-2.0-only OR MIT); expressed as a SINGLE array
+# entry (SPDX "A OR B") because Arch's packaging guide treats multiple
+# entries as license AND, which would wrongly require BOTH licenses
+# instead of granting the choice LICENSE actually offers.
+license=('GPL-2.0-only OR MIT')
 # python-gobject/gtk4 are needed at BUILD time, not just runtime:
 # package_hyprav-gui()'s `make install` (userspace/av-gui/Makefile)
 # depends on `checkdeps`, which imports gi and loads GTK4 before
