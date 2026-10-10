@@ -73,11 +73,14 @@ jobs:
             const scan = scanLines.join('\n');
 
             // Match a ticked checkbox whose first backtick-quoted token
-            // is `component:<slug>`. Tolerates leading whitespace and
-            // either `[x]` or `[X]`. Deliberately strict about the
-            // backticks so free-form "component: foo" prose cannot
+            // is `component:<slug>`. Caps the leading indent at 3
+            // spaces (CommonMark treats 4+ as an indented code block,
+            // which is not a list item) and uses horizontal whitespace
+            // only ([ \t], not \s) so a match never consumes a newline.
+            // Accepts either `[x]` or `[X]`. Deliberately strict about
+            // the backticks so free-form "component: foo" prose cannot
             // trigger a label.
-            const re = /^\s*-\s*\[[xX]\]\s*`(component:[a-z0-9][a-z0-9_-]*)`/gm;
+            const re = /^ {0,3}-[ \t]*\[[xX]\][ \t]*`(component:[a-z0-9][a-z0-9_-]*)`/gm;
             const wanted = new Set();
             for (const m of scan.matchAll(re)) {
               wanted.add(m[1]);
