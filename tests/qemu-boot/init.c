@@ -65,8 +65,8 @@
  * detection kill line in dmesg, while the warm-path EICAR check
  * above still detects and kills normally (so this is the harness
  * demonstrating the gap, not a detection regression). Verified
- * locally on 7.2.2 under TCG; the CI kernel matrix re-checks it on
- * every push.
+ * locally under TCG against the then-current kernel matrix; the CI
+ * kernel matrix re-checks it on every push.
  *
  * It now gates on what it can actually observe:
  *
