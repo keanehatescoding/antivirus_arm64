@@ -86,6 +86,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,6 +269,18 @@
 #define AVD_SCAN_QUEUE_MAX_DEFAULT 256
 #define AVD_SCAN_QUEUE_MIN 1
 #define AVD_SCAN_QUEUE_MAX_MAX 65536
+/* send_verdict()'s retry budget for a send that comes back EAGAIN,
+ * which it can once main() makes the netlink socket non-blocking - see
+ * that loop's comment, and send_verdict()'s own for why this is
+ * defensive rather than a path anything is expected to take.
+ *
+ * 4 attempts with a wait between them caps the delay at 75 ms, well
+ * inside the kernel's smallest daemon_timeout_ms (1 s,
+ * DAEMON_TIMEOUT_MS_MIN in av/main.c), so a retried verdict still
+ * lands before the kernel gives up and fails open. Not tunable: the
+ * ceiling that makes it safe is the module's, not the operator's. */
+#define AVD_NL_SEND_RETRIES 4
+#define AVD_NL_SEND_RETRY_MS 25
 /* Sum of every matching rule's `weight` meta (see the .yar files under rules/)
  * has to clear this before avd convicts. Added after real testing killed
  * /usr/bin/zsh, /bin/sh, and /usr/bin/uwsm - all legitimate binaries that each
@@ -326,7 +339,15 @@ static const char *quarantine_dir = DEFAULT_QUARANTINE_DIR;
 
 static struct nl_sock *sock;
 static int family_id;
-static volatile sig_atomic_t running = 1;
+/* Written by handle_sigint() and by main(), read by main()'s receive
+ * loop and by control_accept_main() on its own thread - so it needs to
+ * be a lock-free atomic rather than volatile sig_atomic_t, which only
+ * covers the signal-handler half of that. Lock-free is what makes the
+ * accesses async-signal-safe; the static assert keeps a build where
+ * atomic_int is emulated with a lock from compiling a handler that
+ * could deadlock against the code it interrupted. */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "running must be lock-free");
+static atomic_int running = 1;
 static YR_RULES *compiled_rules;
 
 /* Runtime-tunable pool sizes - see AVD_SCAN_THREADS_DEFAULT's comment
@@ -437,7 +458,7 @@ static int control_sock_fd = -1;
 
 static void handle_sigint(int signum) {
   (void)signum;
-  running = 0;
+  atomic_store(&running, 0);
 }
 
 /*
@@ -469,7 +490,54 @@ static int send_verdict(uint64_t reqid, uint8_t verdict,
     NLA_PUT_STRING(msg, AV_A_RULE_NAME, rule_name);
 
   pthread_mutex_lock(&send_lock);
-  ret = nl_send_auto(sock, msg);
+  /* The socket is non-blocking once main() reaches its receive loop
+   * (see the comment there), so anything that would have slept inside
+   * nl_send_auto() now surfaces here as -NLE_AGAIN instead. Dropping
+   * the verdict on that would leave the kernel waiting out
+   * daemon_timeout_ms and failing open on a file we have an answer
+   * for, so wait for writability and retry.
+   *
+   * Defensive rather than observed: these messages go to the kernel,
+   * and netlink delivers a unicast to a kernel socket by calling its
+   * input handler inline - there is no queue in between to fill, so
+   * EAGAIN should not be reachable on this path at all. It is handled
+   * because the non-blocking switch above is what makes it *possible*,
+   * and the previous version of that switch's comment kept the socket
+   * blocking specifically to avoid growing an EAGAIN hole here. A
+   * silently dropped verdict is the kind of thing that would only show
+   * up as an unexplained fail-open.
+   *
+   * Bounded hard, and the bound is the point: daemon_timeout_ms is at
+   * least 1 s (DAEMON_TIMEOUT_MS_MIN in av/main.c), so the whole retry
+   * budget stays an order of magnitude inside it - a verdict that
+   * arrives after the kernel gave up is no better than one that never
+   * arrived, and send_lock is held across these waits, so an unbounded
+   * retry here would stall every other worker's verdict too.
+   *
+   * Only EAGAIN is retried. Every other error is either permanent or
+   * about this specific message, and re-sending would not change it. */
+  {
+    int attempts;
+
+    for (attempts = 0; attempts < AVD_NL_SEND_RETRIES; attempts++) {
+      struct pollfd wpfd = {
+          .fd = nl_socket_get_fd(sock), .events = POLLOUT, .revents = 0};
+
+      ret = nl_send_auto(sock, msg);
+      if (ret != -NLE_AGAIN)
+        break;
+      /* Not after the last attempt - send_lock is held across this
+       * wait, so sleeping on the way to giving up would delay every
+       * other worker's verdict for nothing.
+       *
+       * EINTR is retried like any other wait: main() blocks
+       * SIGINT/SIGTERM before spawning the workers that call this, so
+       * a signal landing here is not a shutdown request. */
+      if (attempts + 1 < AVD_NL_SEND_RETRIES)
+        while (poll(&wpfd, 1, AVD_NL_SEND_RETRY_MS) < 0 && errno == EINTR)
+          ;
+    }
+  }
   pthread_mutex_unlock(&send_lock);
   nlmsg_free(msg);
 
@@ -4300,7 +4368,7 @@ static int start_control_socket(void) {
 static void *control_accept_main(void *arg) {
   (void)arg;
 
-  while (running) {
+  while (atomic_load(&running)) {
     struct control_conn_ctx *ctx;
     pthread_t tid;
     uid_t peer_uid = (uid_t)-1;
@@ -4311,8 +4379,9 @@ static void *control_accept_main(void *arg) {
     if (cfd < 0) {
       if (errno == EINTR)
         continue;
-      if (!running) /* expected - see main()'s shutdown sequence, which
-                    * closes control_sock_fd to unblock this accept() */
+      if (!atomic_load(&running))
+        /* expected - see main()'s shutdown sequence, which closes
+         * control_sock_fd to unblock this accept() */
         break;
       fprintf(stderr, "avd: control accept() failed: %s\n", strerror(errno));
       continue;
@@ -4813,7 +4882,7 @@ int main(int argc, char **argv) {
               "avd: fanotify exec gate was requested but could not be "
               "started - shutting down rather than running unprotected\n");
       startup_failed = true;
-      running = 0;
+      atomic_store(&running, 0);
     }
 
     /* poll() first, then receive. nl_recvmsgs_default() cannot be
@@ -4830,13 +4899,42 @@ int main(int argc, char **argv) {
      * a live gate and waits for the exit.
      *
      * Polling the fd with a timeout re-checks `running` on a timer,
-     * the same shape the fanotify responders already use. The socket
-     * deliberately stays blocking rather than being switched to
-     * non-blocking: this loop is the only reader, so POLLIN means the
-     * following receive has data waiting, and the send path
-     * (send_verdict() and friends) keeps its existing semantics
-     * instead of having to grow EAGAIN handling. */
-    while (running) {
+     * the same shape the fanotify responders already use.
+     *
+     * The poll() alone is not enough, which is why the socket is also
+     * made non-blocking just below (#100). POLLIN promises that *one*
+     * read will not block - but libnl reads as many times as the
+     * message tells it to: a header flagged NLM_F_MULTI sends
+     * nl_recvmsgs_default() back to the socket for the rest of the
+     * multipart until it sees NLMSG_DONE. A peer that sends the first
+     * fragment and never terminates it therefore parks this thread in
+     * libnl's second, unpromised recvmsg() - the EINTR-retrying one -
+     * and `running` stops being read at all. Our own msg_handler()
+     * rejecting the fragment (non-kernel portid) does not end the
+     * multipart: libnl is waiting on the wire, not on the callback.
+     *
+     * Non-blocking, that second read returns EAGAIN, libnl gives up on
+     * the unfinished multipart with -NLE_AGAIN, and the loop is back
+     * at poll() with `running` observable again. Unicasting to avd's
+     * portid needs CAP_NET_ADMIN (netlink_allowed(), and only
+     * NETLINK_USERSOCK carries NL_CFG_F_NONROOT_SEND - NETLINK_GENERIC
+     * does not), so reaching this takes a privileged or buggy peer
+     * rather than any local user. A hang only root can trigger is
+     * still a hang worth closing: with the exec gate on it wedges
+     * every exec on a marked mount, per the paragraph above.
+     *
+     * The send path grows the EAGAIN handling the previous version of
+     * this comment wanted to avoid: see send_verdict(). Only sends
+     * after this point are affected - register_with_kernel() above
+     * and genl_ctrl_resolve()'s reply both ran while the socket was
+     * still blocking, which is why the switch happens here and not at
+     * nl_socket_alloc() time. */
+    if (nl_socket_set_nonblocking(sock) < 0)
+      fprintf(stderr,
+              "avd: could not make the netlink socket non-blocking - an "
+              "unterminated multipart message can delay shutdown\n");
+
+    while (atomic_load(&running)) {
       struct pollfd nlpfd = {
           .fd = nl_socket_get_fd(sock), .events = POLLIN, .revents = 0};
       int pret = poll(&nlpfd, 1, AVD_NL_POLL_MS);
@@ -4853,12 +4951,24 @@ int main(int argc, char **argv) {
         continue; /* timeout - re-check `running` */
 
       ret = nl_recvmsgs_default(sock);
-      if (ret < 0 && ret != -NLE_INTR) {
+      /* -NLE_AGAIN is the non-blocking socket doing its job: either a
+       * raced read (nothing left by the time libnl asked) or the
+       * abandoned multipart described above. Neither is an error, and
+       * treating it as one would turn the fix into a different exit. */
+      if (ret < 0 && ret != -NLE_INTR && ret != -NLE_AGAIN) {
         fprintf(stderr, "avd: nl_recvmsgs_default error: %s\n",
                 nl_geterror(ret));
         break;
       }
     }
+
+    /* The loop can also exit on its own (a poll() or libnl error
+     * above) with `running` still 1, and control_accept_main() reads
+     * it to decide whether its next accept() is real work or the
+     * shutdown wake-up connection made below. Left at 1, that thread
+     * takes the wake-up as a real connection, loops back into
+     * accept() and the join further down never returns. */
+    atomic_store(&running, 0);
 
     printf("avd: shutting down, draining %zu queued scan(s)...\n", queue_len);
     pthread_mutex_lock(&queue_lock);
