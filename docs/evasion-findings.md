@@ -176,32 +176,37 @@ about *which file* gets scanned, and it defeats every layer above at
 once: if the verdict is computed against the wrong bytes, the quality of
 the analysis applied to them is irrelevant.
 
-`av/main.c`'s kprobe handler reads the exec'd pathname out of userspace
-with `strncpy_from_user()` and `av_work_fn()` later re-opens that
-pathname. Both halves of that are evadable, and issue #2 tracks both:
+`av/main.c`'s kprobe handler **used to** read the exec'd pathname out of
+userspace with `strncpy_from_user()`, with `av_work_fn()` later re-opening
+that pathname. Both halves of that were evadable, which is what issue #2
+tracked. Both are now closed in the module itself (issue #94) — kept here
+in full, because the shape of the bug and what it took to close it are the
+findings, not the current line count:
 
 - **Cold pathname page.** The pre-handler runs in atomic context and
   cannot sleep to fault a page in, so a pathname on a genuinely
-  non-resident page returns `-EFAULT` and the handler allows the exec
-  without scanning anything. `tests/qemu-boot/cold_launcher.c`
-  reproduces this on every CI run. Note the measured nuance: a plain
+  non-resident page returned `-EFAULT` and the handler allowed the exec
+  without scanning anything. Note the measured nuance: a plain
   `.rodata` string literal did *not* reproduce it — fault-around pulls
-  the literal's page in alongside `.text`. Coldness has to be
+  the literal's page in alongside `.text`. Coldness had to be
   constructed (file-backed `MAP_PRIVATE` mapping, `MADV_DONTNEED`,
   never touched), which is a real constraint on an attacker but not a
-  meaningful one.
-- **TOCTOU on the re-open.** `open_exec_target()` is a second, later
-  open of the same name. Swapping what that name resolves to between
-  the kernel's own resolution and ours means the verdict describes a
-  file that is not the one executing. The kprobe path's version of this
-  is reproduced on every CI run by the batch case in
-  `tests/qemu-boot/init.c` (issue #45): a clean decoy renamed over an
-  EICAR exec target, concurrent with the `execve()`, gets the workqueue
-  to hash and clear the decoy on ~50–75% of attempts (the target's
-  fail-open line carries the *decoy's* sha256), while an interleaved
-  no-swap control is caught every time. Unlike the fanotify version
-  below it is a genuine race, so it gates on "at least one of a batch
-  wins" rather than on a single deterministic attempt.
+  meaningful one. `tests/qemu-boot/cold_launcher.c` still constructs
+  exactly that on every CI run, and now **requires** the exec to be
+  detected and killed.
+- **TOCTOU on the re-open.** The deferred `open()` was a second, later
+  open of the same name. Swapping what that name resolved to between the
+  kernel's own resolution and ours meant the verdict described a file that
+  was not the one executing. Reproduced for real on every CI run by the
+  batch case in `tests/qemu-boot/init.c` (issue #45), which got the
+  workqueue to hash and clear the decoy on ~50–75% of attempts (the
+  target's fail-open line carrying the *decoy's* sha256) while an
+  interleaved no-swap control was caught every time. Post-#94 that same
+  case asserts the opposite, and is no longer a race at all: the rename is
+  ordered strictly after exec entry by a sync pipe, the deferred hash is
+  parked by `av_toctou_test_delay_ms` so the swap always lands mid-scan,
+  and *every* attempt must be killed on the EICAR that executed with none
+  hashing the decoy.
 
 Unlike findings #1, #2 and #4, this one is **not** an inherent limit of
 the technique — it is an artifact of *where the hook sits*. The verdict
@@ -210,15 +215,38 @@ file object the kernel had already resolved. Given the resolved file,
 neither evasion has anything to work with: there is no pathname copy to
 leave cold, and no second lookup to race.
 
-Reaching that file object from a loadable module turns out to be
+*Registering* for that file object from a loadable module turns out to be
 impossible, which is the genuinely interesting constraint here:
 `security_add_hooks()` is `__init` and unexported, and the active LSM
 set is fixed at boot by `CONFIG_LSM=`/`lsm=`, so an `insmod`'d module
 can never register `bprm_check_security` no matter how it is written.
-The fix therefore has to leave the module — discussion #33 weighs an
-in-tree LSM (correct, unshippable), a BPF LSM (needs `lsm=...,bpf` at
-boot), and fanotify `FAN_OPEN_EXEC_PERM` in `avd`, which is what
-shipped.
+Discussion #33 weighs the ways out: an in-tree LSM (correct,
+unshippable), a BPF LSM (needs `lsm=...,bpf` at boot), and fanotify
+`FAN_OPEN_EXEC_PERM` in `avd`, which is what shipped.
+
+What that constraint does *not* rule out — and what issue #94 then did —
+is **observing** the file object without registering anything: a kprobe on
+a function the kernel's own exec path calls with the `linux_binprm` that
+carries the already-open `bprm->file`. Pinning that with `get_file()` and
+hashing it is what closes both bullets above, and it needs no boot-time
+configuration at all beyond `CONFIG_KPROBES=y`.
+
+Which function is picked at load time, because the obvious one is not
+probeable everywhere. `security_bprm_check()` — the LSM mediation point —
+is global and cannot be inlined or renamed, but since the LSM layer moved
+hook dispatch to static calls, the unrolled dispatch loop's first
+static-key branch sits at offset 0 of the function, and `register_kprobe()`
+refuses any address `jump_label_text_reserved()` claims with a bare
+`-EINVAL`. So the module prefers `bprm_execve()` — the single caller of the
+binfmt search, entered with `bprm->file` already set and before any binfmt
+handler has looked at the image — and keeps `security_bprm_check` as the
+fallback for older kernels and for the day a compiler inlines or clones
+`bprm_execve` out of kallsyms.
+
+The split worth keeping straight is detection versus enforcement: a kprobe
+pre-handler cannot change the probed function's return value, so the module
+still cannot *deny* an exec. It detects against the right bytes and kills;
+the gate below is what blocks.
 
 Verified side by side in `tests/fanotify_exec_gate.c`: with a target
 whose content reads `SPIKE-PAYLOAD-MALICIOUS` and a rename-swap
@@ -233,10 +261,12 @@ copied in atomic context for it to defeat.
 finding here with a fix rather than an acceptance: the gate is on by
 default but inactive until `AVD_FANOTIFY_MARK=<mountpoint>[:...]` names
 at least one mount (no default mark set — marking a mount suspends every
-exec on it), it covers only those mounts, and the kprobe path it sits
-beside is unchanged and still has both gaps. `AVD_FANOTIFY_EXEC=0`
-disables the gate; an install that never configures marks is in the same
-state it was in before the gate was flipped default-on. Its own remaining fail-open surface is queue
+exec on it), and it covers only those mounts. The kprobe path it sits
+beside no longer has either gap, but it is still *detection*: on an
+unmarked mount a malicious exec is killed shortly after it starts rather
+than prevented. `AVD_FANOTIFY_EXEC=0` disables the gate; an install that
+never configures marks is in the same state it was in before the gate was
+flipped default-on. Its own remaining fail-open surface is queue
 overflow (`FAN_Q_OVERFLOW`), where events are dropped and the execs
 behind them proceed unchecked — logged loudly rather than silently
 tolerated, but a real ceiling set by `fs/fanotify/max_queued_events`.

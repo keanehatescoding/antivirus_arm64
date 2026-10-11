@@ -11,7 +11,8 @@ contact_links:
     url: https://github.com/keanehatescoding/antivirus_arm64/blob/master/SECURITY.md
     about: >-
       Includes already-accepted tradeoffs (fail-open-by-default, the kprobe
-      TOCTOU/cold-page gaps, arm64-only). Please don't file an issue for
+      path being kill-after-exec rather than exec-time blocking,
+      arm64-only). Please don't file an issue for
       these — a new way to defeat the fanotify gate on a mount it covers is
       still welcome, but goes through private reporting too.
   - name: Question or discussion

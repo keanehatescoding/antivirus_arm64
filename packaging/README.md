@@ -9,9 +9,12 @@ they have different lifecycles:
 | `hyprav`      | `avd` daemon + `avctl` CLI                    | plain userspace |
 | `hyprav-gui`  | GTK4 management console                       | plain userspace, optional |
 
-The kernel module is **arm64 only** — it hooks `__arm64_sys_execve` by
-symbol name and will not build or load on x86_64 (see `SECURITY.md`). The
-userspace pieces are arch-independent.
+The kernel module is **arm64 only** — its behavioral hooks resolve
+`__arm64_sys_*` syscall symbols by name and it will not build or load on
+x86_64 (see `SECURITY.md`). It needs no kernel config beyond
+`CONFIG_KPROBES=y` — the exec hook probes `bprm_execve`, or
+`security_bprm_check` as a fallback. The userspace pieces are
+arch-independent.
 
 ## Which directory for which distro
 
@@ -39,7 +42,8 @@ top of `cachyos/PKGBUILD`:
    passes `CC=clang LLVM=1` (which `av/Makefile` already supports). A
    GCC-built spin is unaffected.
 
-Note the module is **aarch64-only** (it hooks `__arm64_sys_execve`) while
+Note the module is **aarch64-only** (it hooks `__arm64_sys_*` syscall
+symbols) while
 CachyOS is **x86_64-focused** — there is no official CachyOS aarch64 repo.
 So this variant targets an aarch64 host running a CachyOS-flavoured kernel
 (CachyOS kernel PKGBUILDs rebuilt for arm64); on a stock x86_64 CachyOS box

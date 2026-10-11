@@ -78,47 +78,77 @@ not oversights. A *new* way to defeat one of them is still very welcome:
   kernel module lets the exec through rather than blocking it, so a
   crashed daemon can't become a system-wide DoS. `avctl policy set
   fail-closed` opts out of this. See `docs/netlink-protocol.md`.
-- **A known TOCTOU gap in `handler_pre()`** (kernel side) around when the
-  exec'd pathname is captured relative to the exec itself. Three fixes were
-  considered and rejected; full writeup in the comment above
-  `handler_pre()` in `av/main.c`, and design options in issue #2 /
-  discussion #33. Both halves are now reproduced on every CI run.
-  `tests/qemu-boot/cold_launcher.c` covers the cold-page half: it
-  execve()s from a pathname page it guarantees is cold (fresh
-  file-backed mapping, never faulted, `MADV_DONTNEED`'d before exec) so
-  the kprobe handler's atomic copy genuinely sees a non-resident page,
-  and the case gates on the bypass it observes. The TOCTOU half (issue
-  #45) is covered by the batch case in `tests/qemu-boot/init.c`: it
-  renames a clean decoy over an EICAR exec target concurrently with the
-  execve(), and gates on at least one attempt getting the workqueue to
-  hash the decoy (proved by the decoy's own sha256 appearing on a
-  fail-open line) while an interleaved no-swap control is detected and
-  killed every time. Both cases carry a toggle
-  (`AV_EXPECT_COLD_EXEC_DETECTED` / `AV_EXPECT_TOCTOU_CLOSED`) that flips
-  the assertion the day the gap is actually closed.
+- **Kill-after-exec, not exec-time blocking** (kernel side). The module's
+  exec hook is a kprobe pre-handler on the kernel's own exec path
+  (`bprm_execve`, or `security_bprm_check`), and a kprobe cannot change
+  the probed function's return value, so it cannot veto an exec. It hashes asynchronously on a workqueue and `SIGKILL`s what
+  matched, which means a flagged image has usually already started running
+  — briefly — by the time the kill lands. Exec-time *prevention* is `avd`'s
+  fanotify gate, below.
 
-  Both halves of that gap share one cause — the verdict is computed from a
-  pathname the module copied itself, not from the file the kernel already
-  resolved — and a module cannot fix it, because `security_add_hooks()` is
-  `__init` and unexported, so nothing loaded with `insmod` can ever
-  register `bprm_check_security`. `avd` therefore ships a **fanotify
-  exec gate** (`FAN_OPEN_EXEC_PERM`, discussion #33 option C) that scans
-  the kernel-supplied event fd instead. On marked mounts it closes both
-  halves: there is no second `open()` to race, and no pathname is copied
-  in atomic context for a cold page to defeat.
+  This is what is left of issue #2 after #94. Until then the hook probed
+  `__arm64_sys_execve`/`execveat` and copied the pathname argument out of
+  userspace, which carried two real bypasses, both now closed:
 
-  The gate is **on by default and activates as soon as
+  - **Cold pages.** `strncpy_from_user()` in atomic/kprobe context cannot
+    sleep to fault in a non-resident page, so a pathname on a genuinely
+    cold page returned `-EFAULT` and the hook skipped the exec silently.
+  - **Exec-time TOCTOU** (issue #45). The hash came from a *separate,
+    later* `open()` of that pathname on the workqueue; renaming a clean
+    decoy over the path in between got the decoy hashed while the real
+    image ran.
+
+  Both had one cause — the verdict was computed from a pathname the module
+  copied itself rather than from the file the kernel had already resolved —
+  and both are gone now that the hook pins `bprm->file`, the exact `struct
+  file` the kernel is about to execute, and hashes that. Note this is *not*
+  an LSM hook: `security_add_hooks()` is `__init` and unexported, so
+  nothing loaded with `insmod` can ever register `bprm_check_security`.
+  The kprobe only *observes* a function the kernel's own exec path calls,
+  which gets the kernel's resolved file without registering anything — but
+  also without the ability to deny, hence the first paragraph.
+
+  Which function is a load-time decision (`av_exec_hook_candidates[]` in
+  `av/main.c`), because neither candidate is probeable everywhere:
+  `bprm_execve()` is the single caller of the binfmt search, entered with
+  `bprm->file` already set, but it is file-local to `fs/exec.c` and a
+  compiler free to inline or clone it would take the name away;
+  `security_bprm_check()` is global and cannot be renamed, but since the
+  LSM layer moved hook dispatch to static calls its entry is a jump-label
+  patch site, and `register_kprobe()` rejects those with `-EINVAL`. The
+  module tries `bprm_execve` first, falls back, logs which one it got, and
+  refuses to load if neither works rather than scanning no execs at all.
+
+  Both former bypasses stay closed by regression cases that assert
+  unconditionally on every CI run.
+  `tests/qemu-boot/cold_launcher.c` still execve()s from a pathname page
+  it guarantees is cold (fresh file-backed mapping, never faulted,
+  `MADV_DONTNEED`'d before exec) and now *requires* that exec to be
+  detected and killed. The batch case in `tests/qemu-boot/init.c` renames
+  a clean decoy over an EICAR exec target strictly *after* exec entry
+  (ordered by a sync pipe, with the deferred hash parked by
+  `av_toctou_test_delay_ms` so the rename always lands mid-scan) and
+  requires that no attempt gets the decoy hashed and that the swaps are
+  killed on the EICAR that actually executed, with an interleaved no-swap
+  control detected and killed every time.
+
+  `avd`'s **fanotify exec gate** (`FAN_OPEN_EXEC_PERM`, discussion #33
+  option C) is the preventive half: it scans the kernel-supplied event fd
+  and answers allow/deny *before* the exec proceeds. The gate is **on by
+  default and activates as soon as
   `AVD_FANOTIFY_MARK=<mountpoint>[:...]` names at least one mount** —
   there is deliberately no default mark set, since marking a mount
   suspends every exec on it until `avd` answers, so the scope is the
   operator's call. `AVD_FANOTIFY_EXEC=0` turns the gate off entirely.
-  On an install with no `AVD_FANOTIFY_MARK` set the gate is inactive
-  and the kprobe path is still the only exec check, so both gaps
-  described above are present in full on that install — don't report
-  them, but a way to defeat the *gate* on a mount it covers (or to
-  evade it via a mount it does not cover) is very much in scope.
-- **arm64 only.** The module hooks `__arm64_sys_execve` by symbol name and
-  will not build or load on x86_64.
+  On an install with no `AVD_FANOTIFY_MARK` set the gate is inactive and
+  the kprobe path is the only exec check, so execs on that install are
+  detected-and-killed rather than blocked — don't report that, but a way
+  to defeat the *gate* on a mount it covers (or to evade it via a mount
+  it does not cover) is very much in scope.
+- **arm64 only.** The behavioral hooks resolve `__arm64_sys_*` syscall
+  symbols by name and the module will not build or load on x86_64. (The
+  exec hook itself is arch-independent — `bprm_execve` /
+  `security_bprm_check` — but the rest is not.)
 
 ## Reporting
 

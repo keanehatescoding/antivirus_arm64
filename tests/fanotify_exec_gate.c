@@ -1,5 +1,14 @@
 /* fanotify_exec_gate.c - does FAN_OPEN_EXEC_PERM actually close the two
- * exec-time gaps tracked in issue #2?
+ * exec-time gaps tracked in issue #2, and deny before the image runs?
+ *
+ * Both gaps have since also been closed inside the module (issue #94,
+ * which moved the exec hook onto the kernel's own exec path - a kprobe
+ * on bprm_execve(), or security_bprm_check() - and hashes the pinned
+ * bprm->file). That does not retire this harness: S2
+ * covers the thing the module still cannot do - refuse an exec rather
+ * than kill after it - and S3/S4 remain the independent evidence that
+ * the gate's immunity comes from its mechanism and not from whatever
+ * the module happens to do this month.
  *
  * Discussion #33 recommends option C (a fanotify FAN_OPEN_EXEC_PERM
  * gate in avd, implemented in userspace/avd/avd.c's fanexec_* block)
@@ -20,15 +29,18 @@
  *   S3  gap 1 (TOCTOU). With the exec suspended awaiting our verdict, a
  *       decoy is renamed over the target path. We then read BOTH the
  *       event fd (what fanotify hands a scanner) and a fresh open() of
- *       the pathname (what av_work_fn()'s open_exec_target() does
- *       today) and compare inode + content. The two disagreeing in one
- *       run is the gap and its fix demonstrated side by side.
+ *       the pathname (what av_work_fn() used to do, before issue #94
+ *       moved it to the pinned bprm->file) and compare inode + content.
+ *       The two disagreeing in one run is what any path-based verdict
+ *       is exposed to, shown next to the fd-based one that is not.
  *   S4  gap 2 (cold page). The cold_launcher.c technique - execve() of
  *       a pathname on a never-faulted file-backed page - run against a
- *       fanotify listener instead of the kprobe. The same input that
- *       makes strncpy_from_user() return -EFAULT in atomic context
+ *       fanotify listener instead of the kprobe. The input that used to
+ *       make strncpy_from_user() return -EFAULT in atomic context
  *       should be a non-event here, because nothing in this decision
- *       path copies a pathname from userspace at all.
+ *       path copies a pathname from userspace at all. (Nor does the
+ *       kprobe path any more, since #94; this stays as the independent
+ *       demonstration that the property comes from the mechanism.)
  *
  * This deliberately exercises the MECHANISM with the same flags and
  * call sequence avd's gate uses (FAN_CLASS_CONTENT, FAN_MARK_MOUNT,
@@ -393,6 +405,7 @@ static void s3_toctou(int fan_fd) {
   pid_t child;
 
   note("\nS3  gap 1 (TOCTOU): can a rename swap the file out from under the verdict?");
+  note("    (closed in the module too since #94; this is the gate's own evidence)");
   if (!stage_payload("/bin/true", target, MAL_MARKER) ||
       !stage_payload("/bin/true", decoy, CLEAN_MARKER) ||
       !ident_of_path(target, &want) || !ident_of_path(decoy, &decoy_id)) {
@@ -439,7 +452,7 @@ static void s3_toctou(int fan_fd) {
 
   note("    via the event fd   : ino=%llu content=%s   <- fanotify (option C)",
        (unsigned long long)from_fd.ino, marker_fd);
-  note("    via re-opening path: ino=%llu content=%s   <- open_exec_target() today",
+  note("    via re-opening path: ino=%llu content=%s   <- any path-based verdict",
        (unsigned long long)from_path.ino, marker_path);
 
   check(have_fd_id && ident_eq(&from_fd, &want) &&
@@ -447,7 +460,8 @@ static void s3_toctou(int fan_fd) {
         "the event fd still names the inode that is actually executing");
   check(have_path_id && ident_eq(&from_path, &decoy_id) &&
             strcmp(marker_path, CLEAN_MARKER) == 0,
-        "re-opening the path sees the decoy (the #2 gap, reproduced)");
+        "re-opening the path sees the decoy (what a path-based verdict "
+        "would hash)");
   check(have_fd_id && have_path_id && !ident_eq(&from_fd, &from_path),
         "the two disagree: verdict-from-fd and verdict-from-path differ");
 
@@ -470,6 +484,7 @@ static void s4_cold_pathname(int fan_fd) {
   pid_t child;
 
   note("\nS4  gap 2 (cold page): the cold_launcher technique vs a fanotify listener");
+  note("    (closed in the module too since #94; this is the gate's own evidence)");
   if (!stage_payload("/bin/true", target, MAL_MARKER) ||
       !ident_of_path(target, &want)) {
     check(false, "staged the cold-exec target");
@@ -508,7 +523,8 @@ static void s4_cold_pathname(int fan_fd) {
   waitpid(child, &status, 0);
   note("    child: %s", status_str(status));
   check(WIFEXITED(status) && WEXITSTATUS(status) != 0,
-        "the cold exec was blocked (kprobe path fails open here - see #2)");
+        "the cold exec was blocked before the image ran (the kprobe path "
+        "detects this too since #94, but only after the fact)");
   unlink(staging);
 }
 

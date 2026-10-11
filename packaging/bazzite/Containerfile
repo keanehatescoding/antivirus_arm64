@@ -16,8 +16,10 @@
 # This is an EXAMPLE you adapt: set BASE_IMAGE to the aarch64 Atomic image
 # you actually rebase from, and HYPRAV_REF to the commit/tag you want.
 #
-# aarch64 only: av.ko hooks __arm64_sys_execve (see SECURITY.md). BASE_IMAGE
-# must therefore be an aarch64 Atomic image.
+# aarch64 only: av.ko hooks __arm64_sys_* syscall symbols (see
+# SECURITY.md). BASE_IMAGE must therefore be an aarch64 Atomic image. The
+# exec hook itself is arch-independent and needs no kernel config beyond
+# CONFIG_KPROBES=y.
 
 # Pick an aarch64 Fedora Atomic base. Fedora Silverblue/Kinoite publish
 # aarch64; substitute an aarch64 Bazzite image here if you have one.
