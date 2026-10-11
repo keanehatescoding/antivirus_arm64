@@ -74,6 +74,7 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/pid.h>
 #include <linux/proc_fs.h>
@@ -578,14 +579,97 @@ struct av_work {
 };
 
 struct algo_ctx {
-  const char *crypto_name;
   bool active;
+  /* Borrowed from the matching av_tfm_* below (allocated once in
+   * av_crypto_init(), freed in av_crypto_exit()) - never allocated or
+   * freed per-exec here. Every crypto_shash_* call on it runs under
+   * av_tfm_lock. */
   struct crypto_shash *tfm;
   struct shash_desc *desc;
   u8 *digest_bin;
   size_t digest_bin_len;
   char *digest_hex; /* points into the matching field of av_digest */
 };
+
+/* Cached crypto_shash transforms, one per hash algorithm (issue #95).
+ * hash_file_multi() used to crypto_alloc_shash() a fresh transform on
+ * every exec, so an allocation failure under memory pressure skipped
+ * the signature match AND the daemon scan - the exec ran with no
+ * verdict at all. Issue #1 only made that fail-open loud (the
+ * ratelimited event=hash-error reason=crypto-alloc line that used to
+ * live in the alloc loop below); it stayed a deterministic bypass for
+ * anyone able to create memory pressure right before the target exec.
+ *
+ * Allocating once at load moves that failure to module-load time,
+ * where it is loud and, for SHA-256, fatal: av_behavior_record_exec()'s
+ * self-delete correlation and the netlink scan request to avd both key
+ * on the SHA-256 digest unconditionally, so loading without it would
+ * silently degrade every exec to "no hash at all". MD5/SHA-1 only
+ * matter when the sigtable holds entries of that algo, so a missing
+ * transform (an algo the running kernel doesn't provide) warns and
+ * skips that algo instead of refusing to load - a sigtable entry added
+ * later for an unavailable algo then never matches, which is no worse
+ * than the sigtable holding no such entries at all.
+ *
+ * av_tfm_lock is taken around each individual crypto_shash_* call
+ * (init/update/final), never across file IO: av_wq runs av_work_fn()
+ * on multiple threads at once, and sharing one transform across them
+ * must not interleave on it. Locking per call (rather than once for
+ * the whole file) keeps concurrent execs hashing in parallel - a slow
+ * or huge file being read by one worker must not stall every other
+ * exec's verdict behind a single lock-holder. Sleepable context only
+ * (workqueue, never a kprobe pre-handler), so a plain mutex is fine.
+ *
+ * Mirrors sister antivirus_x86-64 cab586a3 (its issue #118). */
+static struct crypto_shash *av_tfm_md5;
+static struct crypto_shash *av_tfm_sha1;
+static struct crypto_shash *av_tfm_sha256;
+static DEFINE_MUTEX(av_tfm_lock);
+
+static int __init av_crypto_init(void) {
+  /* Mandatory algo first: on failure nothing else is allocated yet, so
+   * the caller can just propagate err with no cleanup. */
+  av_tfm_sha256 = crypto_alloc_shash("sha256", 0, 0);
+  if (IS_ERR(av_tfm_sha256)) {
+    int err = PTR_ERR(av_tfm_sha256);
+
+    av_tfm_sha256 = NULL;
+    pr_err("kernel-av: crypto_alloc_shash(sha256) failed: %d - refusing to "
+           "load without it\n",
+           err);
+    return err;
+  }
+  av_tfm_md5 = crypto_alloc_shash("md5", 0, 0);
+  if (IS_ERR(av_tfm_md5)) {
+    pr_warn("kernel-av: crypto_alloc_shash(md5) failed: %d - MD5 sigtable "
+            "entries will never match\n",
+            (int)PTR_ERR(av_tfm_md5));
+    av_tfm_md5 = NULL;
+  }
+  av_tfm_sha1 = crypto_alloc_shash("sha1", 0, 0);
+  if (IS_ERR(av_tfm_sha1)) {
+    pr_warn("kernel-av: crypto_alloc_shash(sha1) failed: %d - SHA-1 sigtable "
+            "entries will never match\n",
+            (int)PTR_ERR(av_tfm_sha1));
+    av_tfm_sha1 = NULL;
+  }
+  return 0;
+}
+
+static void av_crypto_exit(void) {
+  /* No lifetime worry: both callers run after every hash_file_multi()
+   * has finished - av_exit() calls this after destroy_workqueue()
+   * flushes all pending work, and av_init()'s error paths only reach
+   * it when init failed before any work could be queued.
+   * crypto_free_shash() tolerates NULL, so the best-effort MD5/SHA-1
+   * transforms need no guard. */
+  crypto_free_shash(av_tfm_md5);
+  crypto_free_shash(av_tfm_sha1);
+  crypto_free_shash(av_tfm_sha256);
+  av_tfm_md5 = NULL;
+  av_tfm_sha1 = NULL;
+  av_tfm_sha256 = NULL;
+}
 
 /* Captures the identity of the file that was ACTUALLY opened and
  * hashed by hash_file_multi(), so a signature/daemon verdict can be
@@ -673,9 +757,13 @@ static int hash_file_multi(const char *path, const struct path *pwd,
   bool need_md5 = av_sigtable_algo_count(AV_ALGO_MD5) > 0;
   bool need_sha1 = av_sigtable_algo_count(AV_ALGO_SHA1) > 0;
   struct algo_ctx ctx[3] = {
-      {"md5", need_md5, NULL, NULL, md5_bin, sizeof(md5_bin), out->md5},
-      {"sha1", need_sha1, NULL, NULL, sha1_bin, sizeof(sha1_bin), out->sha1},
-      {"sha256", true, NULL, NULL, sha256_bin, sizeof(sha256_bin), out->sha256},
+      {need_md5 && av_tfm_md5, av_tfm_md5, NULL, md5_bin, sizeof(md5_bin),
+       out->md5},
+      {need_sha1 && av_tfm_sha1, av_tfm_sha1, NULL, sha1_bin, sizeof(sha1_bin),
+       out->sha1},
+      /* SHA-256 is always usable here: av_crypto_init() refuses to load
+       * without it (see av_tfm_sha256), so no NULL check is needed. */
+      {true, av_tfm_sha256, NULL, sha256_bin, sizeof(sha256_bin), out->sha256},
   };
   void *buf = NULL;
   loff_t pos = 0;
@@ -724,21 +812,10 @@ static int hash_file_multi(const char *path, const struct path *pwd,
   for (i = 0; i < 3; i++) {
     if (!ctx[i].active)
       continue;
-    ctx[i].tfm = crypto_alloc_shash(ctx[i].crypto_name, 0, 0);
-    if (IS_ERR(ctx[i].tfm)) {
-      ret = PTR_ERR(ctx[i].tfm);
-      /* Distinct from a generic open/hash skip: an allocation failure
-       * here means this exec bypasses BOTH the signature check and the
-       * daemon scan below with no verdict at all (issue #1). Log it so
-       * memory-pressure-induced fail-opens leave an audit trail instead
-       * of vanishing into the generic skip path. Ratelimited: this fires
-       * at most once per exec under sustained pressure. */
-      pr_warn_ratelimited("kernel-av: event=hash-error reason=crypto-alloc "
-                          "algo=%s err=%d\n",
-                          ctx[i].crypto_name, ret);
-      ctx[i].tfm = NULL;
-      goto out;
-    }
+    /* Per-exec shash_desc on the shared cached transform (see
+     * av_tfm_*): the transforms themselves were allocated at load, so
+     * only this desc and the read buffer below can still fail with
+     * -ENOMEM here, and av_work_fn() logs those distinctly. */
     ctx[i].desc = kmalloc(
         sizeof(*ctx[i].desc) + crypto_shash_descsize(ctx[i].tfm), GFP_KERNEL);
     if (!ctx[i].desc) {
@@ -746,7 +823,11 @@ static int hash_file_multi(const char *path, const struct path *pwd,
       goto out;
     }
     ctx[i].desc->tfm = ctx[i].tfm;
+    /* Per-op av_tfm_lock (see its comment): serialize on the shared
+     * transform for exactly this call, never across file IO. */
+    mutex_lock(&av_tfm_lock);
     ret = crypto_shash_init(ctx[i].desc);
+    mutex_unlock(&av_tfm_lock);
     if (ret)
       goto out;
   }
@@ -778,7 +859,11 @@ static int hash_file_multi(const char *path, const struct path *pwd,
     for (i = 0; i < 3; i++) {
       if (!ctx[i].active)
         continue;
+      /* Same per-op locking as the init loop above - the kernel_read()
+       * itself stays outside the lock so workers hash in parallel. */
+      mutex_lock(&av_tfm_lock);
       ret = crypto_shash_update(ctx[i].desc, buf, n);
+      mutex_unlock(&av_tfm_lock);
       if (ret)
         goto out;
     }
@@ -800,7 +885,9 @@ static int hash_file_multi(const char *path, const struct path *pwd,
   for (i = 0; i < 3; i++) {
     if (!ctx[i].active)
       continue;
+    mutex_lock(&av_tfm_lock);
     ret = crypto_shash_final(ctx[i].desc, ctx[i].digest_bin);
+    mutex_unlock(&av_tfm_lock);
     if (ret)
       goto out;
     bin_to_hex(ctx[i].digest_bin, ctx[i].digest_bin_len, ctx[i].digest_hex);
@@ -808,11 +895,10 @@ static int hash_file_multi(const char *path, const struct path *pwd,
 
 out:
   kfree(buf);
-  for (i = 0; i < 3; i++) {
+  /* Only the per-exec descs are ours to free - ctx[i].tfm is borrowed
+   * from the cached av_tfm_* set and outlives every hash. */
+  for (i = 0; i < 3; i++)
     kfree(ctx[i].desc);
-    if (ctx[i].tfm)
-      crypto_free_shash(ctx[i].tfm);
-  }
   filp_close(f, NULL);
   return ret;
 }
@@ -1121,13 +1207,15 @@ static void av_work_fn(struct work_struct *w) {
 
   ret = hash_file_multi(aw->path, &aw->pwd, &digest, &ident);
   if (ret) {
-    /* hash_file_multi() already logs crypto-alloc failures with their
-     * algo/err detail; log every failure here as well with path/pid/err
-     * so no hash bypass - ENOMEM, -EFAULT, -EFBIG, or a plain missing
-     * file - is a silent skip of both the signature and daemon checks
-     * (issue #1). Still fail-open by design (see the daemon fail-open
-     * note below), but now with a greppable audit trail. Ratelimited:
-     * this can fire once per exec under sustained pressure. */
+    /* Log every failure with path/pid/err so no hash bypass - -ENOMEM
+     * (the per-exec shash_desc or read buffer; the transforms are
+     * allocated once at load since #95, so their failure now fails the
+     * load instead of an exec), a crypto_shash_init/update/final
+     * error, -EFAULT, -EFBIG, or a plain missing file - is a silent
+     * skip of both the signature and daemon checks (issue #1). Still
+     * fail-open by design (see the daemon fail-open note below), but
+     * with a greppable audit trail. Ratelimited: this can fire once
+     * per exec under sustained pressure. */
     pr_warn_ratelimited("kernel-av: event=hash-error path=\"%s\" pid=%d "
                         "err=%d (skipped signature and daemon checks)\n",
                         log_path, pid_nr(aw->target_pid), ret);
@@ -1952,9 +2040,17 @@ static int __init av_init(void) {
 
   av_check_preexisting_taint();
 
-  ret = av_sigtable_init();
+  /* Before anything that can queue work: hash_file_multi() borrows
+   * these transforms on every exec and av_crypto_init() is what makes
+   * SHA-256 availability a load-time decision instead of a per-exec
+   * fail-open (issue #95). */
+  ret = av_crypto_init();
   if (ret)
     return ret;
+
+  ret = av_sigtable_init();
+  if (ret)
+    goto err_crypto;
 
   ret = av_sigtable_proc_init();
   if (ret) {
@@ -2127,6 +2223,10 @@ err_proc:
   av_sigtable_proc_exit();
 err_sigtable:
   av_sigtable_exit();
+err_crypto:
+  /* Funnels every av_init() failure path after av_crypto_init()
+   * succeeded, so one call here covers them all. */
+  av_crypto_exit();
   return ret;
 }
 
@@ -2145,6 +2245,7 @@ static void __exit av_exit(void) {
   remove_proc_entry("kernel_av_daemon_policy", NULL);
   av_sigtable_proc_exit();
   av_sigtable_exit();
+  av_crypto_exit();
   pr_info("kernel-av: unloaded\n");
 }
 
