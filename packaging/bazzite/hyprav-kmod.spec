@@ -43,7 +43,7 @@ Version:        %{pkgversion}
 Release:        1%{?dist}
 Summary:        HyprAV kprobe-based execve/file-event kernel module (akmod)
 
-License:        GPL-3.0-only
+License:        GPL-2.0-only OR MIT
 URL:            https://github.com/keanehatescoding/antivirus
 Source0:        %{url}/archive/%{gitcommit}/antivirus-%{gitcommit}.tar.gz
 

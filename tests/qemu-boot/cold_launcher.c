@@ -20,8 +20,8 @@
  *
  * An earlier version of this file passed a plain .rodata string
  * literal straight to execve() and relied on that freshness alone.
- * Measured (issue #2, kernels 6.12.107/6.18.48/7.2.2): it did NOT
- * reproduce - every run detected and killed the inner exec, most
+ * Measured (issue #2, against the then-current kernel matrix): it
+ * did NOT reproduce - every run detected and killed the inner exec, most
  * likely because the launcher is small enough for fault-around to
  * pull the literal's page in alongside .text before execve() runs,
  * so the page is never actually cold. Freshness is necessary but not

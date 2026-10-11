@@ -48,7 +48,11 @@ pkgrel=1
 # route if you only want avd/avctl on x86_64).
 arch=('aarch64')
 url="https://github.com/keanehatescoding/antivirus"
-license=('GPL-3.0-only')
+# Dual-licensed per LICENSE (GPL-2.0-only OR MIT) - matches
+# packaging/arch/PKGBUILD. Expressed as a single SPDX "A OR B" entry
+# because Arch treats multiple array entries as license AND; see
+# packaging/arch/PKGBUILD's own comment for the full rationale.
+license=('GPL-2.0-only OR MIT')
 # Same list as packaging/arch/PKGBUILD, with `linux-headers` swapped for
 # `linux-cachyos-headers` (see header comment #1). 'dkms'/'polkit' are
 # here only to satisfy namcap's split-package makedepends rule, and
