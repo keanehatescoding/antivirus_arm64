@@ -605,11 +605,9 @@ struct algo_ctx {
  * self-delete correlation and the netlink scan request to avd both key
  * on the SHA-256 digest unconditionally, so loading without it would
  * silently degrade every exec to "no hash at all". MD5/SHA-1 only
- * matter when the sigtable holds entries of that algo, so a missing
- * transform (an algo the running kernel doesn't provide) warns and
- * skips that algo instead of refusing to load - a sigtable entry added
- * later for an unavailable algo then never matches, which is no worse
- * than the sigtable holding no such entries at all.
+ * matter when the sigtable holds entries of that algo, so a kernel
+ * that genuinely doesn't provide one is allowed to load without it -
+ * but only that case; see av_alloc_optional_tfm().
  *
  * av_tfm_lock is taken around each individual crypto_shash_* call
  * (init/update/final), never across file IO: av_wq runs av_work_fn()
@@ -620,15 +618,84 @@ struct algo_ctx {
  * exec's verdict behind a single lock-holder. Sleepable context only
  * (workqueue, never a kprobe pre-handler), so a plain mutex is fine.
  *
- * Mirrors sister antivirus_x86-64 cab586a3 (its issue #118). */
+ * Mirrors sister antivirus_x86-64 cab586a3 (its issue #118), with two
+ * deliberate differences - don't "re-sync" them away: av_init() frees
+ * these transforms on every failure path (sister leaks them when
+ * av_sigtable_init() fails), and an optional algo's allocation failure
+ * is only survivable when the kernel genuinely lacks the algorithm
+ * (see av_alloc_optional_tfm()). */
 static struct crypto_shash *av_tfm_md5;
 static struct crypto_shash *av_tfm_sha1;
 static struct crypto_shash *av_tfm_sha256;
 static DEFINE_MUTEX(av_tfm_lock);
 
+static void av_crypto_exit(void) {
+  /* No lifetime worry: every caller runs after any hash_file_multi()
+   * has finished - av_exit() calls this after destroy_workqueue()
+   * flushes all pending work, and av_crypto_init()/av_init()'s error
+   * paths only reach it when init failed before any work could be
+   * queued. crypto_free_shash() tolerates NULL, so a transform whose
+   * allocation never happened needs no guard. */
+  crypto_free_shash(av_tfm_md5);
+  crypto_free_shash(av_tfm_sha1);
+  crypto_free_shash(av_tfm_sha256);
+  av_tfm_md5 = NULL;
+  av_tfm_sha1 = NULL;
+  av_tfm_sha256 = NULL;
+}
+
+/* Allocates one of the two OPTIONAL transforms (MD5, SHA-1), storing
+ * it in *tfm_out. Returns 0 when *tfm_out is usable AND when the
+ * running kernel genuinely has no such algorithm; any other failure is
+ * returned to fail the module load.
+ *
+ * The distinction matters because the decision is permanent for the
+ * module's whole lifetime: hash_file_multi() skips an algo whose
+ * transform is NULL on EVERY exec, so swallowing a transient -ENOMEM
+ * here (crypto_alloc_shash() can fail on allocation, not just on a
+ * missing algorithm) would leave MD5/SHA-1 sigtable entries unable to
+ * match forever after a momentary memory shortage at load - the exact
+ * silent, durable degradation #95 is about, just moved from per-exec
+ * to per-load. A refused load is visible and retryable; an algo
+ * silently disabled until the next reload is neither.
+ *
+ * -ENOENT ("no such algorithm") and -ENOPKG (algorithm not built in
+ * and no module to autoload) are the two errors that genuinely mean
+ * "this kernel can't do it", and only those downgrade to a warning: a
+ * sigtable entry added later for an algo the kernel doesn't implement
+ * then never matches, which is no worse than the sigtable holding no
+ * such entries at all. */
+static int __init av_alloc_optional_tfm(const char *algo,
+                                        struct crypto_shash **tfm_out) {
+  struct crypto_shash *tfm = crypto_alloc_shash(algo, 0, 0);
+  int err;
+
+  if (!IS_ERR(tfm)) {
+    *tfm_out = tfm;
+    return 0;
+  }
+
+  err = PTR_ERR(tfm);
+  *tfm_out = NULL;
+  if (err == -ENOENT || err == -ENOPKG) {
+    pr_warn("kernel-av: crypto_alloc_shash(%s) unavailable on this kernel: "
+            "%d - %s sigtable entries will never match\n",
+            algo, err, algo);
+    return 0;
+  }
+  pr_err("kernel-av: crypto_alloc_shash(%s) failed: %d - refusing to load "
+         "rather than disabling %s signature matching for the life of the "
+         "module (retry once the failure clears)\n",
+         algo, err, algo);
+  return err;
+}
+
 static int __init av_crypto_init(void) {
-  /* Mandatory algo first: on failure nothing else is allocated yet, so
-   * the caller can just propagate err with no cleanup. */
+  int ret;
+
+  /* Mandatory algo first: on failure nothing is allocated yet, so this
+   * can return without cleanup. Every error is fatal here - including
+   * a transient one - since a load without SHA-256 is useless. */
   av_tfm_sha256 = crypto_alloc_shash("sha256", 0, 0);
   if (IS_ERR(av_tfm_sha256)) {
     int err = PTR_ERR(av_tfm_sha256);
@@ -639,36 +706,20 @@ static int __init av_crypto_init(void) {
            err);
     return err;
   }
-  av_tfm_md5 = crypto_alloc_shash("md5", 0, 0);
-  if (IS_ERR(av_tfm_md5)) {
-    pr_warn("kernel-av: crypto_alloc_shash(md5) failed: %d - MD5 sigtable "
-            "entries will never match\n",
-            (int)PTR_ERR(av_tfm_md5));
-    av_tfm_md5 = NULL;
-  }
-  av_tfm_sha1 = crypto_alloc_shash("sha1", 0, 0);
-  if (IS_ERR(av_tfm_sha1)) {
-    pr_warn("kernel-av: crypto_alloc_shash(sha1) failed: %d - SHA-1 sigtable "
-            "entries will never match\n",
-            (int)PTR_ERR(av_tfm_sha1));
-    av_tfm_sha1 = NULL;
-  }
-  return 0;
-}
 
-static void av_crypto_exit(void) {
-  /* No lifetime worry: both callers run after every hash_file_multi()
-   * has finished - av_exit() calls this after destroy_workqueue()
-   * flushes all pending work, and av_init()'s error paths only reach
-   * it when init failed before any work could be queued.
-   * crypto_free_shash() tolerates NULL, so the best-effort MD5/SHA-1
-   * transforms need no guard. */
-  crypto_free_shash(av_tfm_md5);
-  crypto_free_shash(av_tfm_sha1);
-  crypto_free_shash(av_tfm_sha256);
-  av_tfm_md5 = NULL;
-  av_tfm_sha1 = NULL;
-  av_tfm_sha256 = NULL;
+  ret = av_alloc_optional_tfm("md5", &av_tfm_md5);
+  if (ret)
+    goto err;
+  ret = av_alloc_optional_tfm("sha1", &av_tfm_sha1);
+  if (ret)
+    goto err;
+  return 0;
+
+err:
+  /* Frees whatever did get allocated (SHA-256 always, MD5 if SHA-1 was
+   * the one that failed) so a refused load leaks nothing. */
+  av_crypto_exit();
+  return ret;
 }
 
 /* Captures the identity of the file that was ACTUALLY opened and
