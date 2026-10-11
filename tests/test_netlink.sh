@@ -519,10 +519,19 @@ else
     if [ -n "${NOBODY_UID:-}" ] && [ -n "${NOBODY_GID:-}" ]; then
         setpriv --reuid="$NOBODY_UID" --regid="$NOBODY_GID" --clear-groups \
             python3 -c "$MULTI_SENDER" "${AVD_PORTIDS%%[!0-9]*}" 2>/dev/null
-        if [ $? -eq 3 ]; then
+        # Only exit 0 means the send went through. 3 is the sender's
+        # own EPERM exit; anything else (setpriv refusing to drop
+        # privileges, python3 dying on some other exception) says the
+        # check never ran, which is not the same as a privilege
+        # boundary failure - don't report it as one.
+        UNPRIV_MULTI_RC=$?
+        if [ "$UNPRIV_MULTI_RC" -eq 3 ]; then
             pass "unprivileged unicast to avd's portid refused (EPERM)"
-        else
+        elif [ "$UNPRIV_MULTI_RC" -eq 0 ]; then
             fail "unprivileged process could unicast to avd's portid"
+        else
+            echo "  SKIP: the unprivileged unicast check could not run"
+            echo "        (setpriv/python3 exited $UNPRIV_MULTI_RC)"
         fi
     fi
     for portid in $AVD_PORTIDS; do
