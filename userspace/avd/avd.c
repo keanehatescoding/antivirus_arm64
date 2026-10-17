@@ -2192,8 +2192,11 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
    *    (SHA-256, fuzzy, TLSH all read a mutable inode with no writer
    *    coordination - there is no writer-lock protocol anywhere in this
    *    codebase to enforce). A lock-or-stable-filesystem correction
-   *    would need one invented first; the exec-time TOCTOU at large is
-   *    tracked separately (issue #2 / LSM design). What this layer does
+   *    would need one invented first. Note this is a different problem
+   *    from issue #2's exec-time TOCTOU, which was about scanning the
+   *    wrong FILE and is closed (the module hashes the exec's pinned
+   *    bprm->file since #94); this one is about a file changing under a
+   *    scan of the right file. What this layer does
    *    guarantee is that any change the filesystem bothered to record
    *    surfaces as incomplete rather than clean.
    * 3. Aggregate memory: snapshots are private anonymous copies, so
@@ -2590,28 +2593,37 @@ static void *scan_worker_main(void *arg) {
 }
 
 /* ------------------------------------------------------------------
- * fanotify exec gate - the #2 exec path, off a self-copied pathname
+ * fanotify exec gate - the #2 exec path, and the only one that can deny
  *
- * Issue #2 tracks two deterministic exec-time gaps, both rooted in one
- * thing: the exec verdict is computed from a pathname the kernel module
- * copied itself, instead of from the file object the kernel already
+ * Issue #2 tracked two deterministic exec-time gaps, both rooted in one
+ * thing: the exec verdict was computed from a pathname the kernel module
+ * copied itself, instead of from the file object the kernel had already
  * resolved.
  *
- *   gap 1 (TOCTOU)     av_work_fn() re-opens the pathname via
- *                      open_exec_target(), a second and later open than
- *                      the one execve() actually used. Nothing ties the
- *                      two to the same inode.
+ *   gap 1 (TOCTOU)     av_work_fn() re-opened the pathname, a second
+ *                      and later open than the one execve() actually
+ *                      used. Nothing tied the two to the same inode.
  *   gap 2 (cold page)  the kprobe pre-handler runs in atomic context
  *                      and cannot fault in a userspace page, so
- *                      strncpy_from_user() on a cold pathname returns
- *                      -EFAULT and the handler allows the exec.
+ *                      strncpy_from_user() on a cold pathname returned
+ *                      -EFAULT and the handler allowed the exec.
  *
- * Discussion #33 works through why neither is fixable where they live:
- * security_add_hooks() is __init and unexported, so an insmod'd module
- * can never register the bprm_check_security hook that would close
- * both. Option C moves the *exec decision only* out of the module and
- * into this daemon, on top of fanotify FAN_OPEN_EXEC_PERM, which hands
- * us an open fd to the exact file the kernel is about to execute.
+ * Discussion #33 works through why neither could be fixed by
+ * REGISTERING for the kernel's resolved file: security_add_hooks() is
+ * __init and unexported, so an insmod'd module can never register the
+ * bprm_check_security hook. Option C moves the *exec decision only* out
+ * of the module and into this daemon, on top of fanotify
+ * FAN_OPEN_EXEC_PERM, which hands us an open fd to the exact file the
+ * kernel is about to execute.
+ *
+ * Both gaps have since also been closed inside the module (issue #94):
+ * it kprobes the kernel's own exec path - bprm_execve(), or
+ * security_bprm_check() where that one is probeable, observing rather
+ * than registering - and hashes the pinned bprm->file.
+ * That does not make this gate redundant, because a kprobe pre-handler
+ * cannot change the probed function's return value: the module detects
+ * against the right bytes and SIGKILLs, while only this gate can refuse
+ * an exec before the image runs. See the next paragraph.
  *
  * Both gaps then close by construction rather than by narrowing a
  * window: nothing is re-opened by path, so there is no second inode to

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 #
-# tests/test_fanotify_exec_gate.sh - covers the fanotify exec gate that
-# closes issue #2's two exec-time gaps (discussion #33, option C):
-# avd's fanexec_* block in userspace/avd/avd.c.
+# tests/test_fanotify_exec_gate.sh - covers the fanotify exec gate
+# (discussion #33, option C): avd's fanexec_* block in
+# userspace/avd/avd.c. It is the only exec check in this project that
+# can DENY an exec; the module's kprobe path detects and kills after the
+# fact. It also closed issue #2's two exec-time gaps, which issue #94
+# has since closed in the module as well - so the invariants below are
+# about this gate's own mechanism, not about compensating for the
+# module.
 #
 # Two parts, deliberately separate because they cover different things:
 #
@@ -16,8 +21,9 @@
 #   2. LIVE mechanism checks (tests/fanotify_exec_gate.c), which
 #      actually exercise FAN_OPEN_EXEC_PERM against a real kernel with
 #      the same flags and call sequence avd uses, including a
-#      deterministic rename-swap that demonstrates #2's gap 1 and its
-#      fix side by side. Needs root, so this half self-elevates via
+#      deterministic rename-swap that demonstrates a path-based
+#      verdict's gap 1 and the fd-based fix side by side. Needs root, so
+#      this half self-elevates via
 #      pkexec exactly as tests/run_all.sh does.
 #
 # WHAT THIS DOES NOT COVER, stated up front because #34's lesson here
@@ -110,7 +116,7 @@ else
 
     # The regression this guards against is the exec verdict drifting
     # back onto a self-resolved pathname - which is exactly what
-    # av_work_fn()'s open_exec_target() does and what #2 is about. A
+    # av_work_fn() did before issue #94 and what #2 was about. A
     # bare open()/openat() of the recovered path here would silently
     # reintroduce gap 1 while every other test kept passing.
     if grep -qE '\<open(at)?\(' <<<"$HANDLE_BODY"; then
