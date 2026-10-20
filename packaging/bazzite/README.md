@@ -7,8 +7,10 @@ module like `av.ko` has to be delivered. The `packaging/fedora/hyprav.spec`
 DKMS package is written for a **traditional, mutable** Fedora install and
 is *not* the recommended path here — see below.
 
-> **arm64 only.** `av.ko` hooks `__arm64_sys_execve` by symbol name and
-> only builds/loads on aarch64 (see `SECURITY.md`). Use an **aarch64**
+> **arm64 only.** `av.ko` hooks `__arm64_sys_*` syscall symbols by name
+> and only builds/loads on aarch64 (see `SECURITY.md`); its exec hook is
+> arch-independent and needs no kernel config beyond `CONFIG_KPROBES=y`.
+> Use an **aarch64**
 > Atomic base (Fedora Silverblue/Kinoite aarch64, or an aarch64 Bazzite
 > image where one exists). The userspace pieces (`avd`, `avctl`,
 > `av-gui`) are arch-independent.

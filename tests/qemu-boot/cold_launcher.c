@@ -1,9 +1,24 @@
-/* Dedicated regression case for the documented gap in av/main.c's
- * handler_pre()/handler_pre_execveat() (see that comment, README.md's
- * CI section, SECURITY.md, and issue #2): strncpy_from_user() in
- * atomic/kprobe context can't sleep to fault in a userspace page that
- * isn't resident yet, so a pathname argument on a genuinely cold page
- * makes the hook silently skip hashing/killing.
+/* Dedicated regression guard against av.ko ever again deciding what to
+ * scan from a userspace pathname pointer (issues #2 and #94; see also
+ * README.md's CI section and SECURITY.md).
+ *
+ * The gap this was built to reproduce: while the exec hook probed
+ * __arm64_sys_execve[at] it copied the pathname argument out of
+ * userspace with strncpy_from_user(), in atomic/kprobe context, where
+ * it cannot sleep to fault in a page that is not resident yet. A
+ * pathname argument on a genuinely cold page therefore made the hook
+ * fail fast with -EFAULT and silently skip hashing/killing.
+ *
+ * It is closed: the hook now probes the kernel's own exec path
+ * (bprm_execve(), or security_bprm_check()) and pins
+ * bprm->file - the struct file the kernel has already opened and is
+ * about to execute - so there is no userspace copy left on the exec
+ * path to fail. This binary is kept, and init.c now REQUIRES the exec
+ * below to be detected and killed: a guaranteed-cold pathname page is
+ * the sharpest available test that the decision really is made from
+ * the kernel's own resolved file. If this exec ever survives again,
+ * exec-time detection regressed (see av/main.c's
+ * handler_pre_bprm_check() and init.c's cold-pathname block).
  *
  * This is a SEPARATE, minimal binary rather than another code path in
  * init.c on purpose: the only reliable way to guarantee a pathname
@@ -39,17 +54,17 @@
  *     belt-and-braces: a no-op when (as intended) nothing has
  *     faulted the range yet, and a re-eviction if some future
  *     edit, libc startup path, or toolchain change ever touches
- *     it first. Either way the kprobe handler below sees a cold
+ *     it first. Either way the exec below is driven from a cold
  *     page.
  *   - Page-cache state is deliberately NOT part of this:
  *     strncpy_from_user() walks page tables without faulting, so
  *     only pte absence matters to the handler, and no
  *     fadvise()/cache-drop is needed to reproduce the -EFAULT.
  *
- * Deliberately does NOT touch the pathname first (that's init.c's
- * main test's job, demonstrating detection working for the common
- * case) - the entire point here is reproducing the cold-page bypass
- * on purpose, not avoiding it.
+ * Deliberately does NOT touch the pathname first - that is init.c's
+ * run_and_wait() job, which faults the page in so its own checks
+ * exercise the common case. Keeping exactly one of the two paths cold
+ * is what makes them bracket the question from both sides.
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -90,15 +105,17 @@ int main(void) {
   argv[1] = NULL;
   execve(arg, argv, NULL);
   /* Only reached if execve itself failed (expected: eicar_cold.com is
-   * plain text, not a valid ELF, so this fails ENOEXEC). If the
-   * kprobe hook DID hash and flag this exec before the syscall's own
-   * failure - i.e. the cold-pathname bug above is ever fixed - the
-   * kill is workqueue-deferred (async) and can race against this
-   * process's own exit. Same race, same fix as init.c's identical
-   * usleep(1000000) after its own failed execv(): without this delay,
-   * a fixed bypass could still get misreported as reproduced just
-   * because this process exited before the (now-successful) kill
-   * arrived. */
+   * plain text, not a valid ELF, so this fails ENOEXEC - the hook runs
+   * before any binfmt handler has looked at the image, so the exec is
+   * scanned anyway). The kill is
+   * workqueue-deferred (async) and races this process's own exit, so
+   * linger: without this delay a working detection could be
+   * misreported as a surviving exec just because this process got out
+   * first. Same race, same fix as init.c's identical usleep(1000000)
+   * after its own failed execv(). init.c asserts the dmesg verdict
+   * line rather than the SIGKILL for the same reason, so losing this
+   * race is not itself a failure there - it is kept tight anyway
+   * because a killed process is the cleaner signal. */
   usleep(1000000);
   return 1;
 }
