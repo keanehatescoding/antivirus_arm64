@@ -36,10 +36,13 @@ Description: HyprAV kprobe-based execve/file-event kernel module (DKMS)
  fuzzy hashing). Ships as DKMS source and is rebuilt automatically
  against every installed kernel.
  .
- arm64 only as shipped - the module hooks __arm64_sys_execve by symbol
- name; x86_64 needs source changes to hook __x64_sys_execve instead
- (and reinstates the raw unlink(2)/rename(2) kprobes, which arm64
- doesn't have - see av/main.c).
+ arm64 only as shipped - the behavioral hooks resolve __arm64_sys_*
+ syscall symbols by name; x86_64 needs source changes for the
+ __x64_sys_* equivalents (and reinstates the raw unlink(2)/rename(2)
+ kprobes, which arm64 doesn't have - see av/main.c). The exec hook
+ itself is arch-independent - it probes bprm_execve, or
+ security_bprm_check as a fallback - and needs no kernel config beyond
+ CONFIG_KPROBES=y.
 
 Package: hyprav
 Architecture: arm64
