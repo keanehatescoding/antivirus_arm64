@@ -122,10 +122,12 @@ via kprobes and talks to the avd userspace daemon over netlink for
 anything heavier. Ships as DKMS source and is rebuilt automatically
 against every installed kernel.
 
-arm64 only as shipped - the module hooks __arm64_sys_execve by symbol
-name; x86_64 needs source changes to hook __x64_sys_execve instead
-(and reinstates the raw unlink(2)/rename(2) kprobes, which arm64
-doesn't have - see av/main.c).
+arm64 only as shipped - the behavioral hooks resolve __arm64_sys_*
+syscall symbols by name; x86_64 needs source changes for the __x64_sys_*
+equivalents (and reinstates the raw unlink(2)/rename(2) kprobes, which
+arm64 doesn't have - see av/main.c). The exec hook itself is
+arch-independent (bprm_execve, or security_bprm_check as a fallback) and
+needs no kernel config beyond CONFIG_KPROBES=y.
 
 %package -n hyprav-gui
 Summary:        GTK4 management console for HyprAV

@@ -193,10 +193,11 @@ void av_behavior_sensitive_proc_exit(void);
  * SCOPING NOTE, confirmed during testing: since this checks the
  * target's CURRENT exe_file, it only protects a process that has
  * actually BECOME the protected binary by the time av_kill()/
- * kill_with_reason() runs (async, on the workqueue - see the TOCTOU
- * note in main.c). For av_kill()'s exec-time signature path
- * specifically, that means a still-in-flight or failed execve() (e.g.
- * a non-executable file, or a real race) is not protected - the
+ * kill_with_reason() runs (async, on the workqueue - see the
+ * kill-after-exec note on av_work_fn() in main.c). For av_kill()'s
+ * exec-time signature path specifically, that means a still-in-flight
+ * or failed execve() (e.g. a non-executable file, or a real race) is
+ * not protected - the
  * calling process's exe_file is still whatever it was BEFORE the
  * attempted exec, not the (never-completed) target. This is the
  * intended, correct behavior for the actual use case (don't kill a

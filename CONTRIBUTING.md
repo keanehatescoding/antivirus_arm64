@@ -107,13 +107,18 @@ best avoided — particularly right before a tag.
   are both kernel-version-sensitive. That's exactly what the
   `build-matrix.yml` matrix exists to catch — "works on my kernel" isn't
   enough on its own.
-- arm64 only, for now — the module resolves `__arm64_sys_execve` by
-  symbol name and reads syscall args out of `pt_regs.regs[]`. Porting
-  to x86_64 means finding the equivalent `__x64_sys_*` symbols and the
+- arm64 only, for now — the behavioral hooks resolve `__arm64_sys_openat`
+  / `__arm64_sys_unlinkat` / `__arm64_sys_renameat[2]` by symbol name and
+  read syscall args out of `pt_regs.regs[]`. Porting to x86_64 means
+  finding the equivalent `__x64_sys_*` symbols and the
   `di`/`si`/`dx`/`r10`/`r8`/`r9` register mapping throughout (and
   reinstating the raw `unlink(2)`/`rename(2)` kprobes — arm64 doesn't
   have those syscalls, only the `*at()` variants), not just a
-  `Makefile` tweak.
+  `Makefile` tweak. The exec hook is the exception: since issue #94 it
+  probes the kernel's own exec path (`bprm_execve`, falling back to
+  `security_bprm_check`) — arch-independent symbols either way — and
+  reads only `regs->regs[0]` (the AAPCS64 first argument), so porting it
+  is one register read.
 
 ## Adding or changing YARA rules
 

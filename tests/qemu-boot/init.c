@@ -8,10 +8,14 @@
  * serial console, and power off. Statically linked.
  *
  * See also cold_launcher.c (same directory) - a dedicated companion
- * binary this one execs partway through, specifically to reproduce
- * and track a real, documented gap in av.ko's kprobe hook (cold
- * userspace pages in atomic context - see its own header comment,
- * and av/main.c's handler_pre()).
+ * binary this one execs partway through, which drives an exec from a
+ * pathname page it guarantees is cold. That used to be a reproducer
+ * for a real gap in av.ko's kprobe hook (atomic-context
+ * strncpy_from_user() cannot fault in a non-resident page); since the
+ * exec hook moved onto the kernel's own exec path (issues #2/#94) the
+ * pathname is never read from userspace at all, so it is now a
+ * regression guard that requires a detection - see its own header
+ * comment, and av/main.c's handler_pre_bprm_check().
  *
  * All output goes through outmsg() (vsnprintf into a buffer + a raw
  * write(2) to fd 1) rather than stdio - printf()+fflush() was tried
@@ -49,122 +53,104 @@
 #define EICAR                                                                \
   "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
-/* What the cold-pathname case near the end of main() asserts - phrased
- * as a property of THIS HARNESS, deliberately, rather than of the gap
- * in av/main.c.
+/* The cold-pathname case near the end of main() and the exec-time
+ * TOCTOU batch after it target what were issue #2's two halves. Both
+ * are now closed, so both assert unconditionally.
  *
- * That case runs cold_launcher.c, which execve()s /tmp/eicar_cold.com
- * from a pathname page it guarantees is cold: the bytes live in a
- * fresh file-backed mapping (mmap, never faulted, MADV_DONTNEED'd
- * right before execve) rather than in .rodata next to .text, so
- * fault-around cannot pull them in and the kprobe handler's atomic
- * strncpy_from_user() genuinely sees a non-resident page. See
- * cold_launcher.c's own header comment for the mechanism, and issue
- * #2 for the gap itself. Measured: the bypass reproduces here - the
- * cold exec survives with cold_launcher's own exit code 1 and no
- * detection kill line in dmesg, while the warm-path EICAR check
- * above still detects and kills normally (so this is the harness
- * demonstrating the gap, not a detection regression). Verified
- * locally under TCG against the then-current kernel matrix; the CI
- * kernel matrix re-checks it on every push.
+ * What changed (issue #94): av.ko's exec hook no longer probes
+ * __arm64_sys_execve[at] and copies the pathname argument out of
+ * userspace. It probes a function on the kernel's own exec path
+ * instead - bprm_execve(), or security_bprm_check() on a kernel where
+ * that one is probeable; av.ko logs which at insmod - reached once the
+ * target is already open, and pins bprm->file, the exact struct file
+ * the kernel is about to execute. That removes both halves at once:
  *
- * It now gates on what it can actually observe:
+ *   - Cold pages: nothing on the exec path reads userspace memory any
+ *     more, so a non-resident pathname page cannot make the hook
+ *     fail-open. cold_launcher.c still guarantees a cold page
+ *     (file-backed mmap, MADV_DONTNEED'd right before execve - see
+ *     its header comment); the exec it drives must be detected and
+ *     killed anyway. If it is not, exec-time detection regressed.
  *
- *   0 = the bypass reproduces here and the cold exec survives.
- *       Current, measured. If that stops being true, either this
- *       harness regressed (the page is no longer cold) or the #2
- *       gap was actually fixed - both need a human, neither should
- *       be a printed line nobody reads.
- *   1 = the cold exec IS detected and killed here. Set this only
- *       with evidence, and update #2 to match.
+ *   - Exec-time TOCTOU (issue #45): the hash comes from the pinned
+ *     bprm->file, not from a separate later open of the pathname, so
+ *     renaming a decoy over the path after exec cannot change what
+ *     gets hashed. Every swap attempt must be detected+killed on the
+ *     EICAR that actually executed, and no attempt may produce a
+ *     verdict line carrying the decoy's digest.
  *
- * Both branches compile either way - a plain `if`, not an `#if`, so
- * the inactive one cannot bit-rot before the day it is needed. */
-#define AV_EXPECT_COLD_EXEC_DETECTED 0
-
-/* Companion toggle to AV_EXPECT_COLD_EXEC_DETECTED above, for the OTHER
- * half of issue #2: the exec-time TOCTOU (issue #45). av_work_fn() hashes
- * a SEPARATE, LATER open of the exec target's pathname (av/main.c's
- * "KNOWN TOCTOU" comment) - nothing pins that open to the inode that
- * actually executed, so an attacker who renames a clean decoy over the
- * path between the real execve() and the workqueue's open makes the scan
- * hash the decoy while their code is already running.
+ * Neither case asserts anything about exec-time BLOCKING: av.ko is
+ * still kill-after-exec, because a kprobe pre-handler cannot change
+ * the probed function's return value. Prevention is avd's fanotify
+ * FAN_OPEN_EXEC_PERM gate, which the #48 case at the end of main()
+ * covers separately.
  *
- * Earlier this case fired the rename from the parent "concurrent with"
- * the child's execve() and counted any attempt whose verdict line carried
- * the decoy's hash as a win. That was unsound (see #45): with no ordering
- * between the rename and the exec, on the single-vCPU TCG leg CI runs the
- * parent's rename usually completed BEFORE the child was even scheduled to
- * exec, so the exec itself resolved the decoy. That is not a TOCTOU - the
- * check and the use both saw the decoy - yet it produced a byte-identical
- * decoy-hash line, so the metric could not tell a genuine kprobe->open
- * race from a benign rename-before-exec, and the CLOSED==1 branch was
- * unsatisfiable (a correctly fixed scanner hashing the executed inode
- * still emits the decoy's hash whenever the rename beats the exec).
+ * Both assertions were deliberately toggles
+ * (AV_EXPECT_COLD_EXEC_DETECTED / AV_EXPECT_TOCTOU_CLOSED) while the
+ * bypasses were open, so this harness asserted what it could actually
+ * observe rather than a fix that had not landed. They are removed
+ * rather than set to 1: there is no configuration in which a bypass
+ * is the expected outcome again, and a toggle with only one valid
+ * value is just a place for a real failure to get silenced.
  *
- * This case is now DETERMINISTIC in both directions, on two mechanisms:
+ * Two pieces of the old rationale are kept because they still carry
+ * the swap case:
  *
- *   1. A sync pipe orders the swap. The child reports its execve() result
- *      to the parent and only then does the parent rename; the parent
- *      blocks on that report, so the rename is guaranteed to land AFTER
- *      the exec has already resolved+opened EICAR (the kprobe has captured
- *      the path with EICAR live). Every swap therefore exercises the real
- *      window - exec saw EICAR - never the fork->exec window. The reported
- *      errno (ENOEXEC: EICAR is not an ELF) is also checked as ground
- *      truth that the exec resolved EICAR and nothing else.
- *   2. av.ko's test-only av_toctou_test_delay_ms knob (set to
- *      TOCTOU_WQ_DELAY_MS around this batch only, 0 everywhere else) holds
- *      the workqueue's deferred open, so the post-exec rename reliably
- *      lands before that open. Without it the workqueue opens within the
- *      failing execve() syscall (measured: renaming after execve returns
- *      is already too late), leaving no window a userspace rename can hit.
- *      The knob widens the EXISTING window; it does not create the bug.
+ *   - Why the swap arm is ordered. An earlier version fired the
+ *     rename from the parent "concurrent with" the child's execve()
+ *     and counted any decoy-hash line as a win. That was unsound (see
+ *     #45): with no ordering, on the single-vCPU TCG leg the parent's
+ *     rename usually completed BEFORE the child was scheduled to
+ *     exec, so the exec itself resolved the decoy - not a TOCTOU at
+ *     all, yet byte-identical in the log, which also made a
+ *     "closed" assertion unsatisfiable. The sync pipe below pins the
+ *     rename strictly after exec entry, and the reported errno
+ *     (ENOEXEC - EICAR is not an ELF) is ground truth that the exec
+ *     resolved EICAR. That ordering is what makes "every swap is
+ *     killed on the EICAR" a clean per-attempt assertion rather than
+ *     a probability.
  *
- * With ordering pinned, a decoy-hash line is now unambiguous proof of the
- * bug and the toggle is a clean per-attempt assertion, not a probability:
+ *   - The no-swap control, which is the vacuity guard (#34/#45):
+ *     without it a broken fixture that never stages EICAR would read
+ *     identically to a working scanner.
  *
- *   0 = the bypass reproduces: exec saw EICAR yet the scanner hashed the
- *       decoy it was renamed to. With the ordering above this reproduces
- *       on every non-dropped swap attempt while #2 is open. If it stops,
- *       the #2 TOCTOU was closed (a hook that scans the kernel's own
- *       resolved exec file - discussion #33's fanotify option - shuts it
- *       by construction); confirm that, then set the toggle to 1.
- *   1 = no swap attempt got the decoy hashed: every swap (exec saw EICAR)
- *       was instead detected+killed, i.e. the verdict now comes from the
- *       executed inode. Satisfiable precisely because the ordering removes
- *       the benign rename-before-exec attempts that used to make decoy
- *       hashes unavoidable. Set this only WITH that evidence, and update
- *       #2/#45/SECURITY.md to match.
- *
- * Either way the no-swap control must be detected+killed every time - that
- * is the vacuity guard (#34/#45): without it a broken fixture that never
- * stages EICAR would read identically to a perfect bypass, and here "not
- * detected" is the reproduces-the-bug condition, so a false pass is the
- * dangerous direction. Both branches compile (a plain `if`, not `#if`), so
- * the inactive one cannot bit-rot before the day it is needed. */
-#define AV_EXPECT_TOCTOU_CLOSED 0
+ * One post-fix consequence worth knowing when reading the matches
+ * below: the swap's rename() unlinks the dentry of the inode the
+ * kprobe pinned, so d_path() of that still-open file renders as
+ * "<target> (deleted)". The kill line for a swap therefore carries
+ * either spelling depending on whether the rename beat av_work_fn()'s
+ * d_path() call, and both are accepted. */
 #define TOCTOU_SWAP_ATTEMPTS 64
 
 /* sha256 of the exact decoy bytes written below ("toctou decoy - nothing
  * to see here\n"). A fail-open line carrying THIS digest on the exec
- * target's path is the unambiguous proof the scanner hashed the decoy and
- * not the EICAR that executed: EICAR would have produced an
+ * target's path is unambiguous proof the scanner hashed the decoy and not
+ * the EICAR that executed: EICAR would have produced an
  * action=kill/type=signature line instead, and the decoy matches no
- * signature so it can only reach the clean/fail-open branch. Recompute
- * with `printf 'toctou decoy - nothing to see here\n' | sha256sum` if the
+ * signature so it can only reach the clean/fail-open branch. Post-#94 no
+ * attempt may produce it, which is exactly what the batch asserts; the
+ * digest is kept (rather than the assertion reduced to "a kill happened")
+ * so a regression is reported as "the scanner hashed the decoy" instead of
+ * a bare missing kill. Recompute with
+ * `printf 'toctou decoy - nothing to see here\n' | sha256sum` if the
  * decoy bytes ever change. */
 #define TOCTOU_DECOY_SHA256                                                   \
   "fd0e0467cee410d82469da45e023e1f6ca372ff1968a5fccc621bd2b6482e4fb"
 #define TOCTOU_DECOY_BYTES "toctou decoy - nothing to see here\n"
 
-/* av.ko's test-only knob (av_toctou_test_delay_ms) that holds the
- * workqueue's deferred open by this many ms, so the swap below lands in
- * the kprobe->open window deterministically rather than by luck. Any
- * value comfortably larger than the parent's post-handshake rename
- * latency (sub-ms even under TCG) works; 150ms leaves a wide margin. The
- * child must outlive the delayed open+hash so its verdict LINE is emitted
- * against a still-live pid (no reuse), so its linger is the delay plus a
- * generous hash/scheduling margin. */
+/* av.ko's test-only knob (av_toctou_test_delay_ms) that parks the
+ * deferred work item for this many ms immediately before it hashes, so
+ * the swap below is guaranteed to land while the scan is still in flight
+ * rather than winning or losing by luck. Pre-#94 this widened the
+ * kprobe->open window the bypass lived in; now that the hash reads the
+ * pinned bprm->file there is no such window, and the knob's job is the
+ * mirror image - make the mid-flight rename certain, so "the digest still
+ * came from the executed image" is actually being tested on every
+ * attempt. Any value comfortably larger than the parent's
+ * post-handshake rename latency (sub-ms even under TCG) works; 150ms
+ * leaves a wide margin. The child must outlive the delayed hash so its
+ * verdict LINE is emitted against a still-live pid (no reuse), so its
+ * linger is the delay plus a generous hash/scheduling margin. */
 #define TOCTOU_WQ_DELAY_MS 150
 #define TOCTOU_LINGER_US ((TOCTOU_WQ_DELAY_MS + 400) * 1000)
 #define TOCTOU_DELAY_PARAM "/sys/module/av/parameters/av_toctou_test_delay_ms"
@@ -329,37 +315,37 @@ static void run_and_wait(const char *path, const char *arg1,
     char *const argv[] = {(char *)path, (char *)arg1, NULL};
 
     /* Touch `path`'s first byte before exec, forcing its page
-     * resident via a normal (sleepable) userspace fault. Without
-     * this, a freshly-started static binary whose .rodata page
-     * holding this exact string has never been referenced can hit a
-     * real, narrow gap in av.ko's kprobe hook: strncpy_from_user()
-     * in handler_pre() runs in atomic/kprobe context and CANNOT
-     * sleep to fault in a not-yet-resident page - it fails fast with
-     * -EFAULT instead, so the hook silently skips the exec (returns
-     * 0 without hashing/killing). The kernel's OWN later, in-process
-     * getname_flags() call on the exact same pointer runs in normal
-     * sleepable context and faults the page in fine, which is why
-     * execve() itself still proceeds normally afterward - it's only
-     * the kprobe's earlier, atomic-context copy that loses the race.
-     * A real shell invoking a real file essentially never hits this:
-     * by the time a shell calls execve(), its own memory (including
-     * wherever the pathname string lives) has had far too much prior
-     * activity for anything to still be a cold page. It took a
-     * minimal, just-booted static init calling execve() on its own
-     * literal string within milliseconds of process start to
-     * actually observe it - see av/main.c's handler_pre() comment for
-     * the same note on the production side. Confirmed via kprobe-side
-     * debug tracing that removing this touch reproduces the EFAULT
-     * and re-adding it fixes it, consistently, regardless of kernel
-     * config (tinyconfig/defconfig), KVM vs TCG, or SMAP/SMEP.
+     * resident via a normal (sleepable) userspace fault. This is now
+     * only belt-and-braces: av.ko's exec hook probes the kernel's own
+     * exec path and never reads this pointer, so page residency
+     * cannot affect detection either way (issue #94).
      *
-     * This touch is what makes THIS check specifically exercise the
-     * common/intended case (detection working, given a realistic
-     * pathname) rather than the edge case - it is deliberately NOT
-     * applied to cold_launcher.c's own internal exec, which exists
-     * specifically to reproduce the untouched-page case instead of
-     * avoiding it (see main()'s cold-pathname regression block, and
-     * cold_launcher.c's own header comment). */
+     * It is kept because of what it used to be load-bearing for, and
+     * what that cost to find. While the hook probed
+     * __arm64_sys_execve[at] it copied this very pathname out of
+     * userspace with strncpy_from_user(), in atomic/kprobe context,
+     * where it cannot sleep to fault in a not-yet-resident page: it
+     * failed fast with -EFAULT and the hook silently skipped the exec
+     * (returned 0 without hashing/killing). The kernel's OWN later,
+     * in-process getname_flags() call on the exact same pointer runs
+     * sleepable and faults the page in fine, which is why execve()
+     * proceeded normally afterward and the skip left no trace. A real
+     * shell essentially never hit it - by the time a shell calls
+     * execve() its memory has had far too much prior activity for
+     * anything to still be cold; it took a minimal, just-booted
+     * static init exec'ing its own literal string within milliseconds
+     * of process start to observe at all, and kprobe-side debug
+     * tracing to confirm that removing this touch reproduced the
+     * EFAULT and re-adding it fixed it, consistently, across kernel
+     * config (tinyconfig/defconfig), KVM vs TCG, and SMAP/SMEP.
+     *
+     * Removing it would make this check and cold_launcher.c's exec
+     * test the same thing, and would quietly discard the only
+     * difference between them if the exec hook ever moves back to a
+     * syscall probe. cold_launcher.c deliberately does NOT touch its
+     * pathname (see main()'s cold-pathname regression block and that
+     * file's header comment), so the two still bracket the question
+     * from both sides. */
     {
       volatile char touch = path[0];
       (void)touch;
@@ -697,16 +683,17 @@ int main(int argc, char *const argv[]) {
   outmsg("QEMU_TEST: EICAR detection check passed\n");
 
   /* ---- Regression case: cold-pathname exec ----
-   * av/main.c's handler_pre() comment is the authoritative writeup of
-   * the gap this is aimed at. cold_launcher.c is a dedicated, separate
-   * binary specifically so its embedded pathname literal has the best
-   * chance of being genuinely untouched at exec time - see its own
-   * header comment for why init.c can't offer that itself, and
-   * AV_EXPECT_COLD_EXEC_DETECTED above for what actually happens.
+   * cold_launcher.c is a dedicated, separate binary specifically so
+   * the pathname it hands execve() is on a genuinely cold page: its
+   * own header comment explains why init.c cannot offer that
+   * guarantee itself, and the block comment at the top of this file
+   * explains why a cold page no longer bypasses anything.
    *
    * Unlike the EICAR check above, nothing here touches the pathname
-   * before exec; that touch is what makes the primary check exercise
-   * the common case, and skipping it is the whole point. */
+   * before exec - that is the whole point. Post-#94 the hook probes
+   * the kernel's own exec path and hashes the pinned bprm->file, so
+   * the exec must be detected and killed just like the warm one. A
+   * surviving cold exec now means exec-time detection regressed. */
   {
     int killed, exited, code;
     char *log;
@@ -715,134 +702,128 @@ int main(int argc, char *const argv[]) {
     run_and_wait("/cold_launcher", NULL, &killed, &exited, &code);
 
     /* Rule out a broken harness before interpreting the outcome either
-     * way. Exactly two shapes are meaningful: SIGKILL (av.ko caught the
-     * cold exec), or cold_launcher.c's own `return 1` after its inner
-     * execve() fails ENOEXEC (it survived). Anything else - notably
+     * way. Exactly two shapes are meaningful: SIGKILL (the kill beat
+     * the process), or cold_launcher.c's own `return 1` after its inner
+     * execve() fails ENOEXEC (it exited first). Anything else - notably
      * code 127, run_and_wait's OWN outer execv() failing because
      * /cold_launcher is missing or non-executable in the initramfs -
-     * says nothing about av/main.c. */
+     * says nothing about av/main.c, so it is reported as a harness
+     * defect rather than folded into the detection verdict below. */
     if (!killed && !(exited && code == 1)) {
       outmsg("QEMU_TEST: FAIL: cold-pathname case is broken - "
              "/cold_launcher exited unexpectedly (exited=%d code=%d, not "
              "killed). Expected either a SIGKILL or its own exit code 1; "
              "code 127 means /cold_launcher is missing or non-executable "
              "in the initramfs. This is a defect in this harness, not in "
-             "the av/main.c gap it is aimed at.\n",
+             "the exec hook it is aimed at.\n",
              exited, code);
       outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
       poweroff_now();
       return 1;
     }
 
-    /* Corroborate the exit status against dmesg rather than trusting
-     * it alone - a SIGKILL from anything other than av.ko would
-     * otherwise read as a successful detection. This substring is
-     * contiguous in av_kill()'s format string and names the inner
-     * exec specifically, so the EICAR check's own kill line above
-     * cannot satisfy it. */
+    /* The dmesg verdict line, not the SIGKILL, is what this asserts.
+     * The kill is workqueue-deferred, so whether it beats
+     * cold_launcher.c's own exit is a separate race (that is what its
+     * trailing usleep() is for) and says nothing about whether the
+     * cold exec was scanned; a SIGKILL from anything other than av.ko
+     * would also read as a successful detection. The substring is
+     * contiguous in av_kill()'s format string and names the inner exec
+     * specifically, so the EICAR check's own kill line above cannot
+     * satisfy it. The path cannot pick up d_path()'s " (deleted)"
+     * suffix here: nothing unlinks or renames /tmp/eicar_cold.com. */
     log = read_kernel_log();
     {
       const int detected =
           strstr(log, "action=kill type=signature "
                       "path=\"/tmp/eicar_cold.com\"") != NULL;
 
-      if (AV_EXPECT_COLD_EXEC_DETECTED) {
-        if (!killed || !detected) {
-          outmsg("QEMU_TEST: FAIL: cold exec was NOT detected "
-                 "(killed=%d dmesg-kill-line=%d exited=%d code=%d). "
-                 "AV_EXPECT_COLD_EXEC_DETECTED says this harness detects "
-                 "it - every kernel in the matrix did when that was set. "
-                 "So either exec-time detection regressed, or this "
-                 "harness has started genuinely reproducing the "
-                 "cold-page bypass of issue #2. Establish which before "
-                 "touching this check; if it is the latter, that is a "
-                 "real finding for #2 and discussion #33, not something "
-                 "to silence by flipping the toggle.\n",
-                 killed, detected, exited, code);
-          outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", log);
-          poweroff_now();
-          return 1;
-        }
-        outmsg("QEMU_TEST: cold exec detected and killed - note this "
-               "harness does not reproduce the issue #2 bypass, so this "
-               "is a detection regression guard, not evidence about "
-               "that gap\n");
-      } else {
-        if (killed || detected) {
-          outmsg("QEMU_TEST: FAIL: cold exec WAS detected "
-                 "(killed=%d dmesg-kill-line=%d), but "
-                 "AV_EXPECT_COLD_EXEC_DETECTED says this harness "
-                 "reproduces the bypass. Good news if the harness was "
-                 "just made to reproduce it and detection then caught "
-                 "up - flip the toggle back to 1 and update issue #2 "
-                 "and SECURITY.md to match.\n",
-                 killed, detected);
-          outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", log);
-          poweroff_now();
-          return 1;
-        }
-        outmsg("QEMU_TEST: cold-pathname bypass reproduced as documented "
-               "(exited=%d code=%d, not killed, no kill line in dmesg)\n",
-               exited, code);
+      if (!detected) {
+        outmsg("QEMU_TEST: FAIL: the cold-pathname exec was NOT detected "
+               "(killed=%d dmesg-kill-line=%d exited=%d code=%d). Since "
+               "the exec hook moved onto the kernel's own exec path (#94) "
+               "it hashes the pinned bprm->file and never reads the "
+               "pathname from userspace, so a cold page cannot excuse "
+               "this: either exec-time detection regressed, or the hook "
+               "is not registered at all - av.ko logs 'exec hook "
+               "registered on <symbol>' at insmod, and logs every "
+               "candidate it could not probe. Do not relax this check "
+               "to make it pass.\n",
+               killed, detected, exited, code);
+        outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", log);
+        poweroff_now();
+        return 1;
       }
+      outmsg("QEMU_TEST: cold-pathname exec detected on a guaranteed-cold "
+             "pathname page (killed=%d exited=%d code=%d) - issue #2's "
+             "cold-page bypass stays closed\n",
+             killed, exited, code);
     }
   }
+  /* Fixed marker, separate from the line above (which carries run
+   * detail): qemu-boot-test.yml greps for exactly this so the case
+   * cannot be deleted or #if'd out of here and still produce a green
+   * PASS. Same pattern as the TOCTOU and #48 cases below. */
+  outmsg("QEMU_TEST: cold-pathname regression check passed\n");
 
   /* ---- Regression case: exec-time TOCTOU (issue #45, the second half
    * of #2) ----
    *
-   * av/main.c's "KNOWN TOCTOU" comment on av_work_fn() is the
-   * authoritative writeup. The kprobe captures only the pathname STRING
-   * at execve() time; the actual hash is computed from a separate, later
-   * open of that path on the workqueue. Nothing guarantees the two name
-   * the same inode, so a rename of a clean decoy over the path, landing
-   * in the window between the real exec and that open, makes the scanner
-   * hash the decoy while the EICAR that executed goes unreported.
+   * av/main.c's av_work_fn() comment is the authoritative writeup. The
+   * kprobe pins bprm->file - the struct file the kernel is executing -
+   * and the hash is taken from THAT, so renaming a clean decoy over the
+   * path cannot change what gets scanned. Before #94 the kprobe captured
+   * only the pathname STRING at execve() time and the workqueue did a
+   * separate, later open of it; nothing tied the two to the same inode,
+   * and a rename landing in that window got the decoy hashed while the
+   * EICAR that executed went unreported.
    *
    * Run as a batch: TOCTOU_SWAP_ATTEMPTS swap attempts, each interleaved
    * with a no-swap control, verdict over the batch. Two mechanisms make
-   * every attempt DETERMINISTIC rather than a timing gamble (see
-   * AV_EXPECT_TOCTOU_CLOSED for the full rationale, and for why the
-   * earlier fire-from-the-parent-and-hope version was unsound):
+   * every attempt DETERMINISTIC rather than a timing gamble (see the
+   * block comment at the top of this file for the full rationale, and
+   * for why the earlier fire-from-the-parent-and-hope version was
+   * unsound):
    *
    *   - A sync pipe orders the swap relative to the exec. The child
    *     execve()s, then writes its resulting errno to the pipe; the parent
    *     blocks reading that value and only then renames. The rename is
    *     therefore guaranteed to land AFTER the exec has already resolved
-   *     EICAR (the kprobe captured the path with EICAR live), so the swap
-   *     always exercises the kprobe->open window and never the fork->exec
-   *     window. The errno (ENOEXEC - EICAR is not an ELF) is ground truth
-   *     that the exec resolved EICAR and not the decoy; the parent checks
-   *     it and refuses to draw any conclusion from an attempt that broke.
+   *     and opened EICAR, so the swap always exercises the real post-exec
+   *     window and never the fork->exec window. The errno (ENOEXEC -
+   *     EICAR is not an ELF) is ground truth that the exec resolved EICAR
+   *     and not the decoy; the parent checks it and refuses to draw any
+   *     conclusion from an attempt that broke.
    *
    *   - av.ko's test-only av_toctou_test_delay_ms knob, set to
    *     TOCTOU_WQ_DELAY_MS for the duration of this batch only (0 for
-   *     every other exec in this boot and in all production), holds the
-   *     workqueue's deferred open past the rename. Without it the
-   *     workqueue opens within the failing execve() syscall (measured:
-   *     renaming after execve returns is already too late), too fast for a
-   *     userspace rename to land inside. The knob widens the EXISTING
-   *     window; it does not create the bug.
+   *     every other exec in this boot and in all production), parks the
+   *     work item just before it hashes so the rename is certain to land
+   *     mid-scan. Without it the scan completes inside the failing
+   *     execve() syscall (measured: renaming after execve returns is
+   *     already too late) and the swap would be asserting nothing.
    *
-   * Same-directory rename is atomic, so the scanner's open sees exactly
-   * one of the two inodes, never a half-state. */
+   * Same-directory rename is atomic, so nothing here can observe a
+   * half-state. It does unlink the dentry of the pinned inode, which is
+   * why the kill line for a swap may render the path with d_path()'s
+   * " (deleted)" suffix - see the match built below. */
   {
     int i;
     int decoy_wins = 0;    /* swap: exec saw EICAR, scanner hashed the decoy - the bug */
-    int swap_kills = 0;    /* swap: exec saw EICAR, scanner killed on it - closed behavior */
+    int swap_kills = 0;    /* swap: exec saw EICAR, scanner killed on it - required */
     int swap_lost = 0;     /* swap: neither line for this pid (work dropped) */
     int control_kills = 0; /* control: un-swapped EICAR detected+killed, as it must be */
     int control_bad = 0;   /* control: un-swapped EICAR NOT killed - a broken fixture */
     int exec_errno_bad = 0;/* either arm: exec did not fail ENOEXEC - a sync/fixture defect */
 
-    /* Widen the workqueue open window for this batch only, then restore
-     * production timing (below) before the #48 section - or anything else -
-     * execs. */
+    /* Park the deferred hash for this batch only, so every swap lands
+     * mid-scan (see TOCTOU_WQ_DELAY_MS), then restore production timing
+     * (below) before the #48 section - or anything else - execs. */
     write_param_int(TOCTOU_DELAY_PARAM, TOCTOU_WQ_DELAY_MS);
 
     for (i = 0; i < TOCTOU_SWAP_ATTEMPTS; i++) {
       char target[64], decoy[64];
-      char kill_line[160], decoy_line[224];
+      char kill_line[160], kill_line_deleted[176], decoy_line[224];
       int swap;
       char *log;
 
@@ -929,8 +910,8 @@ int main(int argc, char *const argv[]) {
          * failed rename is a fixture defect, not a data point: the swap
          * would silently degrade into a second control, get a kill line,
          * and be counted in swap_kills - i.e. a batch where every rename
-         * failed would pass as "bypass no longer reproduces" under
-         * AV_EXPECT_TOCTOU_CLOSED. Fail loudly instead (see the vacuity
+         * failed would pass as "the TOCTOU stays closed" without ever
+         * having raced anything. Fail loudly instead (see the vacuity
          * guard note below). */
         if (swap && rename(decoy, target) != 0) {
           int saved = errno;
@@ -949,8 +930,21 @@ int main(int argc, char *const argv[]) {
          * child happened to exit first. */
 
         log = read_kernel_log();
+        /* Two spellings, both exact (closing quote included) so
+         * /tmp/tc_swap_1 cannot be satisfied by /tmp/tc_swap_10's line.
+         * The swap's rename() unlinks the dentry of the inode the kprobe
+         * pinned, so d_path() renders that still-open file as
+         * "<target> (deleted)" if the rename beat av_work_fn()'s
+         * d_path() call and as plain "<target>" if it did not - a race
+         * this case has no reason to pin down, since both spellings name
+         * the same executed inode. The control arm renames nothing and
+         * only ever produces the plain form. Matching just the prefix
+         * instead would be simpler and wrong in the dangerous
+         * direction. */
         snprintf(kill_line, sizeof(kill_line),
                  "action=kill type=signature path=\"%s\"", target);
+        snprintf(kill_line_deleted, sizeof(kill_line_deleted),
+                 "action=kill type=signature path=\"%s (deleted)\"", target);
         /* Prefix through sha256= only - the trailing " err=..." is left
          * off so the match does not depend on the exact fail-open errno.
          * pid pins the line to THIS attempt, so an earlier iteration's
@@ -976,7 +970,7 @@ int main(int argc, char *const argv[]) {
         if (swap) {
           if (strstr(log, decoy_line))
             decoy_wins++;
-          else if (strstr(log, kill_line))
+          else if (strstr(log, kill_line) || strstr(log, kill_line_deleted))
             swap_kills++;
           else
             swap_lost++;
@@ -1016,11 +1010,11 @@ int main(int argc, char *const argv[]) {
       return 1;
     }
 
-    /* Vacuity guard - if the control does not reliably detect and
-     * kill an un-swapped EICAR, nothing else in this case means anything
-     * (see AV_EXPECT_TOCTOU_CLOSED). This is the #34/#45 lesson: a
-     * fixture that cannot reproduce what it claims must fail loudly, not
-     * pass quietly, and here the dangerous direction is a false "bypass". */
+    /* Vacuity guard - if the control does not reliably detect and kill
+     * an un-swapped EICAR, nothing else in this case means anything (see
+     * the block comment at the top of this file). This is the #34/#45
+     * lesson: a fixture that cannot reproduce what it claims must fail
+     * loudly, not pass quietly. */
     if (control_bad != 0) {
       outmsg("QEMU_TEST: FAIL: toctou control is broken - %d of %d "
              "un-swapped EICAR execs were NOT detected+killed. The swap "
@@ -1033,11 +1027,14 @@ int main(int argc, char *const argv[]) {
       return 1;
     }
 
-    /* swap_lost is neither a decoy-hash nor a clean kill: the exec was
-     * dropped before it produced any verdict line (e.g. av_work_admit()
-     * refused the allocation under load). It is not itself a failure, but
-     * a batch that is mostly lost has measured nothing, so guard against
-     * it silently hollowing out the verdict. */
+    /* swap_lost is neither a decoy-hash nor a kill: the exec produced no
+     * verdict line at all (e.g. av_work_admit() refused it under load).
+     * It is not itself a failure, but a batch that is mostly lost has
+     * measured nothing, so guard against it silently hollowing out the
+     * verdict. A sudden jump here with decoy_wins still 0 is also how a
+     * path-match regression would show up - if the kill line's path
+     * stopped matching either spelling built above, every swap would land
+     * in this bucket. */
     if (swap_lost > TOCTOU_SWAP_ATTEMPTS / 2) {
       outmsg("QEMU_TEST: FAIL: toctou batch inconclusive - %d of %d swap "
              "attempts produced neither a decoy-hash nor a kill line, so "
@@ -1048,51 +1045,51 @@ int main(int argc, char *const argv[]) {
       return 1;
     }
 
-    if (AV_EXPECT_TOCTOU_CLOSED) {
-      if (decoy_wins != 0) {
-        outmsg("QEMU_TEST: FAIL: %d swap attempt(s) got the scanner to "
-               "hash the decoy even though exec saw EICAR at entry (all "
-               "execs failed ENOEXEC) and the swap was ordered strictly "
-               "after exec-entry - i.e. the real #2 window. "
-               "AV_EXPECT_TOCTOU_CLOSED says the exec verdict is now taken "
-               "from the executed inode, so either the #2 TOCTOU is not "
-               "actually closed, or this harness is asserting a fix that "
-               "has not landed - establish which before touching the "
-               "toggle.\n",
-               decoy_wins);
-        outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
-        poweroff_now();
-        return 1;
-      }
-      outmsg("QEMU_TEST: toctou bypass no longer reproduces - all %d swap "
-             "attempts were caught (control killed %d/%d)\n",
-             TOCTOU_SWAP_ATTEMPTS, control_kills, TOCTOU_SWAP_ATTEMPTS);
-    } else {
-      if (decoy_wins == 0) {
-        outmsg("QEMU_TEST: FAIL: no swap attempt reproduced the TOCTOU "
-               "(decoy_wins=0 over %d attempts, swap_kills=%d) even though "
-               "each swap was ordered strictly after exec-entry (via the "
-               "sync pipe) and the workqueue open was held open by "
-               "av_toctou_test_delay_ms=%dms. Every kernel in the matrix "
-               "reproduced it when AV_EXPECT_TOCTOU_CLOSED was 0. So either "
-               "exec-time detection stopped re-opening the target by path "
-               "(the #2 fix - update #2/#45/SECURITY.md and flip the toggle "
-               "to 1), or the delay knob did not take effect (av.ko built "
-               "without it, or the param write to " TOCTOU_DELAY_PARAM
-               " silently failed) so the workqueue still opened before the "
-               "rename. Establish which; do not silence it by flipping the "
-               "toggle.\n",
-               TOCTOU_SWAP_ATTEMPTS, swap_kills, TOCTOU_WQ_DELAY_MS);
-        outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
-        poweroff_now();
-        return 1;
-      }
-      outmsg("QEMU_TEST: TOCTOU reproduced as documented - %d/%d swap "
-             "attempts hashed the decoy instead of the exec'd EICAR "
-             "(workqueue won %d), controls killed %d/%d\n",
-             decoy_wins, TOCTOU_SWAP_ATTEMPTS, swap_kills, control_kills,
-             TOCTOU_SWAP_ATTEMPTS);
+    /* The assertion: not one swap may get the decoy hashed. Every swap
+     * was ordered strictly after exec entry (sync pipe) with the decoy
+     * renamed over the path while the scan was parked mid-flight, so a
+     * single decoy-hash line means the verdict came from the pathname
+     * rather than from the inode that executed - i.e. #94's fix came
+     * undone. */
+    if (decoy_wins != 0) {
+      outmsg("QEMU_TEST: FAIL: %d of %d swap attempt(s) got the scanner to "
+             "hash the decoy even though exec saw EICAR at entry (every exec "
+             "failed ENOEXEC) and the rename was ordered strictly after exec "
+             "entry. Since #94 the exec verdict is taken from the pinned "
+             "bprm->file, so a swap cannot change what is hashed: the hook "
+             "has gone back to scanning a path rather than the executed "
+             "file. This is issue #2/#45 reopening - do not relax this "
+             "check.\n",
+             decoy_wins, TOCTOU_SWAP_ATTEMPTS);
+      outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
+      poweroff_now();
+      return 1;
     }
+
+    /* And the swaps must be caught, not merely not-fooled: with the
+     * decoy ruled out, every attempt that produced a verdict line
+     * produced a kill on the EICAR that executed. swap_lost is already
+     * bounded above, so requiring a strict majority here is what stops a
+     * batch of mostly-dropped work from reading as a clean pass. */
+    if (swap_kills <= TOCTOU_SWAP_ATTEMPTS / 2) {
+      outmsg("QEMU_TEST: FAIL: only %d of %d swap attempts were "
+             "detected+killed (decoy_wins=0, swap_lost=%d). No attempt was "
+             "fooled by the decoy, so the hash is still coming from the "
+             "executed inode, but too few attempts produced a kill line to "
+             "call the case exercised - check whether the verdict lines are "
+             "being emitted at all and whether the param write to "
+             TOCTOU_DELAY_PARAM " took effect.\n",
+             swap_kills, TOCTOU_SWAP_ATTEMPTS, swap_lost);
+      outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
+      poweroff_now();
+      return 1;
+    }
+
+    outmsg("QEMU_TEST: exec-time TOCTOU stays closed - 0/%d swap attempts "
+           "hashed the decoy, %d were killed on the exec'd EICAR "
+           "(swap_lost=%d), controls killed %d/%d\n",
+           TOCTOU_SWAP_ATTEMPTS, swap_kills, swap_lost, control_kills,
+           TOCTOU_SWAP_ATTEMPTS);
   }
   outmsg("QEMU_TEST: TOCTOU regression check passed\n");
 

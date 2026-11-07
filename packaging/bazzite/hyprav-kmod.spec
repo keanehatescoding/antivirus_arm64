@@ -47,7 +47,7 @@ License:        GPL-2.0-only OR MIT
 URL:            https://github.com/keanehatescoding/antivirus
 Source0:        %{url}/archive/%{gitcommit}/antivirus-%{gitcommit}.tar.gz
 
-# arm64 only: the module hooks __arm64_sys_execve by symbol name (see
+# arm64 only: the module hooks __arm64_sys_* syscall symbols by name (see
 # SECURITY.md / packaging/fedora/hyprav.spec's hyprav-dkms ExclusiveArch).
 ExclusiveArch:  aarch64
 
@@ -72,7 +72,9 @@ an akmod so it is rebuilt on the client against every installed kernel -
 the Fedora Atomic / Bazzite counterpart to the DKMS package in
 packaging/fedora/hyprav.spec.
 
-arm64 only as shipped - hooks __arm64_sys_execve by symbol name.
+arm64 only as shipped - hooks __arm64_sys_* syscall symbols by name. The
+exec hook itself is arch-independent (bprm_execve, or security_bprm_check
+as a fallback) and needs no kernel config beyond CONFIG_KPROBES=y.
 
 %prep
 %autosetup -n antivirus-%{gitcommit}
