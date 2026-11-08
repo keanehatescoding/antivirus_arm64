@@ -575,6 +575,15 @@ struct av_work {
                     * cwd happens to be by the time av_work_fn()
                     * runs - see open_exec_target(). Released with
                     * path_put() in av_work_fn()'s cleanup. */
+  struct path root; /* the exec'ing process's root, captured via
+                     * get_fs_root() alongside pwd, for the same
+                     * reason: an absolute `path` must resolve inside
+                     * the exec'ing process's root (chroot, container
+                     * mount namespace), not the workqueue thread's.
+                     * On 7.3+ a kernel thread's root is the empty
+                     * nullfs, so the old filp_open() failed every
+                     * absolute exec with -ENOENT. Released with
+                     * path_put() in av_work_fn()'s cleanup. */
   char path[PATH_MAX];
 };
 
@@ -751,14 +760,18 @@ static void bin_to_hex(const u8 *bin, size_t bin_len, char *hex_out) {
  * vfs_path_lookup()'s potential I/O is fine here even though it would
  * not have been back in handler_pre().
  *
- * An absolute path needs no resolution against pwd at all (and pwd may
- * be garbage/unused in that case - filp_open() ignores it). This is
- * also why plain filp_open(path, ...) worked "by accident" for every
- * absolute-path exec: glibc's execvp() always resolves PATH lookups to
- * an absolute path before the actual execve() syscall, so this bug
- * only ever showed up for a program calling execve() directly with a
- * relative filename. */
-static struct file *open_exec_target(const char *path, const struct path *pwd) {
+ * An absolute path resolves against `root`, the exec'ing process's
+ * root captured alongside pwd - never via filp_open(), which resolves
+ * against the workqueue thread's own root. That was wrong twice over:
+ * a chrooted/containerized exec of /bin/x hashed the HOST's /bin/x
+ * (a signature-check bypass), and since Linux 7.3 a kernel thread's
+ * root is the empty immutable nullfs (only PID 1 is moved into the
+ * real rootfs, see init_userspace_fs()), so every absolute-path exec
+ * failed here with -ENOENT and skipped both the signature and daemon
+ * checks. vfs_path_lookup() starts the walk at `root` and also makes
+ * it the root for ".." and absolute symlink targets. */
+static struct file *open_exec_target(const char *path, const struct path *pwd,
+                                     const struct path *root) {
   struct file *f;
 
   if (path[0] == '\0') {
@@ -770,14 +783,13 @@ static struct file *open_exec_target(const char *path, const struct path *pwd) {
      * all (there is nothing to look up: dfd already named the exact
      * file). */
     f = dentry_open(pwd, O_RDONLY, current_cred());
-  } else if (path[0] == '/') {
-    f = filp_open(path, O_RDONLY, 0);
   } else {
+    const struct path *base = path[0] == '/' ? root : pwd;
     struct path resolved;
     int err;
 
-    err =
-        vfs_path_lookup(pwd->dentry, pwd->mnt, path, LOOKUP_FOLLOW, &resolved);
+    err = vfs_path_lookup(base->dentry, base->mnt, path, LOOKUP_FOLLOW,
+                          &resolved);
     if (err)
       return ERR_PTR(err);
 
@@ -794,7 +806,7 @@ static struct file *open_exec_target(const char *path, const struct path *pwd) {
  * of the file actually opened - see struct av_file_identity above and
  * the TOCTOU note on av_work_fn(). */
 static int hash_file_multi(const char *path, const struct path *pwd,
-                           struct av_digest *out,
+                           const struct path *root, struct av_digest *out,
                            struct av_file_identity *ident_out) {
   struct file *f;
   u8 md5_bin[16], sha1_bin[20], sha256_bin[32];
@@ -829,7 +841,7 @@ static int hash_file_multi(const char *path, const struct path *pwd,
    * out-of-bounds read waiting to happen. */
 
   memset(out, 0, sizeof(*out));
-  f = open_exec_target(path, pwd);
+  f = open_exec_target(path, pwd, root);
   if (IS_ERR(f))
     return PTR_ERR(f);
 
@@ -1222,6 +1234,7 @@ static void av_work_fn(struct work_struct *w) {
   abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!abs_path) {
     path_put(&aw->pwd);
+    path_put(&aw->root);
     put_pid(aw->target_pid);
     kfree(aw);
     av_work_release();
@@ -1256,7 +1269,7 @@ static void av_work_fn(struct work_struct *w) {
     }
   }
 
-  ret = hash_file_multi(aw->path, &aw->pwd, &digest, &ident);
+  ret = hash_file_multi(aw->path, &aw->pwd, &aw->root, &digest, &ident);
   if (ret) {
     /* Log every failure with path/pid/err so no hash bypass - -ENOMEM
      * (the per-exec shash_desc or read buffer; the transforms are
@@ -1357,6 +1370,7 @@ out:
   kfree(abs_path);
   kfree(esc_path);
   path_put(&aw->pwd);
+  path_put(&aw->root);
   put_pid(aw->target_pid);
   kfree(aw);
   av_work_release();
@@ -1465,8 +1479,11 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
    * process's cwd HERE, while we're still running in its context,
    * so a relative aw->path can be resolved correctly later even
    * though av_work_fn() runs on a workqueue thread with an unrelated
-   * cwd of its own. Released via path_put() in av_work_fn(). */
+   * cwd of its own. Released via path_put() in av_work_fn(). The
+   * root is captured the same way for absolute paths (see
+   * av_work.root and open_exec_target()). */
   get_fs_pwd(current->fs, &aw->pwd);
+  get_fs_root(current->fs, &aw->root);
   INIT_WORK(&aw->work, av_work_fn);
   queue_work(av_wq, &aw->work);
 
@@ -1589,6 +1606,9 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   aw->target_pid = get_task_pid(current, PIDTYPE_PID);
   aw->tgid = task_tgid_nr(current);
   aw->start_time = current->start_time;
+  /* An absolute pathname ignores dirfd and resolves against the
+   * caller's root - same capture as handler_pre(). */
+  get_fs_root(current->fs, &aw->root);
   INIT_WORK(&aw->work, av_work_fn);
   queue_work(av_wq, &aw->work);
 
