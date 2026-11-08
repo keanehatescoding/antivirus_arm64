@@ -1,6 +1,6 @@
 [Unit]
 Description=HyprAV userspace scanning daemon (YARA/fuzzy-hash/quarantine)
-Documentation=https://github.com/keanehatescoding/HyprAV
+Documentation=https://github.com/keanehatescoding/antivirus_arm64
 After=network.target
 
 # The av kernel module (av.ko) is loaded manually via insmod - this

@@ -1,3 +1,6 @@
+# Python bytecode caches (pytest/imports)
+__pycache__/
+*.pyc
 *.o
 *.ko
 *.mod
