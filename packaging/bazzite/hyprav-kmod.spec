@@ -75,7 +75,10 @@ packaging/fedora/hyprav.spec.
 arm64 only as shipped - hooks __arm64_sys_execve by symbol name.
 
 %prep
-%autosetup -n antivirus-%{gitcommit}
+%setup -q
+# GitHub archives extract to antivirus_arm64-<full-sha>/ while the CI
+# workflow produces antivirus-<short-commit>/. Accept either top-level
+# directory name; %build copies from the tree regardless of its name.
 # kmodtool wants a pristine per-kernel source copy; stage one here.
 # (The loop in %build copies from this into a build dir per kernel.)
 

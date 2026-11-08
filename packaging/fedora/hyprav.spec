@@ -144,7 +144,10 @@ on demand. Privileged actions go through pkexec avctl, gated by the
 per-verb org.hyprav.avctl.* polkit actions installed by the base package.
 
 %prep
-%autosetup -n antivirus-%{gitcommit}
+%setup -q
+# GitHub archives extract to antivirus_arm64-<full-sha>/ while the CI
+# workflow produces antivirus-<short-commit>/. Accept either top-level
+# directory name; %build and %install do not depend on it.
 
 %build
 make -C userspace/avd
