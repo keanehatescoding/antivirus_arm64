@@ -9,6 +9,9 @@ name: Build matrix (compile compatibility)
 
 on:
   push:
+    # The kernel-bump branch is pushed with a PAT (update-kernel-matrix.yml)
+    # and always gets a PR; run once there, not twice.
+    branches-ignore: [ci/update-kernel-matrix]
   pull_request:
 
 permissions:

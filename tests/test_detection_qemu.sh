@@ -39,10 +39,11 @@ command -v curl >/dev/null 2>&1 || MISSING+=("curl")
 command -v cpio >/dev/null 2>&1 || MISSING+=("cpio")
 command -v sha256sum >/dev/null 2>&1 || MISSING+=("sha256sum")
 command -v gpg >/dev/null 2>&1 || MISSING+=("gpg")
+command -v flock >/dev/null 2>&1 || MISSING+=("flock (util-linux)")
 if [ "${#MISSING[@]}" -gt 0 ]; then
     echo "test_detection_qemu.sh: missing required tool(s): ${MISSING[*]}"
-    echo "  Arch/CachyOS: sudo pacman -S aarch64-linux-gnu-gcc qemu-system-aarch64 cpio curl gnupg"
-    echo "  Debian/Ubuntu: sudo apt install gcc-aarch64-linux-gnu qemu-system-arm cpio curl gnupg"
+    echo "  Arch/CachyOS: sudo pacman -S aarch64-linux-gnu-gcc qemu-system-aarch64 cpio curl gnupg util-linux"
+    echo "  Debian/Ubuntu: sudo apt install gcc-aarch64-linux-gnu qemu-system-arm cpio curl gnupg util-linux"
     exit 1
 fi
 
@@ -60,13 +61,22 @@ if [ -z "$KERNEL_VERSION" ]; then
     exit 1
 fi
 
+case "$CACHE_ROOT" in
+    *[[:space:]]*)
+        # kbuild can't build out of a path containing whitespace (KDIR and
+        # M= are word-split by its makefiles), so fail clearly up front.
+        echo "test_detection_qemu.sh: the kernel cache path '$CACHE_ROOT' contains whitespace, which kbuild can't handle - set AV_KERNEL_CACHE to a path without spaces"
+        exit 1 ;;
+esac
 KDIR="$CACHE_ROOT/linux-$KERNEL_VERSION"
 mkdir -p "$CACHE_ROOT" || exit 1
-if command -v flock >/dev/null 2>&1; then
-    exec 9>"$CACHE_ROOT/.lock"
-    flock -n 9 || { echo "test_detection_qemu.sh: waiting for another run using $CACHE_ROOT"; flock 9; }
+# The cache is shared by every clone and worktree: never touch it unlocked.
+exec 9>"$CACHE_ROOT/.lock" || exit 1
+if ! flock -n 9; then
+    echo "test_detection_qemu.sh: waiting for another run using $CACHE_ROOT"
+    flock 9 || { echo "test_detection_qemu.sh: couldn't lock $CACHE_ROOT/.lock"; exit 1; }
 fi
-if [ -d "$QDIR/.kernel-cache" ]; then
+if [ -d "$QDIR/.kernel-cache" ] && [ "$(realpath "$QDIR/.kernel-cache")" != "$(realpath "$CACHE_ROOT")" ]; then
     echo "test_detection_qemu.sh: note: $QDIR/.kernel-cache is the old, per-checkout cache location and is no longer used - delete it to free the space"
 fi
 # Keyed on this script's hash plus the kernel download/verify helper files -

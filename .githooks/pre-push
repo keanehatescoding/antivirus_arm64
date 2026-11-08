@@ -110,6 +110,10 @@ echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 if [ "$QEMU_CHANGED" = 0 ]; then
     echo "    (no changes the QEMU boot test uses - skipping it off aarch64)"
     export AV_SKIP_QEMU_BOOT=1
+else
+    # Set it either way: an AV_SKIP_QEMU_BOOT=1 inherited from the shell
+    # must not skip the boot test for a push that changes what it tests.
+    export AV_SKIP_QEMU_BOOT=0
 fi
 
 if "$REPO_ROOT/tests/run_all.sh"; then

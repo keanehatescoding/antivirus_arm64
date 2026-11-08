@@ -30,8 +30,13 @@ name: Update kernel matrix versions
 # GITHUB_TOKEN, so a PR it opens gets no pull_request CI at all - the
 # kernel bump that broke master's qemu-boot (7.3.1) job was merged with
 # zero checks having run. Set the KERNEL_BUMP_TOKEN secret to a
-# fine-grained PAT (or GitHub App token) scoped to this repo with
-# Contents: read/write and Pull requests: read/write. Without it the job
+# fine-grained PAT scoped to this repo with Contents: read/write and
+# Pull requests: read/write. (Not a GitHub App installation token: those
+# expire after an hour, so a stored one is dead by the next weekly run,
+# and a set-but-expired secret skips the GITHUB_TOKEN fallback.) The
+# PAT also pushes the branch, so build-matrix.yml and qemu-boot-test.yml
+# ignore pushes to ci/update-kernel-matrix and run once, on the PR.
+# Without it the job
 # still opens the PR with GITHUB_TOKEN, but warns, and the PR body says
 # how to start CI by hand.
 
