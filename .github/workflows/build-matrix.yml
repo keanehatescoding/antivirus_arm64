@@ -275,6 +275,8 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get install -y yara
+          # The EICAR string is literal; nothing in it should expand.
+          # shellcheck disable=SC2016
           printf 'X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.com
           yara tests/fixtures/test.yar /tmp/eicar.com | grep -q EICAR_Test_String
 
@@ -331,7 +333,12 @@ jobs:
           head -c 100000 /dev/urandom > /tmp/random_sample.bin
           yara rules/entropy.yar /tmp/upx_packed | grep -q High_Overall_Entropy
           yara rules/entropy.yar /tmp/random_sample.bin | grep -q High_Overall_Entropy
-          ! yara rules/entropy.yar /bin/ls | grep -q High_Overall_Entropy
+          # Negative control. Not `! cmd`: under set -e a negated command
+          # never fails the step, so a false positive would pass silently.
+          if yara rules/entropy.yar /bin/ls | grep -q High_Overall_Entropy; then
+            echo "High_Overall_Entropy fired on /bin/ls (false positive)" >&2
+            exit 1
+          fi
           # per-section check: inject a real high-entropy section and confirm it fires
           cp /tmp/ptrace_test /tmp/section_entropy_test
           objcopy --add-section .packed_data=/tmp/random_sample.bin \
