@@ -79,13 +79,22 @@ fi
 if [ -d "$QDIR/.kernel-cache" ] && [ "$(realpath "$QDIR/.kernel-cache")" != "$(realpath "$CACHE_ROOT")" ]; then
     echo "test_detection_qemu.sh: note: $QDIR/.kernel-cache is the old, per-checkout cache location and is no longer used - delete it to free the space"
 fi
-# Keyed on this script's hash plus the kernel download/verify helper files -
-# same reasoning as qemu-boot-test.yml's cache key including
-# hashFiles(workflow file): editing the scripts/config enables below
-# or the verification logic must invalidate the cache, or it'll keep
-# serving a kernel tree built with the old config (or verified the old
+# The cached tree is keyed on what actually shapes it - the build block
+# below (between the >>> and <<< markers: defconfig, the scripts/config
+# enables, the make targets) plus the download/verify helper and its
+# key - not on this whole script, so editing a message or the lock
+# handling doesn't throw away a kernel build. Same reasoning as
+# qemu-boot-test.yml's cache key including hashFiles(workflow file):
+# a config or verification change must invalidate the cache, or it'll
+# keep serving a tree built with the old config (or verified the old
 # way) forever.
-SELF_HASH="$(cat "$0" "$REPO_ROOT/.github/scripts/verify-kernel-tarball.sh" "$REPO_ROOT/.github/scripts/kernel-autosigner.asc" | sha256sum | awk '{print $1}')"
+VERIFY_HASH="$(cat "$REPO_ROOT/.github/scripts/verify-kernel-tarball.sh" "$REPO_ROOT/.github/scripts/kernel-autosigner.asc" | sha256sum | awk '{print $1}')"
+BUILD_BLOCK="$(sed -n '/^ *# >>> kernel build/,/^ *# <<< kernel build/p' "$0")"
+if [ -z "$BUILD_BLOCK" ]; then
+    echo "test_detection_qemu.sh: the '# >>> kernel build' / '# <<< kernel build' markers are missing - the cache key needs them"
+    exit 1
+fi
+SELF_HASH="$(printf '%s\n%s\n' "$BUILD_BLOCK" "$VERIFY_HASH" | sha256sum | awk '{print $1}')"
 STAMP="$KDIR/.hyprav-cache-stamp"
 
 if [ -f "$KDIR/arch/arm64/boot/Image" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$SELF_HASH" ]; then
@@ -94,14 +103,32 @@ else
     echo "test_detection_qemu.sh: (re)building arm64 $KERNEL_VERSION kernel - this takes several minutes but is cached at $KDIR for next time"
     rm -rf "$KDIR"
     mkdir -p "$CACHE_ROOT"
+    # The verified tarball is kept next to the tree (~150 MB), so a
+    # rebuild doesn't download it again. Its .sha256 file records the
+    # tarball's hash at verification time and VERIFY_HASH: it is reused
+    # only while both still match, i.e. the file is byte-identical to
+    # what the helper verified and the helper/key haven't changed since.
+    # Otherwise it's fetched and verified again, the same way as
+    # .github/workflows/qemu-boot-test.yml (issue #6): PGP-verified sums
+    # plus sha256, via the shared helper so the logic can't drift
+    # between CI and this script.
     TARBALL="$CACHE_ROOT/linux-$KERNEL_VERSION.tar.xz"
-    # Same verification as .github/workflows/qemu-boot-test.yml (issue
-    # #6): PGP-verified sums plus sha256, via the shared helper so the
-    # logic can't drift between CI and this script.
-    "$REPO_ROOT/.github/scripts/verify-kernel-tarball.sh" "$KERNEL_VERSION" "$TARBALL" || exit 1
+    TARBALL_SUM="$TARBALL.sha256"
+    for old in "$CACHE_ROOT"/linux-*.tar.xz; do
+        [ -e "$old" ] && [ "$old" != "$TARBALL" ] && rm -f "$old" "$old.sha256"
+    done
+    if [ -f "$TARBALL" ] && [ -f "$TARBALL_SUM" ] &&
+       [ "$(cat "$TARBALL_SUM")" = "$(sha256sum "$TARBALL" | awk '{print $1}') $VERIFY_HASH" ]; then
+        echo "test_detection_qemu.sh: reusing the verified linux-$KERNEL_VERSION.tar.xz in $CACHE_ROOT"
+    else
+        rm -f "$TARBALL_SUM"
+        "$REPO_ROOT/.github/scripts/verify-kernel-tarball.sh" "$KERNEL_VERSION" "$TARBALL" || exit 1
+        echo "$(sha256sum "$TARBALL" | awk '{print $1}') $VERIFY_HASH" > "$TARBALL_SUM"
+    fi
     mkdir -p "$KDIR"
-    tar -xf "$TARBALL" -C "$KDIR" --strip-components=1 || exit 1
-    rm -f "$TARBALL"
+    tar -xf "$TARBALL" -C "$KDIR" --strip-components=1 || { rm -rf "$KDIR"; exit 1; }
+    # >>> kernel build: everything from here to the <<< marker is hashed
+    # into the cache stamp (SELF_HASH above).
     (
         set -e
         cd "$KDIR"
@@ -132,6 +159,7 @@ else
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc -j"$(nproc)" Image modules
     ) || { echo "test_detection_qemu.sh: kernel build failed"; rm -rf "$KDIR"; exit 1; }
+    # <<< kernel build
     echo "$SELF_HASH" > "$STAMP"
 fi
 
