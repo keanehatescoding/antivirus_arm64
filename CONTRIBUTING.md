@@ -85,7 +85,8 @@ Actions tab (they all accept `workflow_dispatch`).
 - **On commit** — `.githooks/pre-commit` lints staged files only:
   `cppcheck` on `av/*.c`, `gcc -fsyntax-only -Wall -Wextra` on
   `avctl`/`avd` changes, a `yara` compile check on rule changes,
-  `shellcheck` on scripts. Quick, no build, no `insmod`.
+  `shellcheck` on scripts, `yamllint` (plus `actionlint` on workflows)
+  on YAML. Quick, no build, no `insmod`.
 - **On push** — `.githooks/pre-push` runs the full suite
   (`pkexec tests/run_all.sh`), but only when the push touches `av/`,
   `userspace/avctl/`, `userspace/avd/`, `userspace/av-gui/`, `rules/`,

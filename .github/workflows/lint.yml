@@ -1,9 +1,9 @@
 name: Lint (static analysis)
 
 # Tier 0 CI: runs the same static-analysis checks the local pre-commit
-# hook runs (shellcheck, cppcheck, yamllint) unconditionally on every
-# PR and master push, independent of what happens to be installed on a given
-# developer's machine. Pre-commit deliberately no-ops when a tool is
+# hook runs (shellcheck, cppcheck, yamllint, actionlint) unconditionally
+# on every PR and master push, independent of what happens to be
+# installed on a given developer's machine. Pre-commit deliberately no-ops when a tool is
 # missing (see its header comment) to keep commits fast, so without
 # this job unlinted shell/YAML/C changes could merge freely with no
 # backstop. See issue #9.
@@ -173,3 +173,21 @@ jobs:
           # not own.
           yamllint .github/workflows/ .github/dependabot.yml \
             packaging/flatpak/org.hyprav.avgui.yml
+
+      - name: actionlint workflows
+        env:
+          # Bump both together; the sum is from the release's
+          # actionlint_<ver>_checksums.txt.
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          # Pinned release binary, checked against a sum stored here, not
+          # the upstream download script. shellcheck (installed above)
+          # makes actionlint lint the run: blocks too.
+          tgz="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tgz"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
