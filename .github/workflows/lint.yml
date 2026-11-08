@@ -3,8 +3,9 @@ name: Lint (static analysis)
 # Tier 0 CI: runs the same static-analysis checks the local pre-commit
 # hook runs (shellcheck, cppcheck, yamllint, actionlint) unconditionally
 # on every PR and master push, independent of what happens to be
-# installed on a given developer's machine. Pre-commit deliberately no-ops when a tool is
-# missing (see its header comment) to keep commits fast, so without
+# installed on a given developer's machine. Pre-commit deliberately
+# no-ops when a tool is missing (see its header comment) to keep commits
+# fast, so without
 # this job unlinted shell/YAML/C changes could merge freely with no
 # backstop. See issue #9.
 #
