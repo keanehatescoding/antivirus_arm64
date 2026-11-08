@@ -14,6 +14,12 @@
 # from-scratch arm64 defconfig build takes several minutes, and this
 # script can run on every `git push` that touches av/.
 #
+# The cache lives outside the checkout, in
+# ${XDG_CACHE_HOME:-~/.cache}/antivirus_arm64/qemu-kernel (override with
+# AV_KERNEL_CACHE), so every clone and `git worktree` of this repo shares
+# one kernel build instead of each paying for its own. A lock serializes
+# runs, so two worktrees can't build the same tree at once.
+#
 # No root needed: nothing here insmod's into the host kernel - av.ko
 # only ever gets loaded inside the QEMU guest, by tests/qemu-boot/init.c
 # acting as the guest's PID 1.
@@ -24,7 +30,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QDIR="$REPO_ROOT/tests/qemu-boot"
-CACHE_ROOT="$QDIR/.kernel-cache"
+CACHE_ROOT="${AV_KERNEL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/antivirus_arm64/qemu-kernel}"
 
 MISSING=()
 command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || MISSING+=("aarch64-linux-gnu-gcc")
@@ -55,6 +61,14 @@ if [ -z "$KERNEL_VERSION" ]; then
 fi
 
 KDIR="$CACHE_ROOT/linux-$KERNEL_VERSION"
+mkdir -p "$CACHE_ROOT" || exit 1
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$CACHE_ROOT/.lock"
+    flock -n 9 || { echo "test_detection_qemu.sh: waiting for another run using $CACHE_ROOT"; flock 9; }
+fi
+if [ -d "$QDIR/.kernel-cache" ]; then
+    echo "test_detection_qemu.sh: note: $QDIR/.kernel-cache is the old, per-checkout cache location and is no longer used - delete it to free the space"
+fi
 # Keyed on this script's hash plus the kernel download/verify helper files -
 # same reasoning as qemu-boot-test.yml's cache key including
 # hashFiles(workflow file): editing the scripts/config enables below

@@ -4,7 +4,11 @@
 # before anything leaves your machine, but ONLY when the push actually
 # touches av/, userspace/avctl/, userspace/avd/, userspace/av-gui/,
 # rules/, corpus/, or packaging/ - a docs-only push shouldn't insmod a
-# kernel module.
+# kernel module. A push that changes only userspace/, rules/, corpus/ or
+# packaging/ still runs the suite but skips the QEMU boot test
+# (AV_SKIP_QEMU_BOOT), which uses none of them; a change to the QEMU test's
+# own inputs (tests/qemu-boot/, tests/test_detection*.sh, the kernel
+# version list) runs it.
 #
 # av.ko is arm64-only (hooks __arm64_sys_* symbols, reads arm64
 # pt_regs), so it can only ever be insmod'd on a native aarch64 host -
@@ -77,7 +81,17 @@ done
 # match result, so a real match could be misreported as "no match"
 # and the test suite silently skipped. A herestring has no second
 # process and no pipe to close early, so this can't happen.
-if ! grep -qE '^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/|packaging/)' <<< "$CHANGED_FILES"; then
+# Everything the QEMU boot test (tests/test_detection_qemu.sh) builds or
+# reads. Only av.ko and the guest's init go into its initramfs - nothing
+# from userspace/, rules/, corpus/ or packaging/ does.
+QEMU_PATHS='^(av/|tests/qemu-boot/|tests/test_detection(_qemu)?\.sh$|\.github/kernel-versions\.json$|\.github/scripts/(verify-kernel-tarball\.sh|kernel-autosigner\.asc)$)'
+if grep -qE "$QEMU_PATHS" <<< "$CHANGED_FILES"; then
+    QEMU_CHANGED=1
+else
+    QEMU_CHANGED=0
+fi
+
+if [ "$QEMU_CHANGED" = 0 ] && ! grep -qE '^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/|packaging/)' <<< "$CHANGED_FILES"; then
     echo "pre-push: no changes under av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, corpus/, or packaging/ - skipping test suite"
     exit 0
 fi
@@ -90,6 +104,14 @@ echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 # clear error (and no polkit agent available shows up as pkexec exiting
 # nonzero immediately), if authentication genuinely can't happen - no
 # need to duplicate that check here.
+# Off a native aarch64 host, test_detection.sh is a cross-built kernel
+# plus a TCG boot taking minutes; skip it when nothing it uses changed.
+# On aarch64 it is a real insmod and stays on.
+if [ "$QEMU_CHANGED" = 0 ]; then
+    echo "    (no changes the QEMU boot test uses - skipping it off aarch64)"
+    export AV_SKIP_QEMU_BOOT=1
+fi
+
 if "$REPO_ROOT/tests/run_all.sh"; then
     echo "pre-push: all tests passed"
     exit 0

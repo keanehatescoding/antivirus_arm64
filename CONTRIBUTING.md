@@ -90,7 +90,12 @@ that loads the module and checks clean-vs-EICAR detection
   dev host `run_all.sh` self-detects and runs unprivileged: the
   module build is cross-compiled and boot-tested under QEMU rather
   than `insmod`'d, and the tests that need a loaded module on the
-  host are skipped rather than failed.
+  host are skipped rather than failed. That QEMU boot only runs when
+  the push touches something it uses (`av/`, `tests/qemu-boot/`,
+  `tests/test_detection*.sh`, the kernel version list), and its
+  kernel build is cached once per machine in
+  `~/.cache/antivirus_arm64/qemu-kernel` (override with
+  `AV_KERNEL_CACHE`), shared by every clone and worktree.
 
 Both accept `--no-verify` if you really need to skip them, but that's
 best avoided — particularly right before a tag.
