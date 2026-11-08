@@ -34,8 +34,8 @@ name: Update kernel matrix versions
 # Pull requests: read/write. (Not a GitHub App installation token: those
 # expire after an hour, so a stored one is dead by the next weekly run,
 # and a set-but-expired secret skips the GITHUB_TOKEN fallback.) The
-# PAT also pushes the branch, so build-matrix.yml and qemu-boot-test.yml
-# ignore pushes to ci/update-kernel-matrix and run once, on the PR.
+# PAT also pushes the branch, but push-triggered CI only runs on
+# master, so the bump's checks run once, on the PR.
 # Without it the job
 # still opens the PR with GITHUB_TOKEN, but warns, and the PR body says
 # how to start CI by hand.

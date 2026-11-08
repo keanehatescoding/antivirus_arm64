@@ -70,12 +70,15 @@ start/stop `avd`:
 | hashing code (either)       | `tests/test_sha256.sh`, `tests/test_tlsh_core.sh` — no root needed            |
 | broader / not sure          | `sudo tests/run_all.sh` — builds everything, runs the full set                |
 
-CI re-runs a version of this on every push across three tiers: compile
+CI re-runs a version of this on every PR (and on `master` after each
+merge) across three tiers: compile
 across gcc/clang against the kernel versions pinned in
 `.github/kernel-versions.json` (`build-matrix.yml`), a real QEMU boot
 that loads the module and checks clean-vs-EICAR detection
 (`qemu-boot-test.yml`), and a packaging build for `.deb`/`.pkg.tar.zst`/
-`.rpm` (`build-packages.yml`).
+`.rpm` (`build-packages.yml`). Pushing a branch without a PR doesn't
+start CI; open a (draft) PR, or start the workflows by hand from the
+Actions tab (they all accept `workflow_dispatch`).
 
 ## What runs automatically
 

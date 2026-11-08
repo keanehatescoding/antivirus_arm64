@@ -1,7 +1,7 @@
 name: Build distro packages
 
 # Builds the .deb (Debian/Ubuntu), .pkg.tar.zst (Arch), and .rpm
-# (Fedora) packages under packaging/ on every push/PR, so a packaging
+# (Fedora) packages under packaging/ on every PR and master push, so a packaging
 # regression (a missing BuildRequires, a broken Makefile override, a
 # stale pinned source) gets caught the same way build-matrix.yml
 # catches a kernel-compat regression. Unlike that workflow, none of
@@ -13,8 +13,14 @@ name: Build distro packages
 # package-build time. This only verifies the PACKAGES build.
 
 on:
+  # Branches are tested by their pull_request run; push runs only on
+  # master, so each PR push runs this once, not twice, and master still
+  # gets a run after every merge. workflow_dispatch tests a branch that
+  # has no PR yet (Actions tab > Run workflow).
   push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
   # Lets .github/workflows/release.yml (tag-triggered) run these same
   # three jobs via `uses: ./.github/workflows/build-packages.yml`
   # instead of re-declaring deb/arch/rpm build steps a second time in
@@ -23,6 +29,14 @@ on:
   # in build-deb/build-rpm, which are gated on `startsWith(github.ref,
   # 'refs/tags/')` and so are no-ops on a plain push/PR trigger.
   workflow_call:
+
+# A newer push to the same PR makes its older run moot: cancel it.
+# Runs on master, tags and manual ones are never cancelled. The fixed
+# prefix matters: when release.yml calls this file, github.workflow is
+# release.yml's name, and the group must not match a group of its own.
+concurrency:
+  group: build-packages-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # None of these jobs push, comment, or otherwise write anything back to
 # the repository - read-only is enough, and persist-credentials: false

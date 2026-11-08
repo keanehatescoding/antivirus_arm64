@@ -117,7 +117,7 @@ is used throughout instead of real malware.
 
 ## CI
 
-Eight workflows, four of them tiers that run on every push and PR:
+Eight workflows, four of them tiers that run on every PR and on each push to `master`:
 shellcheck/cppcheck/yamllint lint, a compile matrix (gcc/clang × 3 kernel
 versions), a QEMU boot test with real runtime detection, and a packaging
 build (deb/Arch/Fedora). The rest: a weekly kernel-matrix refresh, tagged

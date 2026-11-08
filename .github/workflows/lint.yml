@@ -2,7 +2,7 @@ name: Lint (static analysis)
 
 # Tier 0 CI: runs the same static-analysis checks the local pre-commit
 # hook runs (shellcheck, cppcheck, yamllint) unconditionally on every
-# push/PR, independent of what happens to be installed on a given
+# PR and master push, independent of what happens to be installed on a given
 # developer's machine. Pre-commit deliberately no-ops when a tool is
 # missing (see its header comment) to keep commits fast, so without
 # this job unlinted shell/YAML/C changes could merge freely with no
@@ -16,8 +16,20 @@ name: Lint (static analysis)
 # part of closing #9.
 
 on:
+  # Branches are tested by their pull_request run; push runs only on
+  # master, so each PR push runs this once, not twice, and master still
+  # gets a run after every merge. workflow_dispatch tests a branch that
+  # has no PR yet (Actions tab > Run workflow).
   push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+# A newer push to the same PR makes its older run moot: cancel it.
+# Runs on master (and manual ones) are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Nothing here pushes, comments, or writes back to the repository -
 # read-only is enough, and persist-credentials: false below means

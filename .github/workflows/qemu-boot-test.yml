@@ -19,11 +19,20 @@ name: QEMU boot test (runtime detection)
 # there.
 
 on:
+  # Branches are tested by their pull_request run; push runs only on
+  # master, so each PR push runs this once, not twice, and master still
+  # gets a run after every merge. workflow_dispatch tests a branch that
+  # has no PR yet (Actions tab > Run workflow).
   push:
-    # The kernel-bump branch is pushed with a PAT (update-kernel-matrix.yml)
-    # and always gets a PR; run once there, not twice.
-    branches-ignore: [ci/update-kernel-matrix]
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+# A newer push to the same PR makes its older run moot: cancel it.
+# Runs on master (and manual ones) are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
