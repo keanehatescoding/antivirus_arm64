@@ -9,7 +9,7 @@
 # Tracks the git repo directly (no tagged release covers av-gui yet -
 # see the top-level README). Pin to a specific commit/tag instead by
 # changing the `source` line below to
-# git+https://github.com/keanehatescoding/antivirus.git#tag=vX.Y.Z
+# git+https://github.com/keanehatescoding/antivirus_arm64.git#tag=vX.Y.Z
 # if you'd rather not build off the moving master branch.
 #
 # HYPRAV_CI_SOURCE overrides the git URL below (default: the real
@@ -33,7 +33,7 @@ pkgrel=1
 # or switching that container to an ALARM-based one - see
 # .github/workflows/build-packages.yml's build-arch job.
 arch=('aarch64')
-url="https://github.com/keanehatescoding/antivirus"
+url="https://github.com/keanehatescoding/antivirus_arm64"
 # SPDX identifier (namcap E-errors on anything else - confirmed by a
 # real CI run rejecting 'GPL3'). Matches LICENSE and
 # packaging/fedora/hyprav.spec's own License: field. Dual-licensed
@@ -58,7 +58,7 @@ license=('GPL-2.0-only OR MIT')
 # machine, and polkit is just the installed action file plus the
 # runtime `pkexec` dependency package_hyprav() already declares.
 makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4' 'dkms' 'polkit')
-source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus.git}")
+source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus_arm64.git}")
 sha256sums=('SKIP')
 
 pkgver() {

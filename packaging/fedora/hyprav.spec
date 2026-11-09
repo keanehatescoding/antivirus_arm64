@@ -69,7 +69,7 @@ Summary:        Kprobe-based Linux antivirus with YARA/entropy/fuzzy-hash daemon
 # (pre F38-ish) used short names like "GPLv2"/"MIT" instead - adjust
 # if targeting one of those.
 License:        GPL-2.0-only OR MIT
-URL:            https://github.com/keanehatescoding/antivirus
+URL:            https://github.com/keanehatescoding/antivirus_arm64
 Source0:        %{url}/archive/%{gitcommit}/antivirus-%{gitcommit}.tar.gz
 
 BuildRequires:  gcc
@@ -145,7 +145,6 @@ per-verb org.hyprav.avctl.* polkit actions installed by the base package.
 
 %prep
 %autosetup -n antivirus-%{gitcommit}
-
 %build
 make -C userspace/avd
 make -C userspace/avctl
