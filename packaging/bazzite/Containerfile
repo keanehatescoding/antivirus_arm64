@@ -31,7 +31,7 @@ FROM ${BASE_IMAGE} AS builder
 
 # Commit or tag to build. Override with --build-arg HYPRAV_REF=vX.Y.Z.
 ARG HYPRAV_REF=master
-ARG HYPRAV_GIT=https://github.com/keanehatescoding/antivirus.git
+ARG HYPRAV_GIT=https://github.com/keanehatescoding/antivirus_arm64.git
 
 # rpm-ostree is the package manager on an Atomic base; `rpm-ostree install`
 # in a container build applies straight into this stage's /usr. These are
