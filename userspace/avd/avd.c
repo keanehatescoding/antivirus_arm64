@@ -718,13 +718,29 @@ static int load_fuzzy_corpus(const char *path) {
     return -1;
   }
 
-  while (fgets(line, sizeof(line), fp)) {
+  for (;;) {
     char *hash_part, *name_part;
+    size_t len = 0;
+    int ch;
+    int has_nul = 0;
+
+    while ((ch = fgetc(fp)) != EOF && ch != '\n') {
+      if (ch == '\0')
+        has_nul = 1;
+      if (len + 1 < sizeof(line))
+        line[len++] = (char)ch;
+    }
+    if (ch == EOF && len == 0)
+      break;
+    line[len] = '\0';
     lineno++;
-    if (!strchr(line, '\n')) {
-      int ch;
-      while ((ch = fgetc(fp)) != '\n' && ch != EOF) {
-      }
+
+    if (has_nul) {
+      fprintf(stderr,
+              "avd: %s:%zu: skipping malformed fuzzy corpus line "
+              "(embedded NUL)\n",
+              path, lineno);
+      continue;
     }
 
     if (!parse_corpus_line(line, &hash_part, &name_part, path, lineno,
@@ -1067,13 +1083,29 @@ static int load_tlsh_corpus(const char *path) {
     return -1;
   }
 
-  while (fgets(line, sizeof(line), fp)) {
+  for (;;) {
     char *hash_part, *name_part;
+    size_t len = 0;
+    int ch;
+    int has_nul = 0;
+
+    while ((ch = fgetc(fp)) != EOF && ch != '\n') {
+      if (ch == '\0')
+        has_nul = 1;
+      if (len + 1 < sizeof(line))
+        line[len++] = (char)ch;
+    }
+    if (ch == EOF && len == 0)
+      break;
+    line[len] = '\0';
     lineno++;
-    if (!strchr(line, '\n')) {
-      int ch;
-      while ((ch = fgetc(fp)) != '\n' && ch != EOF) {
-      }
+
+    if (has_nul) {
+      fprintf(stderr,
+              "avd: %s:%zu: skipping malformed TLSH corpus line "
+              "(embedded NUL)\n",
+              path, lineno);
+      continue;
     }
 
     if (!parse_corpus_line(line, &hash_part, &name_part, path, lineno,
