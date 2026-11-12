@@ -721,6 +721,11 @@ static int load_fuzzy_corpus(const char *path) {
   while (fgets(line, sizeof(line), fp)) {
     char *hash_part, *name_part;
     lineno++;
+    if (!strchr(line, '\n')) {
+      int ch;
+      while ((ch = fgetc(fp)) != '\n' && ch != EOF) {
+      }
+    }
 
     if (!parse_corpus_line(line, &hash_part, &name_part, path, lineno,
                            "fuzzy"))
@@ -1065,6 +1070,11 @@ static int load_tlsh_corpus(const char *path) {
   while (fgets(line, sizeof(line), fp)) {
     char *hash_part, *name_part;
     lineno++;
+    if (!strchr(line, '\n')) {
+      int ch;
+      while ((ch = fgetc(fp)) != '\n' && ch != EOF) {
+      }
+    }
 
     if (!parse_corpus_line(line, &hash_part, &name_part, path, lineno,
                            "TLSH"))
