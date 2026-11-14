@@ -1025,6 +1025,35 @@ int main(int argc, char *const argv[]) {
       }
       write_param_int(TOCTOU_DELAY_PARAM, 0);
     }
+    /* F: exec through a symlink to the FILE whose name matches the
+     * target's (/tmp/sd_flink/f -> /tmp/sd_real/f, /tmp/sd_flink a real
+     * directory), then unlink that symlink -> NOT killed. Unlinking it
+     * leaves the executable alone, but a lexical key accepted on
+     * "same basename" alone matched it and killed (CodeRabbit on x86
+     * #229). av.ko now accepts that key only when its directory
+     * resolves to the executed file's own directory. */
+    if (!failed) {
+      int code, sig, saw_record, killed;
+
+      if (mkdir("/tmp/sd_flink", 0755) != 0)
+        die("mkdir /tmp/sd_flink");
+      copy_file("/init", "/tmp/sd_real/f");
+      if (symlink("/tmp/sd_real/f", "/tmp/sd_flink/f") != 0)
+        die("symlink /tmp/sd_flink/f");
+      killed = run_self_delete_case("/tmp/sd_flink/f", "--self-unlink",
+                                    "/tmp/sd_real/f", "/tmp/sd_flink/f",
+                                    &code, &sig, &saw_record);
+      outmsg("QEMU_TEST: self-delete case f (file symlink, same name): "
+             "exec /tmp/sd_flink/f, unlink /tmp/sd_flink/f -> %s "
+             "(exit=%d sig=%d, exec record %s)\n",
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (killed || code != 43) {
+        outmsg("QEMU_TEST: FAIL: self-delete case f expected no kill and "
+               "exit 43 (44 = sync read, 45 = unlink)\n");
+        failed = 1;
+      }
+    }
     if (failed) {
       outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
       poweroff_now();
