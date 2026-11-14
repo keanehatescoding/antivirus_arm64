@@ -653,14 +653,14 @@ static int load_rules(const char *dir) {
  * Parses one raw corpus line of the shared "<hash>,<name>" format used
  * by both the ssdeep and TLSH corpus files. Mutates `line` in place
  * (strips the trailing newline, splits at the comma) and points
- * hash_part_out/name_part_out into it. `kind` ("fuzzy"/"TLSH") is
- * only used to label the malformed-line warning so callers stay
- * distinguishable in the log. Returns 1 with the out-params set on a
- * usable line, 0 to skip the line (comment/blank, or malformed -
- * already warned about in the latter case).
+ * hash_part_out/name_part_out into it. `path`/`lineno`/`kind` label
+ * warnings so a bad entry is easy to locate and fix. Returns 1 with the
+ * out-params set on a usable line, 0 to skip the line (comment/blank,
+ * or malformed - already warned about in the latter case).
  */
 static int parse_corpus_line(char *line, char **hash_part_out,
-                             char **name_part_out, const char *kind) {
+                             char **name_part_out, const char *path,
+                             size_t lineno, const char *kind) {
   char *comma;
   char *newline;
 
@@ -679,17 +679,17 @@ static int parse_corpus_line(char *line, char **hash_part_out,
   comma = strchr(line, ',');
   if (!comma) {
     fprintf(stderr,
-            "avd: skipping malformed %s corpus line "
+            "avd: %s:%zu: skipping malformed %s corpus line "
             "(no comma): %s\n",
-            kind, line);
+            path, lineno, kind, line);
     return 0;
   }
   *comma = '\0';
   if (line[0] == '\0' || comma[1] == '\0') {
     fprintf(stderr,
-            "avd: skipping malformed %s corpus line "
+            "avd: %s:%zu: skipping malformed %s corpus line "
             "(empty hash or name)\n",
-            kind);
+            path, lineno, kind);
     return 0;
   }
   *hash_part_out = line;
@@ -701,6 +701,7 @@ static int load_fuzzy_corpus(const char *path) {
   FILE *fp;
   char line[512];
   size_t capacity = 16;
+  size_t lineno = 0;
 
   fp = fopen(path, "r");
   if (!fp) {
@@ -717,10 +718,33 @@ static int load_fuzzy_corpus(const char *path) {
     return -1;
   }
 
-  while (fgets(line, sizeof(line), fp)) {
+  for (;;) {
     char *hash_part, *name_part;
+    size_t len = 0;
+    int ch;
+    int has_nul = 0;
 
-    if (!parse_corpus_line(line, &hash_part, &name_part, "fuzzy"))
+    while ((ch = fgetc(fp)) != EOF && ch != '\n') {
+      if (ch == '\0')
+        has_nul = 1;
+      if (len + 1 < sizeof(line))
+        line[len++] = (char)ch;
+    }
+    if (ch == EOF && len == 0)
+      break;
+    line[len] = '\0';
+    lineno++;
+
+    if (has_nul) {
+      fprintf(stderr,
+              "avd: %s:%zu: skipping malformed fuzzy corpus line "
+              "(embedded NUL)\n",
+              path, lineno);
+      continue;
+    }
+
+    if (!parse_corpus_line(line, &hash_part, &name_part, path, lineno,
+                           "fuzzy"))
       continue;
 
     /* Reject hashes libfuzzy itself cannot parse now, at load, rather
@@ -733,9 +757,9 @@ static int load_fuzzy_corpus(const char *path) {
      * matcher actually accepts. */
     if (fuzzy_compare(hash_part, hash_part) < 0) {
       fprintf(stderr,
-              "avd: skipping malformed fuzzy corpus line "
+              "avd: %s:%zu: skipping malformed fuzzy corpus line "
               "(unparseable hash): %s\n",
-              name_part);
+              path, lineno, name_part);
       continue;
     }
 
@@ -766,9 +790,16 @@ static int load_fuzzy_corpus(const char *path) {
             "avd: fuzzy corpus \"%s\" loaded but empty - "
             "fuzzy matching will never trigger\n",
             path);
-  else
+  else {
     printf("avd: loaded %zu fuzzy hash(es) from %s\n", fuzzy_corpus_count,
            path);
+    if (fuzzy_corpus_count == 1 &&
+        strcmp(fuzzy_corpus[0].name, "test-ptrace-sample") == 0)
+      fprintf(stderr,
+              "avd: warning: fuzzy corpus \"%s\" contains only the demo "
+              "fixture - detections will not fire on real samples\n",
+              path);
+  }
 
   return 0;
 }
@@ -1023,6 +1054,7 @@ static int load_tlsh_corpus(const char *path) {
   char line[512];
   size_t capacity = 16;
   size_t hash_maxlen = av_tlsh_hash_maxlen();
+  size_t lineno = 0;
 
   /* AV_TLSH_HASH_BUFSZ's comment promises this holds; check it rather
    * than trust it silently drifting true forever if either constant
@@ -1051,10 +1083,33 @@ static int load_tlsh_corpus(const char *path) {
     return -1;
   }
 
-  while (fgets(line, sizeof(line), fp)) {
+  for (;;) {
     char *hash_part, *name_part;
+    size_t len = 0;
+    int ch;
+    int has_nul = 0;
 
-    if (!parse_corpus_line(line, &hash_part, &name_part, "TLSH"))
+    while ((ch = fgetc(fp)) != EOF && ch != '\n') {
+      if (ch == '\0')
+        has_nul = 1;
+      if (len + 1 < sizeof(line))
+        line[len++] = (char)ch;
+    }
+    if (ch == EOF && len == 0)
+      break;
+    line[len] = '\0';
+    lineno++;
+
+    if (has_nul) {
+      fprintf(stderr,
+              "avd: %s:%zu: skipping malformed TLSH corpus line "
+              "(embedded NUL)\n",
+              path, lineno);
+      continue;
+    }
+
+    if (!parse_corpus_line(line, &hash_part, &name_part, path, lineno,
+                           "TLSH"))
       continue;
 
     /* sizeof(tlsh_corpus[...].hash) is a fixed AV_TLSH_HASH_BUFSZ
@@ -1066,9 +1121,9 @@ static int load_tlsh_corpus(const char *path) {
      * silent truncated-hash corruption. */
     if (strlen(hash_part) > hash_maxlen) {
       fprintf(stderr,
-              "avd: skipping TLSH corpus line with an oversized hash "
-              "(%zu chars, max %zu): %s\n",
-              strlen(hash_part), hash_maxlen, name_part);
+              "avd: %s:%zu: skipping TLSH corpus line with an oversized "
+              "hash (%zu chars, max %zu): %s\n",
+              path, lineno, strlen(hash_part), hash_maxlen, name_part);
       continue;
     }
     /* Same load-time rejection as load_fuzzy_corpus() above, using
@@ -1080,9 +1135,9 @@ static int load_tlsh_corpus(const char *path) {
      * rejected once here with a clear warning. */
     if (av_tlsh_diff(hash_part, hash_part) < 0) {
       fprintf(stderr,
-              "avd: skipping malformed TLSH corpus line "
+              "avd: %s:%zu: skipping malformed TLSH corpus line "
               "(unparseable hash): %s\n",
-              name_part);
+              path, lineno, name_part);
       continue;
     }
 
@@ -1113,8 +1168,15 @@ static int load_tlsh_corpus(const char *path) {
             "avd: TLSH corpus \"%s\" loaded but empty - "
             "TLSH matching will never trigger\n",
             path);
-  else
+  else {
     printf("avd: loaded %zu TLSH hash(es) from %s\n", tlsh_corpus_count, path);
+    if (tlsh_corpus_count == 1 &&
+        strcmp(tlsh_corpus[0].name, "test-ptrace-sample") == 0)
+      fprintf(stderr,
+              "avd: warning: TLSH corpus \"%s\" contains only the demo "
+              "fixture - detections will not fire on real samples\n",
+              path);
+  }
 
   return 0;
 }
