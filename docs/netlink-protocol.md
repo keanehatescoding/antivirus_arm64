@@ -31,9 +31,14 @@ in the kernel headers the way a raw `NETLINK_*` family would.
    |
    |---------- AV_C_SCAN_REQUEST ------->|   unicast to daemon's portid
    |           REQID, PID, PATH,             (kernel generates a unique
-   |           SHA256                        REQID per request)
+   |           SHA256, DEV_MAJOR,            REQID per request)
+   |           DEV_MINOR, INO
    |
-   |                                     [ daemon opens the file and runs
+   |                                     [ daemon opens PATH, checks its
+   |                                       dev/ino against the request
+   |                                       (falls back to /proc/PID/exe,
+   |                                       else answers UNAVAILABLE),
+   |                                       then runs
    |                                       up to three stages, each only
    |                                       reached if the one before it
    |                                       did not convict:
@@ -50,7 +55,8 @@ in the kernel headers the way a raw `NETLINK_*` family would.
    |
    |<--------- AV_C_VERDICT -------------|   REQID (echoed back),
    |           VERDICT (0=clean/                VERDICT, RULE_NAME
-   |           1=malicious), RULE_NAME
+   |           1=malicious/2=unavailable),
+   |           RULE_NAME
    |
  [workqueue thread was blocked in
   av_netlink_scan_request(), wakes
@@ -128,8 +134,57 @@ by watching your own shell die.
 | `AV_A_PID` | u32 | SCAN_REQUEST | PID of the process that's executing the file (informational for the daemon; the kernel does its own `pid_task()` lookup for the actual kill). |
 | `AV_A_PATH` | nul-string | SCAN_REQUEST | Absolute path to the file. |
 | `AV_A_SHA256` | nul-string | SCAN_REQUEST | Precomputed SHA-256 (kernel already computed it for the signature check, may as well forward it — saves the daemon a redundant hash for logging/caching). |
-| `AV_A_VERDICT` | u8 | VERDICT | `0` = clean, `1` = malicious. |
+| `AV_A_VERDICT` | u8 | VERDICT | `0` = clean, `1` = malicious, `2` = unavailable (the daemon could not reach the file the kernel hashed - see *Scanning the hashed file* below). Any other value is rejected with `-EINVAL`. |
 | `AV_A_RULE_NAME` | nul-string | VERDICT | Which rule/heuristic matched, for logging. Optional/empty on a clean verdict. |
+| `AV_A_DEV_MAJOR` | u32 | SCAN_REQUEST | `major()` of the hashed file's `st_dev`, as userspace `fstat()` reports it (kernel side uses `vfs_getattr()`, not the raw inode fields, so btrfs subvolumes and overlayfs agree). |
+| `AV_A_DEV_MINOR` | u32 | SCAN_REQUEST | `minor()` of the same. |
+| `AV_A_INO` | u64 | SCAN_REQUEST | `st_ino` of the hashed file. The three identity attributes are always sent together. If `vfs_getattr()` fails, the kernel sends no request at all - see *Scanning the hashed file*. |
+
+## Scanning the hashed file (issue #128)
+
+The kernel hashes the exec'd file through the `struct file` it pinned at
+the probe, so a rename or unlink after the exec can't change what it
+hashed. The daemon only gets `PATH`, and opens it by name some time
+later. Without a check, a rename-swap in that window made YARA/ssdeep/
+TLSH scan a decoy, and an unlink made the open fail - which avd used to
+answer `CLEAN`.
+
+So the request carries the file's identity, and avd scans only an fd
+whose `fstat()` matches it:
+
+1. Open `PATH` (`O_NONBLOCK`, regular files only). If its dev/ino match,
+   scan it.
+2. Otherwise open `/proc/<PID>/exe`. `mm->exe_file` follows the exec'd
+   file through renames and unlinks, so this reaches the real file in
+   the "exec, then swap the path" case. It is accepted on the same
+   identity match only: for a script it names the interpreter, and
+   before the exec commits it names the old image. Opening it for
+   another uid's process needs `CAP_SYS_PTRACE`.
+3. If neither matches, reply `AV_VERDICT_UNAVAILABLE`. The kernel applies
+   the fail-open/fail-closed policy below to it, exactly like a timeout:
+   fail-closed kills (`type=fail-closed reason=daemon-unavailable`),
+   fail-open logs `event=unverified type=daemon` at warn - never
+   `event=clean type=daemon`.
+
+If the kernel can't read the hashed file's identity in the first place
+(`vfs_getattr()` fails on the pinned file), it doesn't send a request:
+an identity-free request would put avd in the by-path compatibility
+mode below. It applies the same policy as an `UNAVAILABLE` reply instead
+(`reason=identity-unavailable` under fail-closed; under fail-open the
+`event=unverified` line ends "daemon not asked").
+
+Quarantine after a step-2 scan moves the real inode (linked through the
+fd) and leaves whatever now sits at `PATH` alone: `quarantine_file()`
+only unlinks `PATH` after an `lstat()` re-check that it still names the
+fd's inode.
+
+**Version skew.** A request with no identity attributes comes from a
+module that predates them (current modules never send one), and that
+module also rejects verdict `2`.
+avd keeps the old by-path behaviour for those requests (including
+`CLEAN` on a failed open) instead of making every such exec wait out
+`daemon_timeout_ms`. An older avd ignores the new attributes and never
+sends `2`.
 
 ## Known limitations (document these in your report)
 
