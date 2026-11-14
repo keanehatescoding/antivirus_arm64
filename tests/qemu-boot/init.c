@@ -24,7 +24,7 @@
  * lost), for reasons not fully root-caused. write() sidesteps
  * whatever that was rather than chasing it further.
  *
- * Runs in one of three modes:
+ * Runs in one of these modes:
  *   - argv[1] == "--clean-marker": immediately exit(42). This is what
  *     gets exec'd as the "definitely not malicious" test case - no
  *     separate coreutils/busybox binary needed, we just re-exec
@@ -34,6 +34,10 @@
  *     the child half of the self-delete cases, run from a copy of this
  *     binary - delete or replace a name, then linger (exit 43 if still
  *     alive). See the comments on each in main().
+ *   - argv[1] == "--linger": write one byte to fd 3, then sleep and
+ *     exit(43). The #128 daemon-identity case execs a copy of this
+ *     binary in this mode so a live, already-exec'd process exists
+ *     while its pathname is swapped out from under avd.
  *   - no args (PID 1): the actual init/test-runner logic below.
  */
 #define _GNU_SOURCE
@@ -41,6 +45,7 @@
 #include <fcntl.h>
 #include <linux/reboot.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -50,6 +55,7 @@
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -258,6 +264,30 @@ static void write_file(const char *path, const char *content) {
   if (write(fd, content, strlen(content)) < 0)
     die("write");
   close(fd);
+}
+
+/* Byte-for-byte copy, mode 0755 - the #128 and self-delete cases exec
+ * a copy of /init from /tmp so the original on the rootfs is never
+ * scanned, quarantined, or unlinked. */
+static void copy_file(const char *src, const char *dst) {
+  char buf[65536];
+  int in = open(src, O_RDONLY);
+  int out;
+  ssize_t n;
+
+  if (in < 0)
+    die("open copy source");
+  out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+  if (out < 0)
+    die("open copy destination");
+  while ((n = read(in, buf, sizeof(buf))) > 0) {
+    if (write(out, buf, (size_t)n) != n)
+      die("write copy");
+  }
+  if (n < 0)
+    die("read copy source");
+  close(in);
+  close(out);
 }
 
 /* Set an integer sysfs/module-param attribute. Unlike write_file() this
@@ -572,27 +602,6 @@ static void stop_avd(pid_t pid) {
 
 /* ---- helpers for the self-delete correlation case ---- */
 
-static void copy_file(const char *src, const char *dst) {
-  char buf[65536];
-  int in = open(src, O_RDONLY);
-  int out;
-  ssize_t n;
-
-  if (in < 0)
-    die("open copy source");
-  out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0700);
-  if (out < 0)
-    die("open copy destination");
-  while ((n = read(in, buf, sizeof(buf))) > 0) {
-    if (write(out, buf, (size_t)n) != n)
-      die("write copy destination");
-  }
-  if (n < 0)
-    die("read copy source");
-  close(in);
-  close(out);
-}
-
 /* Execs `exec_path` (a copy of /init) as `exec_path mode arg2 [arg3]`
  * (the --self-* child modes, see main()), lets it act once av.ko has
  * recorded the exec (calling `on_record` first, if non-NULL and the
@@ -790,6 +799,17 @@ int main(int argc, char *const argv[]) {
     if (unlink(argv[3]) != 0)
       _exit(45);
     sleep(5);
+    _exit(43);
+  }
+  if (argc > 1 && !strcmp(argv[1], "--linger")) {
+    struct timespec ts = {.tv_sec = 20, .tv_nsec = 0};
+
+    /* The byte says "exec committed and main() is running" - the
+     * parent swaps the path only after reading it. */
+    if (write(3, "x", 1) != 1)
+      _exit(44);
+    close(3);
+    nanosleep(&ts, NULL);
     _exit(43);
   }
 
@@ -1402,6 +1422,81 @@ int main(int argc, char *const argv[]) {
                  jc[i].name, jc[i].gone,
                  jc[i].survivor ? " and leave " : "",
                  jc[i].survivor ? jc[i].survivor : "");
+          failed = 1;
+        }
+      }
+    }
+    /* T/U: exec spellings whose lexical key used to be dropped
+     * (CodeRabbit on x86 #229). Both must be killed.
+     *
+     *   T: ".." in the EXEC spelling (case H has it in the unlink).
+     *      /tmp/sd_tx/link -> /tmp/sd_ty/sub, so an exec of
+     *      /tmp/sd_tx/link/../t runs /tmp/sd_ty/t. The key was checked
+     *      collapsed, as /tmp/sd_tx/t, whose directory is not the
+     *      image's, and dropped; unlinking the same spelling then
+     *      matched neither key.
+     *   U: chroot /tmp/sd_u, inside which /tmp/sd_u -> "..", i.e. the
+     *      task's own "/". Exec "tmp/sd_u/u" from "/" runs the host's
+     *      /tmp/sd_u/u. Its canonical name equals the task-rooted key,
+     *      so the key was dropped as redundant, but the unlink of
+     *      "tmp/sd_u/u" is /tmp/sd_u/tmp/sd_u/u as this side spells
+     *      it, and only the key matches it.
+     *
+     * Those were #229's path-string keys. Matching the dentry the
+     * kernel resolved for the unlink is spelling- and root-independent,
+     * so here they just pin that down. */
+    if (!failed) {
+      static const struct {
+        const char *name, *chroot_dir, *exec, *image, *unlink;
+      } kc[] = {
+          {"t", NULL, "/tmp/sd_tx/link/../t", "/tmp/sd_ty/t",
+           "/tmp/sd_tx/link/../t"},
+          {"u", "/tmp/sd_u", "tmp/sd_u/u", "/tmp/sd_u/u", "tmp/sd_u/u"},
+      };
+
+      if (mkdir("/tmp/sd_tx", 0755) != 0 || mkdir("/tmp/sd_ty", 0755) != 0 ||
+          mkdir("/tmp/sd_ty/sub", 0755) != 0 ||
+          mkdir("/tmp/sd_u", 0755) != 0 || mkdir("/tmp/sd_u/tmp", 0755) != 0)
+        die("mkdir case t/u dirs");
+      if (symlink("/tmp/sd_ty/sub", "/tmp/sd_tx/link") != 0)
+        die("symlink /tmp/sd_tx/link");
+      if (symlink("..", "/tmp/sd_u/tmp/sd_u") != 0)
+        die("symlink /tmp/sd_u/tmp/sd_u");
+      for (size_t i = 0; i < sizeof(kc) / sizeof(kc[0]) && !failed; i++) {
+        int code, sig, saw_record, killed;
+        struct stat st;
+        pid_t child;
+
+        copy_file("/init", kc[i].image);
+        sd_chroot_dir = kc[i].chroot_dir;
+        killed = run_self_delete_case(kc[i].exec, "--self-unlink",
+                                      kc[i].unlink, NULL, kc[i].image, NULL,
+                                      &code, &sig, &saw_record, &child);
+        sd_chroot_dir = NULL;
+        outmsg("QEMU_TEST: self-delete case %s%s%s%s: exec %s, unlink %s "
+               "-> %s (exit=%d sig=%d, exec record %s)\n",
+               kc[i].name, kc[i].chroot_dir ? " (chroot " : "",
+               kc[i].chroot_dir ? kc[i].chroot_dir : "",
+               kc[i].chroot_dir ? ")" : "", kc[i].exec, kc[i].unlink,
+               killed ? "killed" : "not killed", code, sig,
+               saw_record ? "seen" : "not seen in log");
+        if (!saw_record || !killed) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s expected a seen exec "
+                 "record and a kill%s\n",
+                 kc[i].name,
+                 code == 45 ? " (helper's unlink failed)"
+                 : code == 125 ? " (chroot failed)"
+                               : "");
+          failed = 1;
+        } else if (!saw_kill_reason(child, "self-deleting binary")) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s was killed but dmesg "
+                 "has no reason=\"self-deleting binary ...\" pid=%d line\n",
+                 kc[i].name, (int)child);
+          failed = 1;
+        } else if (stat(kc[i].image, &st) == 0) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s's unlink did not "
+                 "remove %s\n",
+                 kc[i].name, kc[i].image);
           failed = 1;
         }
       }
@@ -2337,6 +2432,418 @@ int main(int argc, char *const argv[]) {
       outmsg("QEMU_TEST: fail-closed avd shut down cleanly and released "
              "the mark\n");
       outmsg("QEMU_TEST: fanotify fail-closed incomplete-scan check passed\n");
+    }
+
+    /* ---- #128: avd scans the file the kernel hashed, not whatever the
+     * pathname names by the time it gets to it ----
+     *
+     * The netlink leg, not the gate: this avd runs WITHOUT
+     * AVD_FANOTIFY_EXEC, so every verdict below comes from av.ko's
+     * scan request and avd's answer to it. The kernel hashes the file
+     * it pinned at the probe; avd used to re-open the request's path by
+     * name, so a rename in between had YARA scan a decoy, and an unlink
+     * made the open fail and avd answer CLEAN. The request now carries
+     * the file's dev/ino, and avd scans only an fd that matches it -
+     * the path, else /proc/<pid>/exe - and answers UNAVAILABLE when
+     * neither does.
+     *
+     * The window is widened with the same test-only knob as the
+     * TOCTOU batch: the work item parks for TOCTOU_WQ_DELAY_MS before
+     * hashing, and avd only sees the request after that, so a swap
+     * made right after exec lands before avd's open in all but the
+     * slowest runs. Each half counts how often it actually won that
+     * race and requires at least one, so a run where every swap lost
+     * fails as vacuous instead of passing.
+     *
+     * (a) Unlink. Non-ELF malicious sample, exec fails ENOEXEC, then
+     *     the file is unlinked. The exec'ing child is gone by the time
+     *     avd looks, so /proc/<pid>/exe can't help either: the answer
+     *     must be UNAVAILABLE, which under the default fail-open policy
+     *     the kernel logs as event=unverified - and never as
+     *     event=clean type=daemon, which is what the old CLEAN produced.
+     *
+     * (b) Rename. A copy of this binary (its .rodata carries
+     *     malicious_content, the fixture rule's literal) exec'd in
+     *     --linger mode, with a clean decoy renamed over its path once
+     *     it is running. The path now names the decoy, so only the
+     *     /proc/<pid>/exe fallback reaches the real file. Every attempt
+     *     must end in SIGKILL; the old code scanned the decoy and let
+     *     the child exit 43.
+     *
+     * Neither race reaches the rejection of an fd that opened fine but
+     * is the wrong file: when the rename wins, the request already says
+     * " (deleted)" and the open fails. So (c) and (d) hand avd such an
+     * fd deterministically. avd runs in its own mount namespace, where
+     * a clean decoy is bind-mounted over each target. The kernel execs
+     * and hashes the target and d_path()s it to the same string, which
+     * avd then opens and gets the decoy. The targets are non-ELF and
+     * the exec fails ENOEXEC, so /proc/<pid>/exe is /init and can't
+     * match either. The answer must be UNAVAILABLE (event=unverified),
+     * where skipping the check scans the decoy and answers CLEAN. avd's
+     * own "replaced since exec" line, with the decoy's and the target's
+     * numbers, proves the open succeeded and the identity check did the
+     * rejecting, rather than some other failure.
+     *
+     * (c) Inode mismatch: target and decoy both on /tmp, so only st_ino
+     *     differs.
+     * (d) Device mismatch: target and decoy each first in a fresh tmpfs,
+     *     which numbers inodes per superblock, so st_ino is equal and
+     *     only st_dev differs. Both are asserted with stat() first. */
+    {
+      /* 8: under the kernel's default printk ratelimit burst (10/5s),
+       * which event=unverified is subject to. */
+      const int unl_attempts = 8;
+      pid_t ren_pids[4];
+      const int ren_attempts = (int)(sizeof(ren_pids) / sizeof(ren_pids[0]));
+      int unl_unverified = 0, unl_clean = 0, ren_killed = 0;
+      int ren_via_exe = 0;
+      pid_t r_pid;
+      int r_pipe[2];
+      char *r_out;
+      char *log;
+      char line_a[160], line_b[160];
+      int ready = 0, i;
+      struct timespec r_start;
+      /* (c) and (d): [0] inode mismatch, [1] device mismatch. */
+      static const char *const mm_name[2] = {"inode", "device"};
+      static const char *const mm_target[2] = {"/tmp/id_ino_target",
+                                               "/tmp/id_dev_a/sample"};
+      static const char *const mm_decoy[2] = {"/tmp/id_ino_decoy",
+                                              "/tmp/id_dev_b/sample"};
+      struct stat mm_tst[2], mm_dst[2];
+
+      if (mkdir("/tmp/id_dev_a", 0755) != 0 ||
+          mkdir("/tmp/id_dev_b", 0755) != 0)
+        die("mkdir #128 device-mismatch mounts");
+      if (mount("tmpfs", "/tmp/id_dev_a", "tmpfs", 0, NULL) != 0 ||
+          mount("tmpfs", "/tmp/id_dev_b", "tmpfs", 0, NULL) != 0)
+        die("mount #128 device-mismatch tmpfs");
+      for (i = 0; i < 2; i++) {
+        write_file(mm_target[i], malicious_content);
+        write_file(mm_decoy[i], clean_content);
+        if (stat(mm_target[i], &mm_tst[i]) != 0 ||
+            stat(mm_decoy[i], &mm_dst[i]) != 0)
+          die("stat #128 mismatch target/decoy");
+      }
+      if (mm_tst[0].st_dev != mm_dst[0].st_dev ||
+          mm_tst[0].st_ino == mm_dst[0].st_ino ||
+          mm_tst[1].st_dev == mm_dst[1].st_dev ||
+          mm_tst[1].st_ino != mm_dst[1].st_ino) {
+        outmsg("QEMU_TEST: FAIL: #128 mismatch preconditions: inode case "
+               "%u:%u/%llu vs %u:%u/%llu (want same dev, other ino), "
+               "device case %u:%u/%llu vs %u:%u/%llu (want other dev, same "
+               "ino)\n",
+               major(mm_tst[0].st_dev), minor(mm_tst[0].st_dev),
+               (unsigned long long)mm_tst[0].st_ino, major(mm_dst[0].st_dev),
+               minor(mm_dst[0].st_dev), (unsigned long long)mm_dst[0].st_ino,
+               major(mm_tst[1].st_dev), minor(mm_tst[1].st_dev),
+               (unsigned long long)mm_tst[1].st_ino, major(mm_dst[1].st_dev),
+               minor(mm_dst[1].st_dev), (unsigned long long)mm_dst[1].st_ino);
+        poweroff_now();
+        return 1;
+      }
+
+      if (pipe(r_pipe) != 0)
+        die("pipe for #128 avd stdout");
+      r_pid = fork();
+      if (r_pid < 0)
+        die("fork #128 avd");
+      if (r_pid == 0) {
+        char *const av_argv[] = {(char *)"/avd", NULL};
+
+        close(r_pipe[0]);
+        /* stderr too: (c)/(d) assert on avd's "replaced since exec"
+         * line, which it writes there. */
+        if (dup2(r_pipe[1], 1) < 0 || dup2(r_pipe[1], 2) < 0)
+          _exit(120);
+        close(r_pipe[1]);
+        /* (c)/(d): the decoys sit over the targets only in avd's view.
+         * Private first, so the binds can't propagate back to init's
+         * namespace, where the targets are exec'd. */
+        if (unshare(CLONE_NEWNS) != 0)
+          _exit(122);
+        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+          _exit(123);
+        for (i = 0; i < 2; i++)
+          if (mount(mm_decoy[i], mm_target[i], NULL, MS_BIND, NULL) != 0)
+            _exit(124 + i);
+        setenv("AVD_RULES_DIR", "/av-rules", 1);
+        setenv("AVD_CORPUS_FILE", "/av-corpus/fuzzy_hashes.txt", 1);
+        setenv("AVD_TLSH_CORPUS_FILE", "/av-corpus/tlsh_hashes.txt", 1);
+        setenv("AVD_QUARANTINE_DIR", "/tmp/av-quarantine", 1);
+        setenv("AVD_SOCK_PATH", "/tmp/avd-128.sock", 1);
+        setenv("LD_LIBRARY_PATH",
+               "/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu",
+               1);
+        execv("/avd", av_argv);
+        _exit(121);
+      }
+      close(r_pipe[1]);
+
+      /* Readiness: a clean sample only yields event=clean type=daemon
+       * once avd has registered and answered for it. Fresh name per
+       * iteration so an earlier line can't satisfy a later check. */
+      clock_gettime(CLOCK_MONOTONIC, &r_start);
+      for (i = 0; !ready; i++) {
+        struct timespec now, ts = {.tv_sec = 0, .tv_nsec = 200 * 1000 * 1000L};
+        char probe[64];
+
+        if (waitpid(r_pid, &code, WNOHANG) == r_pid) {
+          outmsg("QEMU_TEST: FAIL: #128 avd exited during startup "
+                 "(status %d)\n",
+                 WIFEXITED(code) ? WEXITSTATUS(code) : -1);
+          outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(r_pipe[0]));
+          poweroff_now();
+          return 1;
+        }
+        snprintf(probe, sizeof(probe), "/tmp/id_ready_%d", i);
+        write_file(probe, clean_content);
+        exec_expect_failure(probe, &err, &killed);
+        nanosleep(&ts, NULL);
+        snprintf(line_a, sizeof(line_a), "event=clean type=daemon path=\"%s\"",
+                 probe);
+        if (strstr(read_kernel_log(), line_a))
+          ready = 1;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (!ready && (now.tv_sec - r_start.tv_sec) * 1000L >= deadline_ms) {
+          outmsg("QEMU_TEST: FAIL: #128 avd never answered a scan request "
+                 "within %dms\n",
+                 deadline_ms);
+          stop_avd(r_pid);
+          outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(r_pipe[0]));
+          poweroff_now();
+          return 1;
+        }
+      }
+
+      write_param_int(TOCTOU_DELAY_PARAM, TOCTOU_WQ_DELAY_MS);
+
+      /* (a) unlink */
+      for (i = 0; i < unl_attempts; i++) {
+        char target[64];
+
+        snprintf(target, sizeof(target), "/tmp/id_unlink_%d", i);
+        write_file(target, malicious_content);
+        exec_expect_failure(target, &err, &killed);
+        /* ENOENT is fine: avd won this attempt's race, convicted the
+         * file and quarantined it before the unlink got there. */
+        if (unlink(target) != 0 && errno != ENOENT)
+          die("unlink(#128 target)");
+      }
+      /* Each request waits TOCTOU_WQ_DELAY_MS before it reaches avd;
+       * give the last of them time to be answered and logged. */
+      {
+        struct timespec ts = {.tv_sec = 3, .tv_nsec = 0};
+        nanosleep(&ts, NULL);
+      }
+      log = read_kernel_log();
+      for (i = 0; i < unl_attempts; i++) {
+        char target[64];
+
+        snprintf(target, sizeof(target), "/tmp/id_unlink_%d", i);
+        /* Both d_path() spellings, closing quote included - see the
+         * TOCTOU batch for why. */
+        snprintf(line_a, sizeof(line_a), "event=clean type=daemon path=\"%s\"",
+                 target);
+        snprintf(line_b, sizeof(line_b),
+                 "event=clean type=daemon path=\"%s (deleted)\"", target);
+        if (strstr(log, line_a) || strstr(log, line_b))
+          unl_clean++;
+        snprintf(line_a, sizeof(line_a),
+                 "event=unverified type=daemon path=\"%s\"", target);
+        snprintf(line_b, sizeof(line_b),
+                 "event=unverified type=daemon path=\"%s (deleted)\"", target);
+        if (strstr(log, line_a) || strstr(log, line_b))
+          unl_unverified++;
+      }
+
+      /* (b) rename */
+      for (i = 0; i < ren_attempts; i++) {
+        char target[64], decoy[64];
+        int sync_pipe[2];
+        char byte;
+        pid_t pid;
+
+        snprintf(target, sizeof(target), "/tmp/id_rename_%d", i);
+        snprintf(decoy, sizeof(decoy), "/tmp/id_rename_decoy_%d", i);
+        copy_file("/init", target);
+        write_file(decoy, clean_content);
+        if (pipe(sync_pipe) != 0)
+          die("pipe for #128 linger sync");
+        pid = fork();
+        if (pid < 0)
+          die("fork #128 linger");
+        if (pid == 0) {
+          char *const l_argv[] = {target, (char *)"--linger", NULL};
+
+          close(sync_pipe[0]);
+          if (dup2(sync_pipe[1], 3) < 0)
+            _exit(120);
+          if (sync_pipe[1] != 3)
+            close(sync_pipe[1]);
+          execv(target, l_argv);
+          _exit(121);
+        }
+        ren_pids[i] = pid;
+        close(sync_pipe[1]);
+        if (read(sync_pipe[0], &byte, 1) != 1) {
+          /* Killed before it got to main() - avd won the race outright
+           * via the path. Still a kill; counted below. */
+        }
+        close(sync_pipe[0]);
+        if (rename(decoy, target) != 0)
+          die("rename(#128 decoy)");
+        if (!wait_for_exit(pid, 30000, &code, &sig)) {
+          outmsg("QEMU_TEST: FAIL: #128 rename attempt %d: pid %d still "
+                 "running 30s after its path was swapped - avd scanned the "
+                 "decoy and nothing killed the real exec\n",
+                 i, (int)pid);
+          write_param_int(TOCTOU_DELAY_PARAM, 0);
+          stop_avd(r_pid);
+          outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(r_pipe[0]));
+          poweroff_now();
+          return 1;
+        }
+        if (sig == SIGKILL) {
+          ren_killed++;
+        } else {
+          outmsg("QEMU_TEST: FAIL: #128 rename attempt %d: pid %d exited "
+                 "(code=%d sig=%d) instead of being killed - the swapped-in "
+                 "decoy was scanned in place of the exec'd file\n",
+                 i, (int)pid, code, sig);
+          write_param_int(TOCTOU_DELAY_PARAM, 0);
+          stop_avd(r_pid);
+          outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(r_pipe[0]));
+          poweroff_now();
+          return 1;
+        }
+        /* The decoy must still be at the path: quarantine after a
+         * /proc/<pid>/exe scan must never remove what now sits there. */
+        if (access(target, F_OK) != 0) {
+          outmsg("QEMU_TEST: FAIL: #128 rename attempt %d: the decoy at %s "
+                 "was removed - quarantine unlinked a file it never "
+                 "scanned\n",
+                 i, target);
+          write_param_int(TOCTOU_DELAY_PARAM, 0);
+          stop_avd(r_pid);
+          outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(r_pipe[0]));
+          poweroff_now();
+          return 1;
+        }
+      }
+
+      write_param_int(TOCTOU_DELAY_PARAM, 0);
+
+      /* (c)/(d). event=unverified is pr_warn_ratelimited (10 per 5s),
+       * and the unlink arm spent 8 of them; wait out the window so a
+       * missing line here can't be the ratelimit. */
+      {
+        struct timespec ts = {.tv_sec = 5, .tv_nsec = 0};
+        nanosleep(&ts, NULL);
+      }
+      for (i = 0; i < 2; i++)
+        exec_expect_failure(mm_target[i], &err, &killed);
+      {
+        struct timespec ts = {.tv_sec = 3, .tv_nsec = 0};
+        nanosleep(&ts, NULL);
+      }
+      log = read_kernel_log();
+
+      if (kill(r_pid, SIGTERM) != 0)
+        die("kill(#128 avd, SIGTERM)");
+      if (!wait_for_exit(r_pid, 60000, &code, &sig)) {
+        outmsg("QEMU_TEST: FAIL: #128 avd did not exit within 60s of "
+               "SIGTERM\n");
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", drain_pipe(r_pipe[0]));
+        poweroff_now();
+        return 1;
+      }
+      r_out = drain_pipe(r_pipe[0]);
+      close(r_pipe[0]);
+      for (i = 0; i < ren_attempts; i++) {
+        snprintf(line_a, sizeof(line_a), "via /proc/%d/exe", (int)ren_pids[i]);
+        if (strstr(r_out, line_a))
+          ren_via_exe++;
+      }
+
+      outmsg("QEMU_TEST: #128 unlink: %d/%d unverified, %d clean; rename: "
+             "%d/%d killed, %d via /proc/<pid>/exe\n",
+             unl_unverified, unl_attempts, unl_clean, ren_killed, ren_attempts,
+             ren_via_exe);
+      if (unl_clean != 0) {
+        outmsg("QEMU_TEST: FAIL: #128: %d unlinked exec(s) were logged "
+               "event=clean type=daemon - avd answered CLEAN for a file it "
+               "never read\n",
+               unl_clean);
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", r_out);
+        poweroff_now();
+        return 1;
+      }
+      if (unl_unverified == 0 || ren_via_exe == 0) {
+        outmsg("QEMU_TEST: FAIL: #128: vacuous run - %s never won its race "
+               "against avd's open (unverified=%d, via-exe=%d), so the "
+               "identity check was not exercised. Is %s set by this "
+               "build?\n",
+               unl_unverified == 0 ? "the unlink" : "the rename",
+               unl_unverified, ren_via_exe, TOCTOU_DELAY_PARAM);
+        outmsg("QEMU_TEST: --- avd stdout ---\n%s\n", r_out);
+        poweroff_now();
+        return 1;
+      }
+      for (i = 0; i < 2; i++) {
+        char want[256];
+        const char *hit;
+        size_t len;
+
+        snprintf(line_a, sizeof(line_a), "event=clean type=daemon path=\"%s\"",
+                 mm_target[i]);
+        if (strstr(log, line_a)) {
+          outmsg("QEMU_TEST: FAIL: #128 %s mismatch: %s was logged "
+                 "event=clean type=daemon - avd scanned the decoy bound over "
+                 "it instead of rejecting a file with the wrong identity\n",
+                 mm_name[i], mm_target[i]);
+          outmsg("QEMU_TEST: --- avd output ---\n%s\n", r_out);
+          poweroff_now();
+          return 1;
+        }
+        /* avd opened the decoy, and rejected it on identity alone. */
+        snprintf(want, sizeof(want),
+                 "avd: \"%s\" is now %u:%u ino %llu, not the %u:%u ino %llu "
+                 "the kernel hashed",
+                 mm_target[i], major(mm_dst[i].st_dev), minor(mm_dst[i].st_dev),
+                 (unsigned long long)mm_dst[i].st_ino, major(mm_tst[i].st_dev),
+                 minor(mm_tst[i].st_dev), (unsigned long long)mm_tst[i].st_ino);
+        if (!strstr(r_out, want)) {
+          outmsg("QEMU_TEST: FAIL: #128 %s mismatch: avd never reported "
+                 "rejecting the decoy at %s (expected '%s')\n",
+                 mm_name[i], mm_target[i], want);
+          outmsg("QEMU_TEST: --- avd output ---\n%s\n", r_out);
+          poweroff_now();
+          return 1;
+        }
+        /* ...and answered UNAVAILABLE for the target's identity. */
+        snprintf(line_a, sizeof(line_a),
+                 "event=unverified type=daemon path=\"%s\" ", mm_target[i]);
+        snprintf(want, sizeof(want), " dev=%u:%u ino=%llu ",
+                 major(mm_tst[i].st_dev), minor(mm_tst[i].st_dev),
+                 (unsigned long long)mm_tst[i].st_ino);
+        hit = strstr(log, line_a);
+        len = hit ? strcspn(hit, "\n") : 0;
+        if (!hit || !memmem(hit, len, want, strlen(want))) {
+          outmsg("QEMU_TEST: FAIL: #128 %s mismatch: no event=unverified "
+                 "for %s with%s - avd did not answer UNAVAILABLE\n",
+                 mm_name[i], mm_target[i], want);
+          outmsg("QEMU_TEST: --- avd output ---\n%s\n", r_out);
+          poweroff_now();
+          return 1;
+        }
+        outmsg("QEMU_TEST: #128 %s mismatch: decoy opened at the request "
+               "path and rejected, answered UNAVAILABLE\n",
+               mm_name[i]);
+      }
+      umount2("/tmp/id_dev_a", MNT_DETACH);
+      umount2("/tmp/id_dev_b", MNT_DETACH);
+      outmsg("QEMU_TEST: daemon scan identity check passed\n");
     }
   }
 
