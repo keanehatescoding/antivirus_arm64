@@ -166,6 +166,7 @@
 #define TOCTOU_WQ_DELAY_MS 150
 #define TOCTOU_LINGER_US ((TOCTOU_WQ_DELAY_MS + 400) * 1000)
 #define TOCTOU_DELAY_PARAM "/sys/module/av/parameters/av_toctou_test_delay_ms"
+#define LEXKEY_DELAY_PARAM "/sys/module/av/parameters/av_lexkey_test_delay_ms"
 
 static void outmsg(const char *fmt, ...) {
   static char buf[65536];
@@ -623,6 +624,15 @@ static void stop_avd(pid_t pid) {
  * chdir() it to the new "/") before it execs: exec_path and the unlink
  * path are then spelled from inside that root. Cases R and S. */
 static const char *sd_chroot_dir;
+/* Set around a run_self_delete_case() call to run in the parent right
+ * after the fork, before it waits for the exec record: case X's rename
+ * while av_lexkey_test_delay_ms parks the exec worker after d_path(). */
+static void (*sd_before_record)(void);
+/* Case X: av_lexkey_test_delay_ms, and how far into it the parent
+ * renames. The child's exec and the worker's d_path() land well inside
+ * the first; the record line proves they did (it names the old path). */
+#define SELF_DELETE_LEXKEY_DELAY_MS 2000
+#define SELF_DELETE_LEXKEY_RENAME_MS 500
 
 static int run_self_delete_case(const char *exec_path, const char *mode,
                                 const char *recorded_path,
@@ -655,6 +665,8 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
     _exit(127);
   }
   close(sync_fd[0]);
+  if (sd_before_record)
+    sd_before_record();
 
   snprintf(needle, sizeof(needle), "path=\"%s\" pid=%d ", recorded_path,
            (int)pid);
@@ -693,6 +705,20 @@ static void retarget_sd_ralias(void) {
     die("unlink /tmp/sd_ralias");
   if (symlink("/tmp/sd_other", "/tmp/sd_ralias") != 0)
     die("symlink /tmp/sd_ralias -> /tmp/sd_other");
+}
+
+/* Case X's sd_before_record hook: once the exec worker has parked
+ * after d_path(), move the image to /tmp/sd_xb/renamed, point
+ * /tmp/sd_x/alias at /tmp/sd_xb, and put an unrelated "x" there. */
+static void move_sd_x_image(void) {
+  usleep(SELF_DELETE_LEXKEY_RENAME_MS * 1000);
+  if (rename("/tmp/sd_xa/x", "/tmp/sd_xb/renamed") != 0)
+    die("rename /tmp/sd_xa/x");
+  if (unlink("/tmp/sd_x/alias") != 0)
+    die("unlink /tmp/sd_x/alias");
+  if (symlink("/tmp/sd_xb", "/tmp/sd_x/alias") != 0)
+    die("symlink /tmp/sd_x/alias -> /tmp/sd_xb");
+  write_file("/tmp/sd_xb/x", "not the executable\n");
 }
 
 int main(int argc, char *const argv[]) {
@@ -1442,6 +1468,52 @@ int main(int argc, char *const argv[]) {
                  vc[i].survivor ? vc[i].survivor : "");
           failed = 1;
         }
+      }
+    }
+    /* X: the image renamed between the exec worker's d_path() and its
+     * lexical key check (CodeRabbit on x86 #229) -> NOT killed. The
+     * child execs /tmp/sd_x/alias/x, alias -> /tmp/sd_xa; with the
+     * worker parked after d_path() has recorded /tmp/sd_xa/x, the
+     * image moves to /tmp/sd_xb/renamed, the alias is pointed at
+     * /tmp/sd_xb, and an unrelated /tmp/sd_xb/x appears. The child's
+     * unlink of /tmp/sd_x/alias/x removes that file. The key's final
+     * name used to be checked against the stale d_path() string and
+     * its directory against the image's new parent, so the pair passed
+     * and the unlink was taken for a self-delete. The record line
+     * still naming /tmp/sd_xa/x shows the rename came after d_path(). */
+    if (!failed) {
+      int code, sig, saw_record, killed;
+      struct stat st;
+
+      if (mkdir("/tmp/sd_x", 0755) != 0 || mkdir("/tmp/sd_xa", 0755) != 0 ||
+          mkdir("/tmp/sd_xb", 0755) != 0)
+        die("mkdir case x dirs");
+      if (symlink("/tmp/sd_xa", "/tmp/sd_x/alias") != 0)
+        die("symlink /tmp/sd_x/alias");
+      copy_file("/init", "/tmp/sd_xa/x");
+      write_param_int(LEXKEY_DELAY_PARAM, SELF_DELETE_LEXKEY_DELAY_MS);
+      sd_before_record = move_sd_x_image;
+      killed = run_self_delete_case("/tmp/sd_x/alias/x", "--self-unlink",
+                                    "/tmp/sd_xa/x", "/tmp/sd_x/alias/x", NULL,
+                                    &code, &sig, &saw_record);
+      sd_before_record = NULL;
+      write_param_int(LEXKEY_DELAY_PARAM, 0);
+      outmsg("QEMU_TEST: self-delete case x (image renamed after d_path()): "
+             "exec /tmp/sd_x/alias/x, image -> /tmp/sd_xb/renamed, alias "
+             "-> /tmp/sd_xb, unlink /tmp/sd_x/alias/x -> %s (exit=%d sig=%d, "
+             "exec record %s)\n",
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (!saw_record || killed || code != 43) {
+        outmsg("QEMU_TEST: FAIL: self-delete case x expected a seen exec "
+               "record at /tmp/sd_xa/x, no kill and exit 43 (44 = sync "
+               "read, 45 = unlink)\n");
+        failed = 1;
+      } else if (stat("/tmp/sd_xb/renamed", &st) != 0 ||
+                 stat("/tmp/sd_xb/x", &st) == 0) {
+        outmsg("QEMU_TEST: FAIL: self-delete case x's unlink did not "
+               "remove /tmp/sd_xb/x and leave /tmp/sd_xb/renamed\n");
+        failed = 1;
       }
     }
     if (failed) {
