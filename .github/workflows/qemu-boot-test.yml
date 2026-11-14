@@ -398,6 +398,21 @@ jobs:
             exit 1
           fi
 
+          # Self-delete correlation through a directory symlink
+          # (CodeRabbit on #110): exec via a symlinked dir, unlink via
+          # either spelling, must still be killed as a self-deleting
+          # binary. Guards the lexical second key av.ko records next to
+          # the d_path() one.
+          if ! grep -q "QEMU_TEST: self-delete correlation check passed" \
+               serial.log; then
+            echo "::error::init reported PASS but the self-delete" \
+                 "correlation case never printed its marker - the case" \
+                 "was skipped or removed. A green run without it leaves" \
+                 "self-delete detection through directory symlinks with" \
+                 "no runtime coverage."
+            exit 1
+          fi
+
           # Issue #45: the exec-time TOCTOU case - the second half of #2,
           # also closed by #94 (the hash comes from the pinned
           # bprm->file). A green PASS without this marker means the race
