@@ -98,6 +98,9 @@ static const struct nla_policy av_genl_policy[AV_A_MAX + 1] = {
     [AV_A_SHA256]    = { .type = NLA_NUL_STRING, .len = AV_SHA256_ATTR_MAXLEN },
     [AV_A_VERDICT]   = { .type = NLA_U8 },
     [AV_A_RULE_NAME] = { .type = NLA_NUL_STRING, .len = AV_RULE_NAME_MAXLEN },
+    [AV_A_DEV_MAJOR] = { .type = NLA_U32 },
+    [AV_A_DEV_MINOR] = { .type = NLA_U32 },
+    [AV_A_INO]       = { .type = NLA_U64 },
 };
 
 /* ---- AV_C_REGISTER: daemon announces itself ---- */
@@ -171,13 +174,16 @@ static int av_nl_verdict_doit(struct sk_buff *skb, struct genl_info *info)
 
     reqid = nla_get_u64(info->attrs[AV_A_REQID]);
     verdict = nla_get_u8(info->attrs[AV_A_VERDICT]);
-    /* Only AV_VERDICT_CLEAN (0) and AV_VERDICT_MALICIOUS (1) are
-     * defined (netlink_proto.h) - anything else is a malformed or
+    /* Only AV_VERDICT_CLEAN (0), AV_VERDICT_MALICIOUS (1) and
+     * AV_VERDICT_UNAVAILABLE (2, issue #128 - av_work_fn() applies the
+     * daemon fail-open/fail-closed policy to it, never treats it as
+     * clean) are defined (netlink_proto.h) - anything else is a malformed or
      * malicious verdict. Reject it here with -EINVAL rather than
      * letting av_work_fn() treat every non-MALICIOUS value as clean
      * by omission, which would silently mask daemon bugs and widen
      * the accepted input space for a compromised/buggy sender. */
-    if (verdict != AV_VERDICT_CLEAN && verdict != AV_VERDICT_MALICIOUS) {
+    if (verdict != AV_VERDICT_CLEAN && verdict != AV_VERDICT_MALICIOUS &&
+        verdict != AV_VERDICT_UNAVAILABLE) {
         pr_warn("kernel-av: AV_C_VERDICT with invalid verdict %u "
                 "(reqid %llu) rejected\n", verdict,
                 (unsigned long long)reqid);
@@ -245,7 +251,8 @@ static struct genl_family av_genl_family = {
 /* ---- sending a scan request and waiting for the verdict ---- */
 
 int av_netlink_scan_request(const char *path, const char *sha256_hex,
-                             pid_t pid, int *verdict_out,
+                             pid_t pid, const struct av_scan_ident *ident,
+                             int *verdict_out,
                              char *rule_out, size_t rule_out_len,
                              unsigned int timeout_ms)
 {
@@ -295,7 +302,9 @@ int av_netlink_scan_request(const char *path, const char *sha256_hex,
     payload_size = nla_total_size_64bit(sizeof(u64)) +
                    nla_total_size(sizeof(u32)) +
                    nla_total_size(strlen(path) + 1) +
-                   nla_total_size(strlen(sha256_hex) + 1);
+                   nla_total_size(strlen(sha256_hex) + 1) +
+                   nla_total_size(sizeof(u32)) * 2 +
+                   nla_total_size_64bit(sizeof(u64));
 
     skb = genlmsg_new(payload_size, GFP_KERNEL);
     if (!skb) {
@@ -313,6 +322,9 @@ int av_netlink_scan_request(const char *path, const char *sha256_hex,
     ret = ret ?: nla_put_u32(skb, AV_A_PID, pid);
     ret = ret ?: nla_put_string(skb, AV_A_PATH, path);
     ret = ret ?: nla_put_string(skb, AV_A_SHA256, sha256_hex);
+    ret = ret ?: nla_put_u32(skb, AV_A_DEV_MAJOR, ident->dev_major);
+    ret = ret ?: nla_put_u32(skb, AV_A_DEV_MINOR, ident->dev_minor);
+    ret = ret ?: nla_put_u64_64bit(skb, AV_A_INO, ident->ino, 0);
     if (ret)
         goto err_free_skb;
 
