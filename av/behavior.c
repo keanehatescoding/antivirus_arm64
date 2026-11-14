@@ -42,6 +42,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/namei.h>
 #include <linux/pid.h>
 #include <linux/proc_fs.h>
 #include <linux/rcupdate.h>
@@ -296,6 +297,14 @@ struct av_behavior_entry {
    * /usr, every process exec'd as /bin/... carries this key, and an
    * `rm -rf` of millions of files must not trip it by chance. */
   u64 exec_lexical_hash;
+  /* Directory the lexical key named at exec time (the executed file's
+   * parent inode). Only a cookie for unlink_dir_is(): compared, never
+   * dereferenced, so the entry holds no reference. While the process
+   * lives its image pins this inode (exe_file -> dentry -> d_parent);
+   * a rename of the image or PR_SET_MM_EXE_FILE can unpin it, and then
+   * a reused address only lets a lexical-hash match through, i.e. the
+   * pre-check behaviour. Valid when exec_lexical_set. */
+  const struct inode *exec_lexical_dir;
   bool exec_lexical_set;
 
   /* Dedup ring buffer for the rapid-write-open heuristic - counts
@@ -2081,6 +2090,7 @@ static u64 lexical_key_hash(const char *path) {
 
 void av_behavior_record_exec(pid_t pid, const char *path,
                              const char *lexical_path,
+                             const struct inode *lexical_dir,
                              const char *sha256_hex, u64 start_time) {
   struct av_behavior_entry *e;
   /* cppcheck-suppress knownConditionTrueFalse
@@ -2096,9 +2106,11 @@ void av_behavior_record_exec(pid_t pid, const char *path,
     strscpy(e->exec_path, path, sizeof(e->exec_path));
     /* Cleared on every exec that has no lexical key, so a re-exec
      * never inherits the previous image's. */
-    e->exec_lexical_set = lexical_path && lexical_path[0] == '/';
+    e->exec_lexical_set =
+        lexical_path && lexical_path[0] == '/' && lexical_dir;
     e->exec_lexical_hash =
         e->exec_lexical_set ? lexical_key_hash(lexical_path) : 0;
+    e->exec_lexical_dir = e->exec_lexical_set ? lexical_dir : NULL;
     e->trusted = trusted;
     /* A reused pid can land on a stale entry left behind by a
      * previous, unrelated process (get_or_create_entry() matches on
@@ -2171,9 +2183,67 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
                      "rapid file modification (possible ransomware pattern)");
 }
 
+/* True when `spelled` (the unlink target, absolute but unnormalized)
+ * names an ordinary entry in `dir`, resolving its directory part NOW,
+ * at check time.
+ *
+ * The lexical key is a name, and the directory symlinks in it can be
+ * retargeted after the exec: exec /tmp/alias/tool with /tmp/alias ->
+ * /tmp/real, point /tmp/alias at /tmp/other, and an unlink of
+ * /tmp/alias/tool removes /tmp/other/tool while the hash still matches
+ * (CodeRabbit on #229). The parent directory is what is left to check:
+ * the target itself is already gone by the time this worker runs, the
+ * directory normally is not. Comparing inodes rather than mounts lets
+ * a bind mount of the same directory through.
+ *
+ * The unnormalized spelling, not the collapsed key: with
+ * /tmp/x/link -> /tmp/y/sub, an exec of /tmp/x/link/tool and an unlink
+ * of /tmp/x/link/../link/tool share the key /tmp/x/link/tool, but the
+ * kernel follows the link before the "..", so the unlink removes
+ * /tmp/y/link/tool (CodeRabbit on #229). Walking the spelling the
+ * syscall walked lands in /tmp/y, not /tmp/y/sub. A final "." or ".."
+ * is not the file the key names (and unlink() refuses it anyway).
+ *
+ * Resolved from the unlinking task's root as captured at the syscall,
+ * like the exec-time check in main.c (av_exec_key_names_file()), not
+ * from this worker's: kthreads start in a private nullfs since the
+ * nullfs root change, where nothing but "/" resolves. A task whose
+ * root view differs from the one `path` is spelled in (chroot, mount
+ * namespace) fails here, as it already does at exec time. Any failure
+ * returns false, which only drops the lexical-key match. A process that retargets the
+ * symlink between its unlink and this lookup also escapes the lexical
+ * key; inode identity at unlink time (issue #230) closes that. */
+static bool unlink_dir_is(const struct path *root, const char *spelled,
+                          const struct inode *dir) {
+  const char *slash = spelled ? strrchr(spelled, '/') : NULL;
+  struct path p;
+  char *dirname;
+  bool same;
+  int err;
+
+  if (!root || !slash || !dir || spelled[0] != '/')
+    return false;
+  if (!slash[1] || !strcmp(slash + 1, ".") || !strcmp(slash + 1, ".."))
+    return false;
+  dirname = kstrndup(spelled, slash == spelled ? 1 : slash - spelled,
+                     GFP_KERNEL);
+  if (!dirname)
+    return false;
+  err = vfs_path_lookup(root->dentry, root->mnt, dirname,
+                        LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &p);
+  kfree(dirname);
+  if (err)
+    return false;
+  same = d_inode(p.dentry) == dir;
+  path_put(&p);
+  return same;
+}
+
 void av_behavior_check_unlink(pid_t pid, const char *path,
+                              const char *spelled, const struct path *root,
                               struct pid *target_pid) {
   const struct av_behavior_entry *e;
+  const struct inode *lexical_dir = NULL;
   bool self_delete = false;
   bool sensitive;
   u64 path_hash;
@@ -2210,11 +2280,19 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
    * executed file (symlinks followed), the lexical hash is the name
    * exec was given (symlinks not followed, like `path` here). See
    * av_exec_lexical_path() in main.c. */
-  if (e && path[0] == '/' &&
-      ((e->exec_path[0] == '/' && !strcmp(e->exec_path, path)) ||
-       (e->exec_lexical_set && e->exec_lexical_hash == path_hash)))
-    self_delete = true;
+  /* A lexical-only match is confirmed below, outside the lock, by
+   * unlink_dir_is(): the hash says the name matches, not that the name
+   * still leads to the same directory. */
+  if (e && path[0] == '/') {
+    if (e->exec_path[0] == '/' && !strcmp(e->exec_path, path))
+      self_delete = true;
+    else if (e->exec_lexical_set && e->exec_lexical_hash == path_hash)
+      lexical_dir = e->exec_lexical_dir;
+  }
   mutex_unlock(&behavior_lock);
+
+  if (lexical_dir)
+    self_delete = unlink_dir_is(root, spelled, lexical_dir);
 
   sensitive = path_is_sensitive(path);
 
