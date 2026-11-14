@@ -1340,6 +1340,28 @@ static char *av_exec_lexical_path(const struct av_work *aw,
   return buf;
 }
 
+/* Identity of the pinned exec file in the form userspace fstat() reports
+ * it, for the daemon's "is this still the file the kernel hashed" check
+ * (issue #128). Deliberately vfs_getattr() rather than inode->i_sb->s_dev/
+ * i_ino (what av_file_identity carries for logging): btrfs subvolumes and
+ * overlayfs report a different st_dev/st_ino through ->getattr than the
+ * raw inode fields, and a mismatch there would make avd refuse every
+ * legitimate exec on those filesystems. Returns false when getattr
+ * fails. The daemon is then not asked at all: an identity-free request
+ * is avd's compatibility mode for pre-#128 modules, which scans
+ * whatever the path names now, so av_work_fn() treats the exec as
+ * unverified instead (fail-closed kills, fail-open logs it). */
+static bool av_scan_ident_of(struct file *file, struct av_scan_ident *out) {
+  struct kstat st;
+
+  if (vfs_getattr(&file->f_path, &st, STATX_INO, AT_STATX_SYNC_AS_STAT))
+    return false;
+  out->dev_major = MAJOR(st.dev);
+  out->dev_minor = MINOR(st.dev);
+  out->ino = st.ino;
+  return true;
+}
+
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
  * GFP_KERNEL. This is where all "heavy" work happens.
  *
@@ -1357,12 +1379,14 @@ static char *av_exec_lexical_path(const struct av_work *aw,
  * av_toctou_test_delay_ms holding this work item open) and asserts the
  * kill still happens.
  *
- * NOT YET CLOSED for the daemon leg: the scan request still carries
- * only abs_path, and avd's handle_scan_request() open()s that name
- * itself, so a rename racing that open makes YARA/fuzzy/TLSH read a
- * different inode, and an unlink makes the open fail, which avd
- * currently answers with CLEAN. Binding the daemon scan to the
- * executed file needs a protocol change, not a tweak here.
+ * The daemon leg is bound the same way (issue #128): avd still opens
+ * abs_path by name, but the request also carries the st_dev/st_ino of
+ * the pinned file (av_scan_ident_of()), and avd scans only an fd whose
+ * fstat() matches - the path, or failing that /proc/<pid>/exe. When
+ * neither matches (rename-swap, unlink) it answers
+ * AV_VERDICT_UNAVAILABLE, which gets the daemon fail-open/fail-closed
+ * policy below, never "clean". A request without identity (getattr
+ * failed) falls back to the old by-path scan.
  *
  * STILL KILL-AFTER-EXEC, though: this runs asynchronously, so by the
  * time a verdict exists the exec has usually already committed and the
@@ -1502,14 +1526,50 @@ static void av_work_fn(struct work_struct *w) {
   {
     int verdict = AV_VERDICT_CLEAN;
     char rule_name[AV_RULE_NAME_MAXLEN + 1] = "";
+    struct av_scan_ident sid;
+    bool have_sid = av_scan_ident_of(aw->file, &sid);
     int nl_ret;
 
-    nl_ret = av_netlink_scan_request(
-        abs_path, digest.sha256, pid_nr(aw->target_pid), &verdict, rule_name,
-        sizeof(rule_name), (unsigned int)daemon_timeout_ms);
+    if (have_sid) {
+      nl_ret = av_netlink_scan_request(
+          abs_path, digest.sha256, pid_nr(aw->target_pid), &sid, &verdict,
+          rule_name, sizeof(rule_name), (unsigned int)daemon_timeout_ms);
+    } else {
+      /* We hashed the pinned file but can't name it to avd, which
+       * could then only scan whatever the path names now - or answer
+       * CLEAN if it names nothing. Don't ask: take the same "no
+       * verdict for the hashed file" branch as an UNAVAILABLE reply,
+       * so the fail-open/fail-closed policy decides, never a by-path
+       * scan. */
+      nl_ret = 0;
+      verdict = AV_VERDICT_UNAVAILABLE;
+    }
     if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
       snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
       av_kill(aw->target_pid, abs_path, "daemon", reason, &ident);
+    } else if (nl_ret == 0 && verdict == AV_VERDICT_UNAVAILABLE) {
+      /* No verdict for the inode we hashed. Either avd answered
+       * UNAVAILABLE - the path names a different file now
+       * (rename-swap) or nothing (unlink), and /proc/<pid>/exe didn't
+       * lead back to it either (issue #128) - or vfs_getattr() failed
+       * and avd was never asked (have_sid above). That is "no
+       * verdict", not "clean" - same policy as a timeout, but logged
+       * distinctly at warn because a swap in this window is exactly
+       * what an evasion attempt looks like. */
+      if (atomic_read(&av_daemon_fail_closed)) {
+        av_kill(aw->target_pid, abs_path, "fail-closed",
+                have_sid ? "daemon-unavailable" : "identity-unavailable",
+                &ident);
+      } else {
+        pr_warn_ratelimited("kernel-av: event=unverified type=daemon "
+                            "path=\"%s\" pid=%d sha256=%s dev=%u:%u ino=%lu "
+                            "(%s)\n",
+                            log_path, pid_nr(aw->target_pid), digest.sha256,
+                            MAJOR(ident.dev), MINOR(ident.dev), ident.ino,
+                            have_sid ? "daemon could not open the hashed file"
+                                     : "could not read the hashed file's "
+                                       "identity; daemon not asked");
+      }
     } else if (nl_ret == 0) {
       /* pr_info_ratelimited, not plain pr_info: this fires for
        * every exec that reaches the daemon path (i.e. every
