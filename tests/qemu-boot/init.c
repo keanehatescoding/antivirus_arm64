@@ -43,6 +43,7 @@
 #include <fcntl.h>
 #include <linux/reboot.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -52,6 +53,7 @@
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -2039,7 +2041,27 @@ int main(int argc, char *const argv[]) {
      *     it is running. The path now names the decoy, so only the
      *     /proc/<pid>/exe fallback reaches the real file. Every attempt
      *     must end in SIGKILL; the old code scanned the decoy and let
-     *     the child exit 43. */
+     *     the child exit 43.
+     *
+     * Neither race reaches the rejection of an fd that opened fine but
+     * is the wrong file: when the rename wins, the request already says
+     * " (deleted)" and the open fails. So (c) and (d) hand avd such an
+     * fd deterministically. avd runs in its own mount namespace, where
+     * a clean decoy is bind-mounted over each target. The kernel execs
+     * and hashes the target and d_path()s it to the same string, which
+     * avd then opens and gets the decoy. The targets are non-ELF and
+     * the exec fails ENOEXEC, so /proc/<pid>/exe is /init and can't
+     * match either. The answer must be UNAVAILABLE (event=unverified),
+     * where skipping the check scans the decoy and answers CLEAN. avd's
+     * own "replaced since exec" line, with the decoy's and the target's
+     * numbers, proves the open succeeded and the identity check did the
+     * rejecting, rather than some other failure.
+     *
+     * (c) Inode mismatch: target and decoy both on /tmp, so only st_ino
+     *     differs.
+     * (d) Device mismatch: target and decoy each first in a fresh tmpfs,
+     *     which numbers inodes per superblock, so st_ino is equal and
+     *     only st_dev differs. Both are asserted with stat() first. */
     {
       /* 8: under the kernel's default printk ratelimit burst (10/5s),
        * which event=unverified is subject to. */
@@ -2055,6 +2077,44 @@ int main(int argc, char *const argv[]) {
       char line_a[160], line_b[160];
       int ready = 0, i;
       struct timespec r_start;
+      /* (c) and (d): [0] inode mismatch, [1] device mismatch. */
+      static const char *const mm_name[2] = {"inode", "device"};
+      static const char *const mm_target[2] = {"/tmp/id_ino_target",
+                                               "/tmp/id_dev_a/sample"};
+      static const char *const mm_decoy[2] = {"/tmp/id_ino_decoy",
+                                              "/tmp/id_dev_b/sample"};
+      struct stat mm_tst[2], mm_dst[2];
+
+      if (mkdir("/tmp/id_dev_a", 0755) != 0 ||
+          mkdir("/tmp/id_dev_b", 0755) != 0)
+        die("mkdir #128 device-mismatch mounts");
+      if (mount("tmpfs", "/tmp/id_dev_a", "tmpfs", 0, NULL) != 0 ||
+          mount("tmpfs", "/tmp/id_dev_b", "tmpfs", 0, NULL) != 0)
+        die("mount #128 device-mismatch tmpfs");
+      for (i = 0; i < 2; i++) {
+        write_file(mm_target[i], malicious_content);
+        write_file(mm_decoy[i], clean_content);
+        if (stat(mm_target[i], &mm_tst[i]) != 0 ||
+            stat(mm_decoy[i], &mm_dst[i]) != 0)
+          die("stat #128 mismatch target/decoy");
+      }
+      if (mm_tst[0].st_dev != mm_dst[0].st_dev ||
+          mm_tst[0].st_ino == mm_dst[0].st_ino ||
+          mm_tst[1].st_dev == mm_dst[1].st_dev ||
+          mm_tst[1].st_ino != mm_dst[1].st_ino) {
+        outmsg("QEMU_TEST: FAIL: #128 mismatch preconditions: inode case "
+               "%u:%u/%llu vs %u:%u/%llu (want same dev, other ino), "
+               "device case %u:%u/%llu vs %u:%u/%llu (want other dev, same "
+               "ino)\n",
+               major(mm_tst[0].st_dev), minor(mm_tst[0].st_dev),
+               (unsigned long long)mm_tst[0].st_ino, major(mm_dst[0].st_dev),
+               minor(mm_dst[0].st_dev), (unsigned long long)mm_dst[0].st_ino,
+               major(mm_tst[1].st_dev), minor(mm_tst[1].st_dev),
+               (unsigned long long)mm_tst[1].st_ino, major(mm_dst[1].st_dev),
+               minor(mm_dst[1].st_dev), (unsigned long long)mm_dst[1].st_ino);
+        poweroff_now();
+        return 1;
+      }
 
       if (pipe(r_pipe) != 0)
         die("pipe for #128 avd stdout");
@@ -2065,9 +2125,21 @@ int main(int argc, char *const argv[]) {
         char *const av_argv[] = {(char *)"/avd", NULL};
 
         close(r_pipe[0]);
-        if (dup2(r_pipe[1], 1) < 0)
+        /* stderr too: (c)/(d) assert on avd's "replaced since exec"
+         * line, which it writes there. */
+        if (dup2(r_pipe[1], 1) < 0 || dup2(r_pipe[1], 2) < 0)
           _exit(120);
         close(r_pipe[1]);
+        /* (c)/(d): the decoys sit over the targets only in avd's view.
+         * Private first, so the binds can't propagate back to init's
+         * namespace, where the targets are exec'd. */
+        if (unshare(CLONE_NEWNS) != 0)
+          _exit(122);
+        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+          _exit(123);
+        for (i = 0; i < 2; i++)
+          if (mount(mm_decoy[i], mm_target[i], NULL, MS_BIND, NULL) != 0)
+            _exit(124 + i);
         setenv("AVD_RULES_DIR", "/av-rules", 1);
         setenv("AVD_CORPUS_FILE", "/av-corpus/fuzzy_hashes.txt", 1);
         setenv("AVD_TLSH_CORPUS_FILE", "/av-corpus/tlsh_hashes.txt", 1);
@@ -2235,6 +2307,21 @@ int main(int argc, char *const argv[]) {
 
       write_param_int(TOCTOU_DELAY_PARAM, 0);
 
+      /* (c)/(d). event=unverified is pr_warn_ratelimited (10 per 5s),
+       * and the unlink arm spent 8 of them; wait out the window so a
+       * missing line here can't be the ratelimit. */
+      {
+        struct timespec ts = {.tv_sec = 5, .tv_nsec = 0};
+        nanosleep(&ts, NULL);
+      }
+      for (i = 0; i < 2; i++)
+        exec_expect_failure(mm_target[i], &err, &killed);
+      {
+        struct timespec ts = {.tv_sec = 3, .tv_nsec = 0};
+        nanosleep(&ts, NULL);
+      }
+      log = read_kernel_log();
+
       if (kill(r_pid, SIGTERM) != 0)
         die("kill(#128 avd, SIGTERM)");
       if (!wait_for_exit(r_pid, 60000, &code, &sig)) {
@@ -2276,6 +2363,59 @@ int main(int argc, char *const argv[]) {
         poweroff_now();
         return 1;
       }
+      for (i = 0; i < 2; i++) {
+        char want[256];
+        const char *hit;
+        size_t len;
+
+        snprintf(line_a, sizeof(line_a), "event=clean type=daemon path=\"%s\"",
+                 mm_target[i]);
+        if (strstr(log, line_a)) {
+          outmsg("QEMU_TEST: FAIL: #128 %s mismatch: %s was logged "
+                 "event=clean type=daemon - avd scanned the decoy bound over "
+                 "it instead of rejecting a file with the wrong identity\n",
+                 mm_name[i], mm_target[i]);
+          outmsg("QEMU_TEST: --- avd output ---\n%s\n", r_out);
+          poweroff_now();
+          return 1;
+        }
+        /* avd opened the decoy, and rejected it on identity alone. */
+        snprintf(want, sizeof(want),
+                 "avd: \"%s\" is now %u:%u ino %llu, not the %u:%u ino %llu "
+                 "the kernel hashed",
+                 mm_target[i], major(mm_dst[i].st_dev), minor(mm_dst[i].st_dev),
+                 (unsigned long long)mm_dst[i].st_ino, major(mm_tst[i].st_dev),
+                 minor(mm_tst[i].st_dev), (unsigned long long)mm_tst[i].st_ino);
+        if (!strstr(r_out, want)) {
+          outmsg("QEMU_TEST: FAIL: #128 %s mismatch: avd never reported "
+                 "rejecting the decoy at %s (expected '%s')\n",
+                 mm_name[i], mm_target[i], want);
+          outmsg("QEMU_TEST: --- avd output ---\n%s\n", r_out);
+          poweroff_now();
+          return 1;
+        }
+        /* ...and answered UNAVAILABLE for the target's identity. */
+        snprintf(line_a, sizeof(line_a),
+                 "event=unverified type=daemon path=\"%s\" ", mm_target[i]);
+        snprintf(want, sizeof(want), " dev=%u:%u ino=%llu ",
+                 major(mm_tst[i].st_dev), minor(mm_tst[i].st_dev),
+                 (unsigned long long)mm_tst[i].st_ino);
+        hit = strstr(log, line_a);
+        len = hit ? strcspn(hit, "\n") : 0;
+        if (!hit || !memmem(hit, len, want, strlen(want))) {
+          outmsg("QEMU_TEST: FAIL: #128 %s mismatch: no event=unverified "
+                 "for %s with%s - avd did not answer UNAVAILABLE\n",
+                 mm_name[i], mm_target[i], want);
+          outmsg("QEMU_TEST: --- avd output ---\n%s\n", r_out);
+          poweroff_now();
+          return 1;
+        }
+        outmsg("QEMU_TEST: #128 %s mismatch: decoy opened at the request "
+               "path and rejected, answered UNAVAILABLE\n",
+               mm_name[i]);
+      }
+      umount2("/tmp/id_dev_a", MNT_DETACH);
+      umount2("/tmp/id_dev_b", MNT_DETACH);
       outmsg("QEMU_TEST: daemon scan identity check passed\n");
     }
   }
