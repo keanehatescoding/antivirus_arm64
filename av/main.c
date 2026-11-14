@@ -96,6 +96,7 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/pid.h>
@@ -360,8 +361,8 @@ module_param(av_wq_max_active, int, 0444);
 MODULE_PARM_DESC(av_wq_max_active,
                  "Max concurrently-running kernel_av_wq workers (default 32; must be within [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling], otherwise reset to the default)");
 
-/* TEST-ONLY: milliseconds to sleep in av_work_fn() before hashing the
- * exec's pinned file. This does NOT create or widen a race: since the
+/* TEST-ONLY: milliseconds to sleep at the start of av_work_fn(), before
+ * it d_path()s or hashes the exec's pinned file. This does NOT create or widen a race: since the
  * exec hook moved onto the kernel's exec path (issues #2/#94),
  * av_work_fn() hashes the very struct file the kernel is executing,
  * so there is no
@@ -383,7 +384,7 @@ MODULE_PARM_DESC(av_wq_max_active,
 static int av_toctou_test_delay_ms; /* = 0: disabled unless a test sets it */
 module_param(av_toctou_test_delay_ms, int, 0644);
 MODULE_PARM_DESC(av_toctou_test_delay_ms,
-                 "TEST ONLY: ms to sleep before the deferred exec hash, so a regression test can swap the pathname mid-flight and prove the digest still comes from the executed image (default 0 = disabled; clamped to [0, 2000]); never set in production");
+                 "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove the digest still comes from the executed image (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1205,6 +1206,39 @@ static void av_work_free(struct av_work *aw) {
   av_work_release();
 }
 
+/* d_path() renders an unlinked dentry as "<path> (deleted)". That is
+ * the right thing for the log lines and for the daemon request (avd
+ * must not open whatever now sits at the bare path), but not for the
+ * self-delete keys: a dropper that unlinks its own image before this
+ * work item reaches d_path() would otherwise be recorded as
+ * "/tmp/payload (deleted)", and an unlink check for "/tmp/payload"
+ * that runs after the record would match neither key (CodeRabbit on
+ * #110). Returns the key to record: `canonical` itself, or a
+ * kmalloc()ed copy without the suffix that the caller kfree()s.
+ *
+ * Stripped only when d_unlinked() AND the suffix is present, so a file
+ * whose real name ends in " (deleted)" is left alone, and so is the
+ * window where the unlink lands between d_path() and the d_unlinked()
+ * test (unlinked, but rendered without the suffix). Files on an
+ * internal mount (memfd_create(), shmem/anon inodes) are never on a
+ * path anything can unlink, so their "/memfd:x (deleted)" stays as is
+ * rather than becoming a key that a real file named /memfd:x could
+ * match. On kmalloc failure the suffixed string is returned, which
+ * just loses the match - the behaviour before this helper existed. */
+static const char *av_exec_self_delete_key(const struct file *f,
+                                           const char *canonical) {
+  static const char sfx[] = " (deleted)";
+  const size_t sfx_len = sizeof(sfx) - 1;
+  size_t len = strlen(canonical);
+
+  if (canonical[0] != '/' || len <= sfx_len ||
+      strcmp(canonical + len - sfx_len, sfx) ||
+      !d_unlinked(f->f_path.dentry) ||
+      (f->f_path.mnt->mnt_flags & MNT_INTERNAL))
+    return canonical;
+  return kstrndup(canonical, len - sfx_len, GFP_KERNEL) ?: canonical;
+}
+
 /* The second self-delete key for this exec: the name the process
  * asked to exec, made absolute against its cwd the same way
  * av_unlink_work_fn() resolves an unlink target (resolve_absolute_path:
@@ -1216,6 +1250,11 @@ static void av_work_free(struct av_work *aw) {
  * says /tmp/alias/x, the exec side /tmp/real/x. Recording both keeps
  * every match the pre-#94 lexical-only key made and adds the reverse
  * one (exec through the alias, unlink through the real path).
+ *
+ * `canonical` is the first key as av_exec_self_delete_key() returned
+ * it, i.e. without d_path()'s " (deleted)" suffix - comparing against
+ * the suffixed form rejected this key on the final-component check
+ * below for every image unlinked before d_path() ran.
  *
  * Returns a kmalloc()ed PATH_MAX buffer, or NULL when there is no
  * useful second key: same string as `canonical`, not absolute (a
@@ -1288,8 +1327,28 @@ static void av_work_fn(struct work_struct *w) {
   char *abs_path;
   char *esc_path;
   char *lex_path;
+  const char *sd_key;
   const char *log_path;
   int ret;
+
+  /* TEST-ONLY delay (see av_toctou_test_delay_ms): a no-op whenever
+   * the knob is at its default 0, i.e. in every production
+   * configuration. Placed before this work item looks at the file at
+   * all - the d_path() below and the hash - so a regression test can
+   * replace or unlink the pathname while it is parked, then assert the
+   * digest still came from aw->file (the image the kernel actually
+   * executed) and that an image unlinked before d_path() still matches
+   * the self-delete check. Read once and clamped so a racing sysfs
+   * write of a bogus value cannot stall a worker indefinitely. */
+  {
+    int delay_ms = READ_ONCE(av_toctou_test_delay_ms);
+
+    if (delay_ms > 0) {
+      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
+        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
+      msleep(delay_ms);
+    }
+  }
 
   /* Recorded as this process's exec_path (for the unlink hook's
    * self-delete comparison, av_behavior_check_unlink()) and used in
@@ -1302,7 +1361,9 @@ static void av_work_fn(struct work_struct *w) {
    * unlink hook spells the same file. It is " (deleted)"-suffixed
    * if the file was unlinked after the exec opened it - a real case
    * for self-deleting droppers, and for the exec-time TOCTOU test,
-   * whose rename unlinks the pinned inode. A d_path() failure leaves
+   * whose rename unlinks the pinned inode. The logs and the daemon get
+   * that suffixed form; the self-delete record gets sd_key, the same
+   * path without it (av_exec_self_delete_key()). A d_path() failure leaves
    * an empty string, which av_behavior_check_unlink() never matches
    * (it requires a leading '/'), rather than a misleading partial
    * path.
@@ -1323,7 +1384,8 @@ static void av_work_fn(struct work_struct *w) {
     else
       memmove(abs_path, p, strlen(p) + 1);
   }
-  lex_path = av_exec_lexical_path(aw, abs_path);
+  sd_key = av_exec_self_delete_key(aw->file, abs_path);
+  lex_path = av_exec_lexical_path(aw, sd_key);
   /* Escaped rendering of abs_path for the dmesg lines below (CWE-117 -
    * see av_log.h). The recorded identity (av_behavior_record_exec) and
    * the daemon message keep the raw bytes; only log lines use this.
@@ -1334,24 +1396,6 @@ static void av_work_fn(struct work_struct *w) {
   esc_path = kmalloc(PATH_MAX, GFP_KERNEL);
   log_path = esc_path ? av_escape_log_str(abs_path, esc_path, PATH_MAX)
                       : "<path-escape-oom>";
-
-  /* TEST-ONLY hash delay (see av_toctou_test_delay_ms): a no-op
-   * whenever the knob is at its default 0, i.e. in every production
-   * configuration. Placed immediately before the hash below so a
-   * regression test can replace the pathname's contents while this
-   * work item is parked, then assert the digest still came from
-   * aw->file - the image the kernel actually executed. Read once and
-   * clamped so a racing sysfs write of a bogus value cannot stall a
-   * worker indefinitely. */
-  {
-    int delay_ms = READ_ONCE(av_toctou_test_delay_ms);
-
-    if (delay_ms > 0) {
-      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
-        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
-      msleep(delay_ms);
-    }
-  }
 
   ret = hash_file_multi(aw->file, &digest, &ident);
   if (ret) {
@@ -1376,7 +1420,7 @@ static void av_work_fn(struct work_struct *w) {
      * we could not hash. An empty hash never matches the trust table,
      * so this actively clears the exemption while restoring a
      * comparable exec_path. */
-    av_behavior_record_exec(aw->tgid, abs_path, lex_path, "",
+    av_behavior_record_exec(aw->tgid, sd_key, lex_path, "",
                             aw->start_time);
     goto out;
   }
@@ -1385,7 +1429,7 @@ static void av_work_fn(struct work_struct *w) {
    * immediately it'll never reach the unlink hook anyway, and this
    * keeps the recording logic in one place rather than duplicated
    * across the signature-match/daemon-match/clean branches. */
-  av_behavior_record_exec(aw->tgid, abs_path, lex_path, digest.sha256,
+  av_behavior_record_exec(aw->tgid, sd_key, lex_path, digest.sha256,
                           aw->start_time);
 
   if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
@@ -1453,6 +1497,8 @@ static void av_work_fn(struct work_struct *w) {
   }
 
 out:
+  if (sd_key != abs_path)
+    kfree(sd_key);
   kfree(abs_path);
   kfree(lex_path);
   kfree(esc_path);
