@@ -1383,6 +1383,7 @@ static void av_work_fn(struct work_struct *w) {
   char *abs_path;
   char *esc_path;
   char *lex_path;
+  const struct inode *lex_dir = NULL;
   const char *sd_key;
   const char *log_path;
   int ret;
@@ -1442,6 +1443,15 @@ static void av_work_fn(struct work_struct *w) {
   }
   sd_key = av_exec_self_delete_key(aw->file, abs_path);
   lex_path = av_exec_lexical_path(aw, sd_key);
+  /* The lexical key's directory, which av_exec_lexical_path() just
+   * checked is this dentry's parent. Recorded so the unlink check can
+   * tell when that name has since been pointed somewhere else. */
+  if (lex_path) {
+    struct dentry *parent = dget_parent(aw->file->f_path.dentry);
+
+    lex_dir = d_inode(parent);
+    dput(parent);
+  }
   /* Escaped rendering of abs_path for the dmesg lines below (CWE-117 -
    * see av_log.h). The recorded identity (av_behavior_record_exec) and
    * the daemon message keep the raw bytes; only log lines use this.
@@ -1476,7 +1486,7 @@ static void av_work_fn(struct work_struct *w) {
      * we could not hash. An empty hash never matches the trust table,
      * so this actively clears the exemption while restoring a
      * comparable exec_path. */
-    av_behavior_record_exec(aw->tgid, sd_key, lex_path, "",
+    av_behavior_record_exec(aw->tgid, sd_key, lex_path, lex_dir, "",
                             aw->start_time);
     goto out;
   }
@@ -1485,8 +1495,8 @@ static void av_work_fn(struct work_struct *w) {
    * immediately it'll never reach the unlink hook anyway, and this
    * keeps the recording logic in one place rather than duplicated
    * across the signature-match/daemon-match/clean branches. */
-  av_behavior_record_exec(aw->tgid, sd_key, lex_path, digest.sha256,
-                          aw->start_time);
+  av_behavior_record_exec(aw->tgid, sd_key, lex_path, lex_dir,
+                          digest.sha256, aw->start_time);
 
   if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
     snprintf(reason, sizeof(reason), "signature:%s", sig_name);
@@ -1804,6 +1814,12 @@ struct av_unlink_work {
                      * dfd arg) this is always the cwd capture, same
                      * as AT_FDCWD would give unlinkat(). Released
                      * via path_put() in av_unlink_work_fn(). */
+  struct path root; /* the unlinker's root at kprobe time, which the
+                     * self-delete check resolves a lexical match's
+                     * directory from (this worker's own root is a
+                     * private nullfs on newer kernels). Only valid
+                     * when has_root. */
+  bool has_root;
   char path[PATH_MAX];
 };
 
@@ -1820,9 +1836,12 @@ static void av_unlink_work_fn(struct work_struct *w) {
   }
 
   resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX);
-  av_behavior_check_unlink(uw->pid, abs_path, uw->target_pid);
+  av_behavior_check_unlink(uw->pid, abs_path,
+                           uw->has_root ? &uw->root : NULL, uw->target_pid);
 
   kfree(abs_path);
+  if (uw->has_root)
+    path_put(&uw->root);
   path_put(&uw->base);
   put_pid(uw->target_pid);
   kfree(uw);
@@ -1869,6 +1888,12 @@ static int schedule_unlink_work(const char __user *user_path, int dfd) {
     }
   }
 
+  /* Atomic-safe like get_fs_pwd(): fs->lock and a refcount. */
+  uw->has_root = false;
+  if (current->fs) {
+    get_fs_root(current->fs, &uw->root);
+    uw->has_root = true;
+  }
   uw->pid = task_tgid_nr(current);
   uw->target_pid = get_task_pid(current, PIDTYPE_PID);
   INIT_WORK(&uw->work, av_unlink_work_fn);
