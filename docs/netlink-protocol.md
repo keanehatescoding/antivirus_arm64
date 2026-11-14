@@ -176,19 +176,26 @@ by watching your own shell die.
   caveat above the Commands table for a real, if narrow, hazard this
   introduces (a flip to fail-closed can retroactively catch an
   already-in-flight exec, including the flipping shell's own).
-- **The exec verdict this channel carries is computed from a pathname,
-  not from the file the kernel resolved.** Everything above is about
-  who may speak on this channel and what happens when nobody answers;
-  this is about the request itself being answerable for the wrong file.
-  The kprobe pre-handler copies the pathname with
-  `strncpy_from_user()` (which cannot fault in a cold page from atomic
-  context) and `av_work_fn()` re-opens that name later (a second lookup
-  to race). Issue #2 tracks both halves; `docs/evasion-findings.md` #5
-  has the full writeup. **Not fixable on this channel**, and not
-  fixable in the module at all: `security_add_hooks()` is `__init` and
-  unexported, so an `insmod`'d module can never register
-  `bprm_check_security` to get at the resolved file. **Addressed
-  alongside it, not on it:** `avd` can additionally run a fanotify
+- **The exec verdict this channel carries arrives too late to block
+  the exec.** Everything above is about who may speak on this channel
+  and what happens when nobody answers; this is about *when* the answer
+  is useful. The scan is deferred to a workqueue and the module's hook
+  is a kprobe pre-handler, which cannot change the probed function's
+  return value, so a verdict carried here can only produce a `SIGKILL`
+  after the image has usually already started. **Not fixable on this
+  channel**: the request is sent from a context that has already let
+  the exec proceed.
+
+  What this entry used to say — that the verdict is computed from a
+  pathname the module copied itself rather than from the file the kernel
+  resolved, with a cold page defeating `strncpy_from_user()` and a
+  second lookup to race — is no longer true. Issue #94 moved the hook
+  onto the kernel's own exec path (`bprm_execve`, or
+  `security_bprm_check`) and it now hashes the pinned `bprm->file`; `docs/evasion-findings.md` #5 has the full writeup of
+  both former gaps. Registering a real LSM hook is still impossible from
+  a module (`security_add_hooks()` is `__init` and unexported), which is
+  why the module observes rather than denies. **Addressed alongside it,
+  not on it:** `avd` can additionally run a fanotify
   `FAN_OPEN_EXEC_PERM` gate that scans the kernel-supplied event fd
   directly, which sidesteps this channel entirely for execs on the
   mounts it covers. On by default; activates as soon as

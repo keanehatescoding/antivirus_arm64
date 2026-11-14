@@ -59,9 +59,12 @@ dmesg | tail -20
 sudo rmmod av
 ```
 
-Targets arm64 (aarch64) kernels 5.7+ only (hooks `__arm64_sys_execve` by
-symbol name — see the wiki's **Kernel Module** page for why x86_64 isn't
-supported). `make CC=clang LLVM=1` builds against a Clang-built kernel.
+Targets arm64 (aarch64) kernels 5.7+ only (the behavioral hooks resolve
+`__arm64_sys_*` syscall symbols by name — see the wiki's **Kernel Module**
+page for why x86_64 isn't supported). The exec hook needs nothing beyond
+`CONFIG_KPROBES=y`: at load time it binds to `bprm_execve`, the kernel's
+single caller of the binfmt search, and falls back to
+`security_bprm_check`. `make CC=clang LLVM=1` builds against a Clang-built kernel.
 Behavioral thresholds are load-time module params; see the wiki's
 **Behavioral Heuristics** page.
 
@@ -86,9 +89,10 @@ See the wiki's **Building and Running**, **avd Daemon**, **avctl CLI**, and
 builds.
 
 `avd` additionally runs a fanotify `FAN_OPEN_EXEC_PERM` exec gate, which
-scans the kernel-supplied fd instead of a pathname and so closes the kprobe
-path's TOCTOU/cold-page gaps on the mounts it covers. The gate is **on by
-default** and activates as soon as `AVD_FANOTIFY_MARK=<mountpoint>[:...]`
+answers allow/deny *before* an exec proceeds — the kprobe path only detects
+and kills, so on mounts the gate covers it is the difference between
+blocking a malicious exec and killing it a moment after it started. The
+gate is **on by default** and activates as soon as `AVD_FANOTIFY_MARK=<mountpoint>[:...]`
 names at least one mount (no default mark set — marking a mount suspends
 every exec on it until `avd` answers, so the scope is yours to pick);
 `AVD_FANOTIFY_EXEC=0` disables it entirely. See the wiki's **Fanotify Exec
@@ -151,5 +155,5 @@ still a known gap).
 ## Security
 
 See [SECURITY.md](SECURITY.md) for scope, already-accepted tradeoffs
-(fail-open by default, a documented kernel TOCTOU gap, arm64-only), and how
-to report a vulnerability privately.
+(fail-open by default, kill-after-exec rather than exec-time blocking on
+the kprobe path, arm64-only), and how to report a vulnerability privately.

@@ -35,7 +35,7 @@ pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
 pkgver=0.9.0.r134.g849b462
 pkgrel=1
 # aarch64 only - forced by the MODULE, not by the distro: av.ko hooks
-# __arm64_sys_execve by symbol name and will not build on x86_64 (see
+# __arm64_sys_* syscall symbols by name and will not build on x86_64 (see
 # SECURITY.md), exactly as in the Arch variant. Note CachyOS itself is
 # x86_64-focused - its linux-cachyos PKGBUILD targets x86_64, tuned for
 # x86-64-v3/v4, and there is no official CachyOS aarch64 repo. This
