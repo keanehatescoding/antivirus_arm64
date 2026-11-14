@@ -1494,6 +1494,12 @@ static int write_quarantine_meta(int qdirfd, const char *name,
   mn = snprintf(meta_name, sizeof(meta_name), "%s.meta", name);
   if (mn < 0 || (size_t)mn >= sizeof(meta_name))
     return -1;
+  /* Escaped before the sidecar exists, so a failure here leaves nothing
+   * to clean up (it used to run after fdopen() and close() the fd under
+   * the FILE, leaking the FILE). */
+  if (wire_escape(orig_path ? orig_path : "", esc_path, sizeof(esc_path)) != 0 ||
+      wire_escape(rule_name ? rule_name : "", esc_rule, sizeof(esc_rule)) != 0)
+    return -1;
   /* O_EXCL|O_NOFOLLOW, not fopen("w"): name itself is an
    * unpredictable pid+nanotime name (see quarantine_file()), so a
    * planted symlink here is impractical - but openat() would still
@@ -1507,13 +1513,6 @@ static int write_quarantine_meta(int qdirfd, const char *name,
     return -1;
   f = fdopen(mfd, "w");
   if (!f) {
-    close(mfd);
-    unlinkat(qdirfd, meta_name, 0);
-    return -1;
-  }
-
-  if (wire_escape(orig_path ? orig_path : "", esc_path, sizeof(esc_path)) != 0 ||
-      wire_escape(rule_name ? rule_name : "", esc_rule, sizeof(esc_rule)) != 0) {
     close(mfd);
     unlinkat(qdirfd, meta_name, 0);
     return -1;
