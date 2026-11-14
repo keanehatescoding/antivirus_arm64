@@ -69,5 +69,5 @@ Checks that run automatically (nothing to do here, just so you know):
   - CodeRabbit and Claude both leave inline review comments.
   - `.github/workflows/claude.yml` responds to `@claude` in a PR comment.
   - `build-matrix.yml`, `qemu-boot-test.yml`, `build-packages.yml` and
-    `lint.yml` run on every push.
+    `lint.yml` run on every PR push (and on `master` after merge).
 -->

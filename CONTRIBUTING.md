@@ -70,19 +70,23 @@ start/stop `avd`:
 | hashing code (either)       | `tests/test_sha256.sh`, `tests/test_tlsh_core.sh` — no root needed            |
 | broader / not sure          | `sudo tests/run_all.sh` — builds everything, runs the full set                |
 
-CI re-runs a version of this on every push across three tiers: compile
+CI re-runs a version of this on every PR (and on `master` after each
+merge) across three tiers: compile
 across gcc/clang against the kernel versions pinned in
 `.github/kernel-versions.json` (`build-matrix.yml`), a real QEMU boot
 that loads the module and checks clean-vs-EICAR detection
 (`qemu-boot-test.yml`), and a packaging build for `.deb`/`.pkg.tar.zst`/
-`.rpm` (`build-packages.yml`).
+`.rpm` (`build-packages.yml`). Pushing a branch without a PR doesn't
+start CI; open a (draft) PR, or start the workflows by hand from the
+Actions tab (they all accept `workflow_dispatch`).
 
 ## What runs automatically
 
 - **On commit** — `.githooks/pre-commit` lints staged files only:
   `cppcheck` on `av/*.c`, `gcc -fsyntax-only -Wall -Wextra` on
   `avctl`/`avd` changes, a `yara` compile check on rule changes,
-  `shellcheck` on scripts. Quick, no build, no `insmod`.
+  `shellcheck` on scripts, `yamllint` (plus `actionlint` on workflows)
+  on YAML. Quick, no build, no `insmod`.
 - **On push** — `.githooks/pre-push` runs the full suite
   (`pkexec tests/run_all.sh`), but only when the push touches `av/`,
   `userspace/avctl/`, `userspace/avd/`, `userspace/av-gui/`, `rules/`,
@@ -90,7 +94,12 @@ that loads the module and checks clean-vs-EICAR detection
   dev host `run_all.sh` self-detects and runs unprivileged: the
   module build is cross-compiled and boot-tested under QEMU rather
   than `insmod`'d, and the tests that need a loaded module on the
-  host are skipped rather than failed.
+  host are skipped rather than failed. That QEMU boot only runs when
+  the push touches something it uses (`av/`, `tests/qemu-boot/`,
+  `tests/test_detection*.sh`, the kernel version list), and its
+  kernel build is cached once per machine in
+  `~/.cache/antivirus_arm64/qemu-kernel` (override with
+  `AV_KERNEL_CACHE`), shared by every clone and worktree.
 
 Both accept `--no-verify` if you really need to skip them, but that's
 best avoided — particularly right before a tag.

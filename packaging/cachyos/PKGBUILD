@@ -47,7 +47,7 @@ pkgrel=1
 # there, which is correct - use the userspace-only pieces via another
 # route if you only want avd/avctl on x86_64).
 arch=('aarch64')
-url="https://github.com/keanehatescoding/antivirus"
+url="https://github.com/keanehatescoding/antivirus_arm64"
 # Dual-licensed per LICENSE (GPL-2.0-only OR MIT) - matches
 # packaging/arch/PKGBUILD. Expressed as a single SPDX "A OR B" entry
 # because Arch treats multiple array entries as license AND; see
@@ -59,7 +59,7 @@ license=('GPL-2.0-only OR MIT')
 # python-gobject/gtk4 are BUILD-time deps of package_hyprav-gui()'s
 # install - both documented at length in the Arch PKGBUILD.
 makedepends=('git' 'linux-cachyos-headers' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4' 'dkms' 'polkit')
-source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus.git}")
+source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus_arm64.git}")
 sha256sums=('SKIP')
 
 pkgver() {
