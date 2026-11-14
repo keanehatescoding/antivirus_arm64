@@ -106,6 +106,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #include "av_log.h"
@@ -205,10 +206,20 @@ MODULE_PARM_DESC(daemon_timeout_ms,
  *   bprm_execve() is the single caller of the binfmt search (both
  *   exec_binprm() and search_binary_handler() inline into it on the
  *   kernels this was checked against, which is why neither of those
- *   names is in the candidate list). It is entered with bprm->file already set by
- *   alloc_bprm() and before any binfmt handler has looked at the
- *   image, which is exactly the point this module wants. It is
- *   file-local to fs/exec.c, so it is a local text symbol rather than
+ *   names is in the candidate list). Since 6.8 (978ffcbf00d8, "execve:
+ *   open the executable file before doing anything else") it is
+ *   entered with bprm->file already set by alloc_bprm() and before any
+ *   binfmt handler has looked at the image, which is exactly the point
+ *   this module wants. On 5.9-6.7 it exists but opens the file ITSELF
+ *   (bprm_execve(bprm, fd, filename, flags) -> do_open_execat()), so
+ *   at function entry bprm->file is still NULL: the probe would
+ *   register fine and then skip every exec at the !bprm->file guard,
+ *   and the loop in av_init() would never get to try the fallback.
+ *   Hence av_exec_hook_usable() skips it before 6.8, and older
+ *   kernels go straight to security_bprm_check(), which predates the
+ *   LSM static-call conversion there and so is probeable. (Before 5.9
+ *   there is no bprm_execve at all.) It is file-local to fs/exec.c,
+ *   so it is a local text symbol rather than
  *   an exported one - register_kprobe() resolves those through
  *   kallsyms perfectly well, but a compiler that chose to inline it
  *   into its two callers, or to clone it (bprm_execve.constprop.0),
@@ -241,6 +252,18 @@ static const char *const av_exec_hook_candidates[] = {
     "bprm_execve",
     "security_bprm_check",
 };
+
+/* The 6.8 gate on bprm_execve described above. A plain C condition
+ * rather than an #if around the array entry: cppcheck lints av/
+ * without kernel headers (lint.yml, .githooks/pre-commit) and errors
+ * out on an #if it cannot evaluate, while the compiler folds this to a
+ * constant either way. */
+static bool av_exec_hook_usable(const char *sym) {
+  if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0) &&
+      strcmp(sym, "bprm_execve") == 0)
+    return false;
+  return true;
+}
 
 /* .symbol_name is filled in at load time from the candidate list
  * above, so it is deliberately not initialized here. */
@@ -1174,10 +1197,18 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
  * path, between the real exec and this open - made the signature and
  * daemon checks run against a swapped-in decoy while their actual code
  * was already running. With no second open and no path re-resolution
- * there is nothing left to swap: see issue #94 and the exec-time
- * TOCTOU case in tests/qemu-boot/init.c, which replaces the file
- * mid-flight (with av_toctou_test_delay_ms holding this work item
- * open) and asserts the kill still happens.
+ * in the kernel there is nothing left to swap for the hash and the
+ * signature check: see issue #94 and the exec-time TOCTOU case in
+ * tests/qemu-boot/init.c, which replaces the file mid-flight (with
+ * av_toctou_test_delay_ms holding this work item open) and asserts the
+ * kill still happens.
+ *
+ * NOT YET CLOSED for the daemon leg: the scan request still carries
+ * only abs_path, and avd's handle_scan_request() open()s that name
+ * itself, so a rename racing that open makes YARA/fuzzy/TLSH read a
+ * different inode, and an unlink makes the open fail, which avd
+ * currently answers with CLEAN. Binding the daemon scan to the
+ * executed file needs a protocol change, not a tweak here.
  *
  * STILL KILL-AFTER-EXEC, though: this runs asynchronously, so by the
  * time a verdict exists the exec has usually already committed and the
@@ -2068,6 +2099,13 @@ static int __init av_init(void) {
 
   kp_bprm_check.pre_handler = handler_pre_bprm_check;
   for (i = 0; i < ARRAY_SIZE(av_exec_hook_candidates); i++) {
+    if (!av_exec_hook_usable(av_exec_hook_candidates[i])) {
+      pr_info("kernel-av: exec hook candidate %s skipped: bprm->file is "
+              "not yet set at its entry before 6.8\n",
+              av_exec_hook_candidates[i]);
+      ret = -EOPNOTSUPP;
+      continue;
+    }
     /* register_kprobe() resolves .symbol_name into .addr and leaves
      * .addr set even on the failures this loop is here to survive,
      * and it rejects outright any probe that arrives with both fields
