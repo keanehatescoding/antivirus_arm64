@@ -45,7 +45,7 @@
 -->
 <policyconfig>
   <vendor>HyprAV</vendor>
-  <vendor_url>https://github.com/keanehatescoding/HyprAV</vendor_url>
+  <vendor_url>https://github.com/keanehatescoding/antivirus_arm64</vendor_url>
 
   <action id="org.hyprav.avctl.scan">
     <description>Run an on-demand HyprAV scan</description>

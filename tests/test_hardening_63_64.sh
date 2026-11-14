@@ -112,7 +112,8 @@ fi
 # The linkat() check above pins only the fast path: the copy
 # fallback, the lockdown chmod, and the chmod-failure cleanup must
 # stay dirfd-relative too, or a regression in any of them passes
-# while linkat() is unchanged. (The original's unlink(path) and the
+# while linkat() is unchanged. (The original's removal is covered
+# behaviorally by tests/test_quarantine_unlink.sh (#132); the
 # restore/delete/list paths are intentionally path-based and are NOT
 # covered here - see quarantine_file()'s own comment.)
 if echo "$QFILE_BODY" | grep -q "copy_fd_to_at(fd, qdirfd, name)"; then

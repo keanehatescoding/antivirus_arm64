@@ -19,8 +19,20 @@ name: QEMU boot test (runtime detection)
 # there.
 
 on:
+  # Branches are tested by their pull_request run; push runs only on
+  # master, so each PR push runs this once, not twice, and master still
+  # gets a run after every merge. workflow_dispatch tests a branch that
+  # has no PR yet (Actions tab > Run workflow).
   push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+# A newer push to the same PR makes its older run moot: cancel it.
+# Runs on master (and manual ones) are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -395,6 +407,21 @@ jobs:
                  "never printed its marker - the case was skipped or" \
                  "removed. A green run without it leaves the cold-page" \
                  "half of #2 with no runtime coverage."
+            exit 1
+          fi
+
+          # Self-delete correlation through a directory symlink
+          # (CodeRabbit on #110): exec via a symlinked dir, unlink via
+          # either spelling, must still be killed as a self-deleting
+          # binary. Guards the lexical second key av.ko records next to
+          # the d_path() one.
+          if ! grep -q "QEMU_TEST: self-delete correlation check passed" \
+               serial.log; then
+            echo "::error::init reported PASS but the self-delete" \
+                 "correlation case never printed its marker - the case" \
+                 "was skipped or removed. A green run without it leaves" \
+                 "self-delete detection through directory symlinks with" \
+                 "no runtime coverage."
             exit 1
           fi
 

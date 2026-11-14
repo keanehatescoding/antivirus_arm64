@@ -24,11 +24,14 @@
  * lost), for reasons not fully root-caused. write() sidesteps
  * whatever that was rather than chasing it further.
  *
- * Runs in one of two modes:
+ * Runs in one of these modes:
  *   - argv[1] == "--clean-marker": immediately exit(42). This is what
  *     gets exec'd as the "definitely not malicious" test case - no
  *     separate coreutils/busybox binary needed, we just re-exec
  *     ourselves.
+ *   - argv[1] == "--self-unlink" <path>: wait for a byte on fd 3, then
+ *     unlink <path> and linger (exit 43 if still alive). Run from a
+ *     copy of this binary by the self-delete correlation case.
  *   - argv[1] == "--linger": write one byte to fd 3, then sleep and
  *     exit(43). The #128 daemon-identity case execs a copy of this
  *     binary in this mode so a live, already-exec'd process exists
@@ -123,7 +126,10 @@
  * kprobe pinned, so d_path() of that still-open file renders as
  * "<target> (deleted)". The kill line for a swap therefore carries
  * either spelling depending on whether the rename beat av_work_fn()'s
- * d_path() call, and both are accepted. */
+ * d_path() call, and both are accepted. (With the delay knob now
+ * parking the work item before d_path(), the suffixed form is the one
+ * expected; the plain one stays accepted rather than asserting timing
+ * this case is not about.) */
 #define TOCTOU_SWAP_ATTEMPTS 64
 
 /* sha256 of the exact decoy bytes written below ("toctou decoy - nothing
@@ -143,7 +149,7 @@
 #define TOCTOU_DECOY_BYTES "toctou decoy - nothing to see here\n"
 
 /* av.ko's test-only knob (av_toctou_test_delay_ms) that parks the
- * deferred work item for this many ms immediately before it hashes, so
+ * deferred work item for this many ms before it d_path()s and hashes, so
  * the swap below is guaranteed to land while the scan is still in flight
  * rather than winning or losing by luck. Pre-#94 this widened the
  * kprobe->open window the bypass lived in; now that the hash reads the
@@ -256,9 +262,9 @@ static void write_file(const char *path, const char *content) {
   close(fd);
 }
 
-/* Byte-for-byte copy, mode 0755 - the #128 case execs a copy of /init
- * from /tmp so the original on the rootfs is never scanned or
- * quarantined. */
+/* Byte-for-byte copy, mode 0755 - the #128 and self-delete cases exec
+ * a copy of /init from /tmp so the original on the rootfs is never
+ * scanned, quarantined, or unlinked. */
 static void copy_file(const char *src, const char *dst) {
   char buf[65536];
   int in = open(src, O_RDONLY);
@@ -590,9 +596,109 @@ static void stop_avd(pid_t pid) {
   (void)wait_for_exit(pid, 15000, &code, &sig);
 }
 
+/* ---- helpers for the self-delete correlation case ---- */
+
+/* Execs `exec_path` (a copy of /init) in `mode` (--self-unlink or
+ * --self-unlink-early, see main()), lets it unlink `unlink_path` once
+ * av.ko has recorded the exec, and reports how it ended. `recorded_path` is the d_path() av.ko logs for the
+ * exec (symlinks followed); its event=clean line for this pid is the
+ * signal that av_behavior_record_exec() has run, since av_work_fn()
+ * records before it logs. That line is ratelimited, so if it never
+ * shows the case proceeds after SELF_DELETE_RECORD_WAIT_MS anyway -
+ * an unscanned exec would leave no record and fail the kill
+ * assertion, not pass it. Returns 1 if the child was SIGKILLed. */
+#define SELF_DELETE_RECORD_WAIT_MS 5000
+/* av_toctou_test_delay_ms for the unlinked-before-d_path() self-delete
+ * cases: long enough that the child's own unlink (its first syscall
+ * after exec) always beats the parked work item's d_path(). */
+#define SELF_DELETE_EARLY_DELAY_MS 500
+static int run_self_delete_case(const char *exec_path, const char *mode,
+                                const char *recorded_path,
+                                const char *unlink_path, int *exit_code,
+                                int *term_sig, int *saw_record) {
+  int sync_fd[2];
+  pid_t pid;
+  char needle[256];
+  int waited = 0;
+
+  if (pipe(sync_fd) != 0)
+    die("pipe(self-delete sync)");
+  pid = fork();
+  if (pid < 0)
+    die("fork(self-delete)");
+  if (pid == 0) {
+    char *const cargv[] = {(char *)exec_path, (char *)mode,
+                           (char *)unlink_path, NULL};
+
+    close(sync_fd[1]);
+    if (sync_fd[0] != 3) {
+      if (dup2(sync_fd[0], 3) < 0)
+        _exit(126);
+      close(sync_fd[0]);
+    }
+    execv(exec_path, cargv);
+    _exit(127);
+  }
+  close(sync_fd[0]);
+
+  snprintf(needle, sizeof(needle), "path=\"%s\" pid=%d ", recorded_path,
+           (int)pid);
+  *saw_record = 0;
+  while (waited < SELF_DELETE_RECORD_WAIT_MS) {
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
+
+    if (strstr(read_kernel_log(), needle)) {
+      *saw_record = 1;
+      break;
+    }
+    nanosleep(&ts, NULL);
+    waited += 50;
+  }
+
+  if (write(sync_fd[1], "x", 1) != 1)
+    die("write(self-delete sync)");
+  close(sync_fd[1]);
+  (void)wait_for_exit(pid, 15000, exit_code, term_sig);
+  return *term_sig == SIGKILL;
+}
+
 int main(int argc, char *const argv[]) {
   if (argc > 1 && !strcmp(argv[1], "--clean-marker")) {
     _exit(42);
+  }
+  /* Child half of the self-delete case below, run as a COPY of this
+   * binary: block until the parent writes one byte to fd 3 (it does so
+   * once av.ko has recorded this exec), unlink argv[2], then linger so
+   * the kernel's asynchronous self-delete kill has time to land. Exit
+   * 43 means it was NOT killed; 44/45 mean the helper itself broke. */
+  if (argc > 2 && !strcmp(argv[1], "--self-unlink")) {
+    char c;
+
+    if (read(3, &c, 1) != 1)
+      _exit(44);
+    if (unlink(argv[2]) != 0)
+      _exit(45);
+    sleep(5);
+    _exit(43);
+  }
+  /* Same, for the unlinked-before-d_path() cases: unlink argv[2] (this
+   * image) straight away, while av.ko's exec work item is parked by
+   * av_toctou_test_delay_ms, so d_path() later renders it with the
+   * " (deleted)" suffix. That first unlink's check runs before the exec
+   * is recorded and cannot match anything. Once the parent has seen the
+   * record, unlink the same name again: av.ko's unlink hook fires at
+   * syscall entry whatever the outcome (ENOENT here), so this is the
+   * check-after-record ordering the fix is about, made deterministic. */
+  if (argc > 2 && !strcmp(argv[1], "--self-unlink-early")) {
+    char c;
+
+    if (unlink(argv[2]) != 0)
+      _exit(45);
+    if (read(3, &c, 1) != 1)
+      _exit(44);
+    (void)unlink(argv[2]);
+    sleep(5);
+    _exit(43);
   }
   if (argc > 1 && !strcmp(argv[1], "--linger")) {
     struct timespec ts = {.tv_sec = 20, .tv_nsec = 0};
@@ -805,6 +911,176 @@ int main(int argc, char *const argv[]) {
    * PASS. Same pattern as the TOCTOU and #48 cases below. */
   outmsg("QEMU_TEST: cold-pathname regression check passed\n");
 
+  /* ---- Regression case: self-delete correlation through a directory
+   * symlink (CodeRabbit on #110) ----
+   *
+   * av_behavior_check_unlink() kills a process that unlinks its own
+   * executable, matched by path string. The unlink side spells the path
+   * lexically (resolve_absolute_path(): symlinks NOT followed); since
+   * #94 the exec side records d_path() of the executed file, which DOES
+   * follow them. With only that key, exec /tmp/sd_alias/a followed by
+   * unlink("/tmp/sd_alias/a") compared /tmp/sd_real/a against
+   * /tmp/sd_alias/a and missed - a regression from the old lexical-only
+   * key. av.ko now also records the exec name lexically
+   * (av_exec_lexical_path()), and an unlink matching either key counts.
+   *
+   *   A: exec via the alias, unlink via the alias  -> killed (lexical key)
+   *   B: exec via the alias, unlink via the real dir -> killed (d_path key)
+   *   C: exec via the alias, unlink an unrelated file -> NOT killed
+   *
+   * C is the control: it proves the kills in A and B come from the
+   * self-delete match and not from something else about the setup. */
+  {
+    static const struct {
+      const char *name;   /* file under /tmp/sd_real */
+      const char *unlink; /* what the child unlinks */
+      int expect_kill;
+    } cases[] = {
+        {"a", "/tmp/sd_alias/a", 1},
+        {"b", "/tmp/sd_real/b", 1},
+        {"c", "/tmp/sd_real/c_other", 0},
+    };
+    int failed = 0;
+
+    if (mkdir("/tmp/sd_real", 0755) != 0)
+      die("mkdir /tmp/sd_real");
+    if (symlink("/tmp/sd_real", "/tmp/sd_alias") != 0)
+      die("symlink /tmp/sd_alias");
+    write_file("/tmp/sd_real/c_other", "not the executable\n");
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+      char real[64], alias[64];
+      int code, sig, saw_record, killed;
+
+      snprintf(real, sizeof(real), "/tmp/sd_real/%s", cases[i].name);
+      snprintf(alias, sizeof(alias), "/tmp/sd_alias/%s", cases[i].name);
+      copy_file("/init", real);
+      killed = run_self_delete_case(alias, "--self-unlink", real,
+                                    cases[i].unlink, &code, &sig,
+                                    &saw_record);
+      outmsg("QEMU_TEST: self-delete case %s: exec %s, unlink %s -> "
+             "%s (exit=%d sig=%d, exec record %s)\n",
+             cases[i].name, alias, cases[i].unlink,
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (killed != cases[i].expect_kill) {
+        outmsg("QEMU_TEST: FAIL: self-delete case %s expected %s\n",
+               cases[i].name, cases[i].expect_kill ? "a kill" : "no kill");
+        failed = 1;
+      } else if (!killed && code != 43) {
+        outmsg("QEMU_TEST: FAIL: self-delete control case %s exited %d, "
+               "not 43 - the helper itself broke (44 = sync read, "
+               "45 = unlink)\n",
+               cases[i].name, code);
+        failed = 1;
+      }
+    }
+    if (!failed) {
+      const char *log = read_kernel_log();
+
+      if (!strstr(log, "path=\"/tmp/sd_alias/a\" reason=\"self-deleting "
+                       "binary") ||
+          !strstr(log, "path=\"/tmp/sd_real/b\" reason=\"self-deleting "
+                       "binary")) {
+        outmsg("QEMU_TEST: FAIL: self-delete kills happened but dmesg is "
+               "missing a reason=\"self-deleting binary\" line for them\n");
+        failed = 1;
+      }
+    }
+    /* Image unlinked before av.ko's d_path() (CodeRabbit on #110).
+     * d_path() of an unlinked dentry ends in " (deleted)", so before the
+     * fix the d_path() key was recorded with that suffix and the lexical
+     * key was dropped on its final-component check ("d" vs
+     * "d (deleted)"): an unlink check running after the record matched
+     * neither. The delay knob parks the exec work item before d_path()
+     * so the child's own unlink deterministically lands first; the
+     * "(deleted)" record line below confirms it did.
+     *
+     *   D: exec via the alias, unlink via the alias -> killed (lexical key)
+     *   E: exec via the alias, unlink via the real dir -> killed (d_path key)
+     *
+     * Case C above stays the control for these too. */
+    if (!failed) {
+      static const struct {
+        const char *name;
+        const char *unlink;
+      } early[] = {
+          {"d", "/tmp/sd_alias/d"},
+          {"e", "/tmp/sd_real/e"},
+      };
+
+      write_param_int(TOCTOU_DELAY_PARAM, SELF_DELETE_EARLY_DELAY_MS);
+      for (size_t i = 0; i < sizeof(early) / sizeof(early[0]); i++) {
+        char real[64], alias[64], recorded[80], reason_line[128];
+        int code, sig, saw_record, killed;
+
+        snprintf(real, sizeof(real), "/tmp/sd_real/%s", early[i].name);
+        snprintf(alias, sizeof(alias), "/tmp/sd_alias/%s", early[i].name);
+        snprintf(recorded, sizeof(recorded), "%s (deleted)", real);
+        copy_file("/init", real);
+        killed = run_self_delete_case(alias, "--self-unlink-early", recorded,
+                                      early[i].unlink, &code, &sig,
+                                      &saw_record);
+        outmsg("QEMU_TEST: self-delete case %s (unlinked before d_path): "
+               "exec %s, unlink %s -> %s (exit=%d sig=%d, \"(deleted)\" "
+               "record %s)\n",
+               early[i].name, alias, early[i].unlink,
+               killed ? "killed" : "not killed", code, sig,
+               saw_record ? "seen" : "not seen in log");
+        snprintf(reason_line, sizeof(reason_line),
+                 "path=\"%s\" reason=\"self-deleting binary", early[i].unlink);
+        if (!killed) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s expected a kill%s\n",
+                 early[i].name,
+                 code == 45 ? " (helper's first unlink failed)" : "");
+          failed = 1;
+        } else if (!strstr(read_kernel_log(), reason_line)) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s was killed but dmesg "
+                 "has no %s\" line\n",
+                 early[i].name, reason_line);
+          failed = 1;
+        }
+      }
+      write_param_int(TOCTOU_DELAY_PARAM, 0);
+    }
+    /* F: exec through a symlink to the FILE whose name matches the
+     * target's (/tmp/sd_flink/f -> /tmp/sd_real/f, /tmp/sd_flink a real
+     * directory), then unlink that symlink -> NOT killed. Unlinking it
+     * leaves the executable alone, but a lexical key accepted on
+     * "same basename" alone matched it and killed (CodeRabbit on x86
+     * #229). av.ko now accepts that key only when its directory
+     * resolves to the executed file's own directory. */
+    if (!failed) {
+      int code, sig, saw_record, killed;
+
+      if (mkdir("/tmp/sd_flink", 0755) != 0)
+        die("mkdir /tmp/sd_flink");
+      copy_file("/init", "/tmp/sd_real/f");
+      if (symlink("/tmp/sd_real/f", "/tmp/sd_flink/f") != 0)
+        die("symlink /tmp/sd_flink/f");
+      killed = run_self_delete_case("/tmp/sd_flink/f", "--self-unlink",
+                                    "/tmp/sd_real/f", "/tmp/sd_flink/f",
+                                    &code, &sig, &saw_record);
+      outmsg("QEMU_TEST: self-delete case f (file symlink, same name): "
+             "exec /tmp/sd_flink/f, unlink /tmp/sd_flink/f -> %s "
+             "(exit=%d sig=%d, exec record %s)\n",
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (killed || code != 43) {
+        outmsg("QEMU_TEST: FAIL: self-delete case f expected no kill and "
+               "exit 43 (44 = sync read, 45 = unlink)\n");
+        failed = 1;
+      }
+    }
+    if (failed) {
+      outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
+      poweroff_now();
+      return 1;
+    }
+  }
+  /* Fixed marker for qemu-boot-test.yml - see the cold-pathname one. */
+  outmsg("QEMU_TEST: self-delete correlation check passed\n");
+
   /* ---- Regression case: exec-time TOCTOU (issue #45, the second half
    * of #2) ----
    *
@@ -837,8 +1113,8 @@ int main(int argc, char *const argv[]) {
    *   - av.ko's test-only av_toctou_test_delay_ms knob, set to
    *     TOCTOU_WQ_DELAY_MS for the duration of this batch only (0 for
    *     every other exec in this boot and in all production), parks the
-   *     work item just before it hashes so the rename is certain to land
-   *     mid-scan. Without it the scan completes inside the failing
+   *     work item before it d_path()s and hashes so the rename is
+   *     certain to land mid-scan. Without it the scan completes inside the failing
    *     execve() syscall (measured: renaming after execve returns is
    *     already too late) and the swap would be asserting nothing.
    *
