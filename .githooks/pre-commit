@@ -219,6 +219,18 @@ for f in "${STAGED[@]}"; do
                 echo "  - yamllint: $f"
                 yamllint "$f" || FAIL=1
             fi
+            # actionlint checks what yamllint can't: expressions, event
+            # and runner names, and (via shellcheck, if installed) the
+            # shell in run: blocks. Skipped if not installed; lint.yml
+            # runs it in CI either way.
+            case "$f" in
+                .github/workflows/*)
+                    if command -v actionlint >/dev/null 2>&1; then
+                        echo "  - actionlint: $f"
+                        actionlint "$f" || FAIL=1
+                    fi
+                    ;;
+            esac
             ;;
     esac
 done

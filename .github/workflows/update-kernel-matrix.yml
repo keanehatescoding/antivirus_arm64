@@ -14,15 +14,31 @@ name: Update kernel matrix versions
 #
 # Writes .github/kernel-versions.json, NOT build-matrix.yml itself, even
 # though the latter is what conceptually "owns" this data: GitHub refuses
-# to let the default GITHUB_TOKEN (or the app-installation token
-# peter-evans/create-pull-request below uses) push a change to anything
+# to let the default GITHUB_TOKEN (or a token without the `workflows`
+# permission) push a change to anything
 # under .github/workflows/, even with `permissions: contents: write`
 # granted right here - that specific directory needs the separate
 # `workflows` OAuth scope, which only a PAT can carry. The first version
 # of this job edited build-matrix.yml directly and every single scheduled
 # run failed silently on exactly that push rejection. build-matrix.yml
 # now reads kernel-versions.json at run time instead (fromJSON()), so
-# this job never touches a workflow file and never needs a PAT.
+# this job never touches a workflow file and never needs the `workflows`
+# permission.
+#
+# It does need a token other than GITHUB_TOKEN to open the PR, though:
+# GitHub deliberately doesn't start workflows for events caused by
+# GITHUB_TOKEN, so a PR it opens gets no pull_request CI at all - the
+# kernel bump that broke master's qemu-boot (7.3.1) job was merged with
+# zero checks having run. Set the KERNEL_BUMP_TOKEN secret to a
+# fine-grained PAT scoped to this repo with Contents: read/write and
+# Pull requests: read/write. (Not a GitHub App installation token: those
+# expire after an hour, so a stored one is dead by the next weekly run,
+# and a set-but-expired secret skips the GITHUB_TOKEN fallback.) The
+# PAT also pushes the branch, but push-triggered CI only runs on
+# master, so the bump's checks run once, on the PR.
+# Without it the job
+# still opens the PR with GITHUB_TOKEN, but warns, and the PR body says
+# how to start CI by hand.
 
 on:
   schedule:
@@ -39,6 +55,8 @@ permissions:
 jobs:
   update-kernel-matrix:
     runs-on: ubuntu-latest
+    env:
+      HAS_BUMP_TOKEN: ${{ secrets.KERNEL_BUMP_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
@@ -48,10 +66,18 @@ jobs:
         id: update
         run: .github/scripts/update-kernel-matrix.sh
 
+      - name: Warn if CI won't run on the PR
+        if: steps.update.outputs.changed == 'true' && env.HAS_BUMP_TOKEN != 'true'
+        run: |
+          msg="KERNEL_BUMP_TOKEN is not set - the PR is opened with GITHUB_TOKEN,"
+          msg+=" so no pull_request workflows will run on it. Close and reopen the PR to start CI."
+          echo "::warning::$msg"
+
       - name: Open PR if the matrix changed
         if: steps.update.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8  # v8
         with:
+          token: ${{ secrets.KERNEL_BUMP_TOKEN || github.token }}
           commit-message: "ci: bump kernel matrix versions to current kernel.org releases"
           title: "ci: bump kernel matrix versions"
           body: |
@@ -60,12 +86,15 @@ jobs:
             - the 2 most recent non-EOL longterm (LTS) branches
             - the current stable release
 
-            Review the diff in `.github/kernel-versions.json` before
-            merging - build-matrix.yml reads this file at run time via
-            fromJSON(), so this PR does not itself run the build-matrix
-            workflow's kernel build/smoke-test jobs; those run
-            automatically once this PR exists (see `on: pull_request` in
-            build-matrix.yml).
+            build-matrix.yml and qemu-boot-test.yml read this file at run
+            time via fromJSON(), so their jobs on this PR build and boot
+            the new versions. **Don't merge until they have run and
+            passed** - a new kernel can break av.ko (Linux 7.3's nullfs
+            did).
+
+            If this PR shows no checks, the KERNEL_BUMP_TOKEN secret is
+            missing (a PR opened with GITHUB_TOKEN starts no workflows):
+            close and reopen the PR to start CI.
           branch: ci/update-kernel-matrix
           labels: ci, dependencies
           delete-branch: true

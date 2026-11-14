@@ -19,6 +19,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # the cross-compile + QEMU boot-test version instead of just failing;
 # that path needs no root at all (nothing is insmod'd into this host).
 if [ "$(uname -m)" != "aarch64" ]; then
+    # Set by .githooks/pre-push when the push touches nothing the QEMU
+    # boot test uses (e.g. a userspace-only change), so those pushes skip a
+    # minutes-long kernel/av.ko cross-build plus a TCG boot.
+    if [ "${AV_SKIP_QEMU_BOOT:-0}" = 1 ]; then
+        echo "test_detection.sh: SKIPPED - no changes to av/, tests/qemu-boot/ or the kernel version (AV_SKIP_QEMU_BOOT=1)"
+        exit 0
+    fi
     echo "test_detection.sh: host is $(uname -m), not aarch64 - av.ko can't be"
     echo "  insmod'd here. Delegating to test_detection_qemu.sh (cross-compile"
     echo "  + QEMU boot test)."

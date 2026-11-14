@@ -9,7 +9,7 @@ name: Release
 #
 # The .deb/.pkg.tar.zst/.rpm builds themselves are NOT redefined here -
 # build-packages.yml already builds and artifact-uploads all three on
-# every push/PR, so this calls that workflow instead of forking a
+# every PR and master push, so this calls that workflow instead of forking a
 # second copy of ~200 lines of container/dependency/build steps that
 # would only drift out of sync with it over time. That file's own
 # version-stamping steps are gated on `startsWith(github.ref,
