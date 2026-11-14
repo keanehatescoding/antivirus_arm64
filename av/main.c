@@ -2043,6 +2043,7 @@ static void av_unlink_work_fn(struct work_struct *w) {
   const char *spelled;
   char *spelled_buf;
   char *lexical = NULL;
+  bool path_is_workers;
 
   if (!abs_path) {
     if (uw->has_root)
@@ -2067,8 +2068,13 @@ static void av_unlink_work_fn(struct work_struct *w) {
       normalize_abs_path(lexical, PATH_MAX);
     }
   }
-  av_behavior_check_unlink(uw->pid, abs_path, lexical, spelled,
-                           uw->has_root ? &uw->root : NULL, uw->target_pid);
+  /* abs_path is spelled from this worker's root, like the exec's d_path()
+   * key, unless the task spelled it absolute from a root of its own. */
+  path_is_workers = uw->path[0] != '/' || !uw->has_root ||
+                    av_root_is_workers(&uw->root);
+  av_behavior_check_unlink(uw->pid, abs_path, path_is_workers, lexical,
+                           spelled, uw->has_root ? &uw->root : NULL,
+                           uw->target_pid);
 
   kfree(lexical);
   kfree(spelled_buf);
