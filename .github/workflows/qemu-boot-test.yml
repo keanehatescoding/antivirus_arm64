@@ -432,6 +432,17 @@ jobs:
                  "branch was not exercised at runtime."
             exit 1
           fi
+          # Issue #128: avd scans the file the kernel hashed (dev/ino
+          # check + /proc/<pid>/exe fallback), not whatever the path
+          # names by then. Without this marker the identity check has
+          # no runtime coverage.
+          if ! grep -q "QEMU_TEST: daemon scan identity check passed" \
+               serial.log; then
+            echo "::error::init reported PASS but the daemon scan" \
+                 "identity case (#128) never printed its marker - the" \
+                 "rename/unlink races against avd were not exercised."
+            exit 1
+          fi
 
       - name: Upload serial console log
         if: always()

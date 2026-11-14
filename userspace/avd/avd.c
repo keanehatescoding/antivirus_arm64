@@ -95,6 +95,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -389,10 +390,21 @@ static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
  * itself. `shutting_down` lets both a full queue's producer-side wait
  * and an empty queue's consumer-side wait unblock cleanly on
  * SIGINT/SIGTERM instead of hanging the process past `running = 0`. */
+/* Identity of the file the kernel hashed, from AV_A_DEV_MAJOR/MINOR/INO
+ * (issue #128). present=false for a request from a kernel module that
+ * predates those attributes - see handle_scan_request(). */
+struct scan_ident {
+  bool present;
+  uint32_t dev_major;
+  uint32_t dev_minor;
+  uint64_t ino;
+};
+
 struct scan_task {
   struct scan_task *next;
   uint64_t reqid;
   uint32_t pid;
+  struct scan_ident ident;
   char path[PATH_MAX];
   char sha256_hex[65];
 };
@@ -463,7 +475,9 @@ static void handle_sigint(int signum) {
 
 /*
  * Sends AV_C_VERDICT back to the kernel for the given request.
- * verdict: AV_VERDICT_CLEAN or AV_VERDICT_MALICIOUS.
+ * verdict: AV_VERDICT_CLEAN, AV_VERDICT_MALICIOUS, or (only in reply to
+ * a request that carried identity attributes - an older kernel rejects
+ * it) AV_VERDICT_UNAVAILABLE.
  * rule_name: may be NULL/empty for a clean verdict.
  */
 static int send_verdict(uint64_t reqid, uint8_t verdict,
@@ -2448,10 +2462,48 @@ record:
                          out->rule_name, out->score, on_demand);
 }
 
-static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
-                                const char *sha256_hex) {
+/* Opens `p` for scanning: O_NONBLOCK + fstat/S_ISREG, same as cmd_scan()'s
+ * on-demand path - without it, a FIFO path with no writer blocks a scan
+ * worker indefinitely on open(), and repeated N times (N = worker count)
+ * that DoSes on-access scanning entirely. The flag is cleared once the
+ * file is known-regular, where it has no read() effect anyway. Returns
+ * the fd with *st filled, or -1 with *what naming the step that failed
+ * (errno is meaningful for "open" and "prepare"). */
+static int open_scan_target(const char *p, struct stat *st, const char **what) {
+  int fd = open(p, O_RDONLY | O_NONBLOCK);
+
+  if (fd < 0) {
+    *what = "open";
+    return -1;
+  }
+  if (fstat(fd, st) != 0 || !S_ISREG(st->st_mode)) {
+    *what = "non-regular";
+    close(fd);
+    return -1;
+  }
+  if (fcntl(fd, F_SETFL, O_RDONLY) != 0) {
+    int saved = errno;
+
+    *what = "prepare";
+    close(fd);
+    errno = saved;
+    return -1;
+  }
+  return fd;
+}
+
+static bool scan_ident_matches(const struct stat *st,
+                               const struct scan_ident *id) {
+  return major(st->st_dev) == id->dev_major &&
+         minor(st->st_dev) == id->dev_minor && (uint64_t)st->st_ino == id->ino;
+}
+
+static void handle_scan_request(uint64_t reqid, uint32_t pid,
+                                const struct scan_ident *ident,
+                                const char *path, const char *sha256_hex) {
   struct scan_result result;
   struct stat st;
+  const char *what = "";
   int fd;
 
   printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
@@ -2466,38 +2518,93 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
    * regardless of what happens to `path` afterward (deleted, renamed,
    * replaced with a symlink to something else - even during the scan
    * itself, which can take up to avd_scan_timeout_secs), so there's
-   * nothing left for an attacker to swap out from under it. This
-   * replaces the previous design's lstat-baseline-then-re-check-at-
-   * rename-time approach, which could only narrow that window, not
-   * close it. */
-  /* O_NONBLOCK + fstat/S_ISREG, same as cmd_scan()'s on-demand path:
-   * without it, a FIFO path with no writer blocks a scan worker
-   * indefinitely on open() - repeated N times (N = worker count) this
-   * DoSes on-access scanning entirely. The flag is cleared once the
-   * file is known-regular, where it has no read() effect anyway. */
-  fd = open(path, O_RDONLY | O_NONBLOCK);
-  if (fd < 0) {
-    fprintf(stderr, "avd: could not open \"%s\" for scanning: %s\n", path,
-            strerror(errno));
-    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
-    return;
+   * nothing left for an attacker to swap out from under it.
+   *
+   * What the fd can't do by itself is prove that `path` still named
+   * the file the kernel hashed when this open() resolved it: the
+   * request is queued and answered asynchronously, so a rename between
+   * the exec and here would hand YARA/fuzzy/TLSH a decoy, and an unlink
+   * used to make the open fail and be answered CLEAN (issue #128). So
+   * the fd is only scanned if its st_dev/st_ino match what the kernel
+   * reports for the file it pinned and hashed. */
+  fd = open_scan_target(path, &st, &what);
+
+  if (!ident->present) {
+    /* Kernel module predates the identity attributes (module/daemon
+     * version skew during an upgrade). It would also reject
+     * AV_VERDICT_UNAVAILABLE with -EINVAL, leaving every failed open
+     * to wait out daemon_timeout_ms, so keep the old by-path
+     * behaviour - including CLEAN when the open fails - for it. */
+    if (fd < 0) {
+      if (strcmp(what, "non-regular") == 0)
+        fprintf(stderr, "avd: refusing to scan non-regular file \"%s\"\n",
+                path);
+      else
+        fprintf(stderr, "avd: could not %s \"%s\" for scanning: %s\n",
+                what, path, strerror(errno));
+      send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+      return;
+    }
+  } else {
+    if (fd >= 0 && !scan_ident_matches(&st, ident)) {
+      fprintf(stderr,
+              "avd: \"%s\" is now %u:%u ino %llu, not the %u:%u ino %llu "
+              "the kernel hashed - replaced since exec\n",
+              path, major(st.st_dev), minor(st.st_dev),
+              (unsigned long long)st.st_ino, ident->dev_major,
+              ident->dev_minor, (unsigned long long)ident->ino);
+      close(fd);
+      fd = -1;
+    } else if (fd < 0 && strcmp(what, "non-regular") == 0) {
+      fprintf(stderr, "avd: \"%s\" is not a regular file\n", path);
+    } else if (fd < 0) {
+      fprintf(stderr, "avd: could not %s \"%s\" for scanning: %s\n", what,
+              path, strerror(errno));
+    }
+
+    /* Fallback: the exec'ing process's own image. mm->exe_file is the
+     * file the kernel exec'd whatever has since happened to its name
+     * (renamed, unlinked), so this reaches the hashed inode in the
+     * common evasion case of "exec, then immediately swap the path".
+     * It is only right once the exec has committed - for a script it
+     * names the interpreter, and before commit (or after a failed
+     * exec) it names the old image - so it is accepted only on the
+     * same identity match, never on trust. Opening it for another
+     * uid's process needs CAP_SYS_PTRACE (ptrace_may_access()). */
+    if (fd < 0 && pid != 0) {
+      char exe[32];
+
+      snprintf(exe, sizeof(exe), "/proc/%u/exe", pid);
+      fd = open_scan_target(exe, &st, &what);
+      if (fd >= 0 && !scan_ident_matches(&st, ident)) {
+        close(fd);
+        fd = -1;
+      }
+      if (fd >= 0)
+        printf("avd: scanning reqid=%llu via %s (path no longer names the "
+               "hashed file)\n",
+               (unsigned long long)reqid, exe);
+    }
+
+    if (fd < 0) {
+      /* Not CLEAN: we never saw the bytes the kernel hashed. The kernel
+       * applies its fail-open/fail-closed daemon policy to this, and
+       * logs it as event=unverified rather than event=clean. */
+      fprintf(stderr,
+              "avd: reqid=%llu: could not reach the file the kernel hashed "
+              "for \"%s\" - answering UNAVAILABLE\n",
+              (unsigned long long)reqid, path);
+      send_verdict(reqid, AV_VERDICT_UNAVAILABLE, NULL);
+      return;
+    }
   }
 
-  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-    fprintf(stderr, "avd: refusing to scan non-regular file \"%s\"\n", path);
-    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
-    close(fd);
-    return;
-  }
-
-  if (fcntl(fd, F_SETFL, O_RDONLY) != 0) {
-    fprintf(stderr, "avd: could not prepare \"%s\" for scanning: %s\n", path,
-            strerror(errno));
-    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
-    close(fd);
-    return;
-  }
-
+  /* `path` is kept for logging/history even when scanning via
+   * /proc/<pid>/exe - it is what the operator knows the exec by.
+   * quarantine_file() is safe with that combination: it links the fd's
+   * inode into quarantine and only unlinks `path` after an lstat()
+   * re-check that its dev/ino still match the fd, which a swapped-in
+   * decoy fails, so the decoy is never removed. */
   perform_scan(fd, path, sha256_hex, pid, false, &result);
 
   if (send_verdict(reqid, result.verdict, result.rule_name) < 0)
@@ -2520,7 +2627,8 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
  * request waits before that side fails open. Returns false only on
  * shutdown or allocation failure, in which case the caller drops the
  * request (matching this codebase's existing fail-open stance). */
-static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
+static bool enqueue_scan_task(uint64_t reqid, uint32_t pid,
+                              const struct scan_ident *ident, const char *path,
                               const char *sha256_hex) {
   struct scan_task *task = malloc(sizeof(*task));
 
@@ -2530,6 +2638,7 @@ static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
   task->next = NULL;
   task->reqid = reqid;
   task->pid = pid;
+  task->ident = *ident;
   snprintf(task->path, sizeof(task->path), "%s", path ? path : "");
   snprintf(task->sha256_hex, sizeof(task->sha256_hex), "%s",
            sha256_hex ? sha256_hex : "");
@@ -2584,7 +2693,7 @@ static void *scan_worker_main(void *arg) {
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
 
-    handle_scan_request(task->reqid, task->pid, task->path,
+    handle_scan_request(task->reqid, task->pid, &task->ident, task->path,
                         task->sha256_hex);
     free(task);
   }
@@ -3270,6 +3379,9 @@ static struct nla_policy av_policy[AV_A_MAX + 1] = {
     [AV_A_PID] = {.type = NLA_U32},
     [AV_A_PATH] = {.type = NLA_STRING, .maxlen = AV_PATH_ATTR_MAXLEN},
     [AV_A_SHA256] = {.type = NLA_STRING, .maxlen = AV_SHA256_ATTR_MAXLEN + 1},
+    [AV_A_DEV_MAJOR] = {.type = NLA_U32},
+    [AV_A_DEV_MINOR] = {.type = NLA_U32},
+    [AV_A_INO] = {.type = NLA_U64},
 };
 
 static int msg_handler(struct nl_msg *msg, void *arg) {
@@ -3323,13 +3435,23 @@ static int msg_handler(struct nl_msg *msg, void *arg) {
   }
 
   if (gnlh->cmd == AV_C_SCAN_REQUEST) {
+    struct scan_ident ident = {0};
+
     if (!attrs[AV_A_REQID] || !attrs[AV_A_PATH]) {
       fprintf(stderr, "avd: malformed SCAN_REQUEST (missing attrs)\n");
       return NL_SKIP;
     }
+    /* All three or none: a partial set is treated as absent (legacy
+     * by-path scan) rather than half-checked. */
+    if (attrs[AV_A_DEV_MAJOR] && attrs[AV_A_DEV_MINOR] && attrs[AV_A_INO]) {
+      ident.present = true;
+      ident.dev_major = nla_get_u32(attrs[AV_A_DEV_MAJOR]);
+      ident.dev_minor = nla_get_u32(attrs[AV_A_DEV_MINOR]);
+      ident.ino = nla_get_u64(attrs[AV_A_INO]);
+    }
     if (!enqueue_scan_task(
             nla_get_u64(attrs[AV_A_REQID]),
-            attrs[AV_A_PID] ? nla_get_u32(attrs[AV_A_PID]) : 0,
+            attrs[AV_A_PID] ? nla_get_u32(attrs[AV_A_PID]) : 0, &ident,
             nla_get_string(attrs[AV_A_PATH]),
             attrs[AV_A_SHA256] ? nla_get_string(attrs[AV_A_SHA256]) : ""))
       fprintf(stderr,
