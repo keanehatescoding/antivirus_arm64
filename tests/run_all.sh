@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# tests/run_all.sh - builds everything and runs both test scripts.
+# tests/run_all.sh - builds everything and runs all fourteen suites below.
 # Used by .githooks/pre-push, and safe to run manually any time:
 #   tests/run_all.sh
 #
