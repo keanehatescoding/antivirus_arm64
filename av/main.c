@@ -535,6 +535,100 @@ static void normalize_abs_path(char *path, size_t path_len) {
   kfree(tmp);
 }
 
+/* Lexically resolves `path` against `dirpath` (the dfd's directory) under
+ * RESOLVE_IN_ROOT semantics: every leading '/' and every '..' is scoped
+ * inside `dirpath`, so the result can never climb above it (mirroring
+ * the kernel's chroot-like resolution). Pure string manipulation, no
+ * filesystem access - same rationale as normalize_abs_path(). On
+ * allocation failure or an over-deep path, leaves `out` with a
+ * best-effort result rather than dropping the event. */
+static void normalize_in_root_path(const char *dirpath, const char *path,
+                                   char *out, size_t out_len) {
+  char *stack[128];
+  int depth = 0;
+  int base_depth = 0;
+  char *d_tmp;
+  char *u_tmp;
+  char *saveptr, *tok;
+  bool overflowed = false;
+  int i;
+
+  d_tmp = kstrdup(dirpath, GFP_KERNEL);
+  u_tmp = kstrdup(path, GFP_KERNEL);
+  if (!d_tmp || !u_tmp) {
+    /* Degraded: keep the raw path rather than a partial result. */
+    strscpy(out, path, out_len);
+    kfree(d_tmp);
+    kfree(u_tmp);
+    return;
+  }
+
+  /* Base components: the dfd's own directory, which is the root of
+   * the scoped resolution and can never be popped by '..'. */
+  saveptr = d_tmp;
+  while ((tok = strsep(&saveptr, "/")) != NULL) {
+    if (tok[0] == '\0' || (tok[0] == '.' && tok[1] == '\0'))
+      continue;
+    if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0') {
+      if (depth > 0)
+        depth--;
+      continue;
+    }
+    if (depth < (int)ARRAY_SIZE(stack)) {
+      stack[depth++] = tok;
+    } else {
+      overflowed = true;
+      break;
+    }
+  }
+  base_depth = depth;
+
+  if (!overflowed) {
+    char *cursor = u_tmp;
+
+    /* Strip leading slashes - under RESOLVE_IN_ROOT they do not denote
+     * the filesystem root, just the scoped one. */
+    while (*cursor == '/')
+      cursor++;
+
+    saveptr = cursor;
+    while ((tok = strsep(&saveptr, "/")) != NULL) {
+      if (tok[0] == '\0' || (tok[0] == '.' && tok[1] == '\0'))
+        continue;
+      if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0') {
+        if (depth > base_depth)
+          depth--;
+        /* else: stay at the scoped root */
+        continue;
+      }
+      if (depth < (int)ARRAY_SIZE(stack)) {
+        stack[depth++] = tok;
+      } else {
+        overflowed = true;
+        break;
+      }
+    }
+  }
+
+  if (overflowed) {
+    strscpy(out, path, out_len);
+    kfree(d_tmp);
+    kfree(u_tmp);
+    return;
+  }
+
+  out[0] = '\0';
+  if (depth == 0)
+    strlcat(out, "/", out_len);
+  for (i = 0; i < depth; i++) {
+    strlcat(out, "/", out_len);
+    strlcat(out, stack[i], out_len);
+  }
+
+  kfree(d_tmp);
+  kfree(u_tmp);
+}
+
 /* Resolves `path` into a NUL-terminated absolute path string written
  * into `out` (capacity out_len), using `base` (captured by
  * resolve_dfd_path() above, in atomic context, back when `path` was
@@ -560,10 +654,41 @@ static void normalize_abs_path(char *path, size_t path_len) {
  * failure this falls back to copying `path` through unresolved rather
  * than dropping the event - a degraded (pre-fix) check on this one
  * call is better than silently skipping it. */
+#ifndef RESOLVE_IN_ROOT
+#define RESOLVE_IN_ROOT 0x10
+#endif
+
+static void normalize_in_root_path(const char *dirpath, const char *path,
+                                   char *out, size_t out_len);
+
 static void resolve_absolute_path(const char *path, const struct path *base,
-                                  char *out, size_t out_len) {
+                                  char *out, size_t out_len, u64 resolve) {
   char *tmp;
   char *dirpath;
+  bool in_root = (resolve & RESOLVE_IN_ROOT) != 0;
+
+  /* RESOLVE_IN_ROOT scopes every path - including one that starts with
+   * '/' or contains '..' - inside the dfd's directory, mirroring the
+   * kernel's chroot-like resolution. Treat such a path as relative to
+   * `base` rather than as an absolute filesystem path. */
+  if (in_root) {
+    tmp = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!tmp) {
+      strscpy(out, path, out_len);
+      return;
+    }
+
+    dirpath = d_path(base, tmp, PATH_MAX);
+    if (IS_ERR(dirpath)) {
+      strscpy(out, path, out_len);
+      kfree(tmp);
+      return;
+    }
+
+    normalize_in_root_path(dirpath, path, out, out_len);
+    kfree(tmp);
+    return;
+  }
 
   if (path[0] == '/') {
     strscpy(out, path, out_len);
@@ -1338,7 +1463,7 @@ static char *av_exec_lexical_path(const struct av_work *aw,
   buf = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!buf)
     return NULL;
-  resolve_absolute_path(aw->exec_name, &aw->pwd, buf, PATH_MAX);
+  resolve_absolute_path(aw->exec_name, &aw->pwd, buf, PATH_MAX, 0);
   if (buf[0] != '/' || !strcmp(buf, canonical) ||
       strcmp(kbasename(buf), kbasename(canonical)) ||
       !av_exec_key_names_file(aw, buf)) {
@@ -1748,6 +1873,9 @@ struct av_openat_work {
               * writes across threads, since each thread got its own
               * independent counter. */
   int flags;
+  u64 resolve; /* openat2 how.resolve, preserved so scoped-root
+                * semantics (RESOLVE_IN_ROOT) survive into path
+                * resolution and dedup. 0 for plain openat. */
   struct path base; /* dfd resolved to a struct path at kprobe time -
                      * see resolve_dfd_path(). `path` below is
                      * resolved against THIS in av_openat_work_fn(),
@@ -1770,7 +1898,7 @@ static void av_openat_work_fn(struct work_struct *w) {
     return;
   }
 
-  resolve_absolute_path(ow->path, &ow->base, abs_path, PATH_MAX);
+  resolve_absolute_path(ow->path, &ow->base, abs_path, PATH_MAX, ow->resolve);
   av_behavior_check_openat(ow->pid, abs_path, ow->flags, ow->target_pid);
 
   kfree(abs_path);
@@ -1796,7 +1924,7 @@ static void av_openat_work_fn(struct work_struct *w) {
  * /etc/shadow while behavior.c only ever saw the bare string
  * "shadow". */
 static void schedule_openat_work(const char __user *user_filename, int dfd,
-                                 int flags) {
+                                 int flags, u64 resolve) {
   struct av_openat_work *ow;
   struct path base;
 
@@ -1841,6 +1969,7 @@ static void schedule_openat_work(const char __user *user_filename, int dfd,
   }
 
   ow->flags = flags;
+  ow->resolve = resolve;
   ow->pid = task_tgid_nr(current);
   ow->target_pid = get_task_pid(current, PIDTYPE_PID);
   INIT_WORK(&ow->work, av_openat_work_fn);
@@ -1854,7 +1983,7 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
     return 0;
 
   schedule_openat_work((const char __user *)real_regs->regs[1],
-                       (int)real_regs->regs[0], (int)real_regs->regs[2]);
+                       (int)real_regs->regs[0], (int)real_regs->regs[2], 0);
 
   return 0;
 }
@@ -1909,7 +2038,7 @@ static int handler_pre_openat2(struct kprobe *p, struct pt_regs *regs) {
                      sizeof(how)))
     return 0;
 
-  schedule_openat_work(user_filename, dfd, (int)how.flags);
+  schedule_openat_work(user_filename, dfd, (int)how.flags, how.resolve);
 
   return 0;
 }
@@ -1943,7 +2072,7 @@ static void av_unlink_work_fn(struct work_struct *w) {
     return;
   }
 
-  resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX);
+  resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX, 0);
   av_behavior_check_unlink(uw->pid, abs_path, uw->target_pid);
 
   kfree(abs_path);
@@ -2069,8 +2198,8 @@ static void av_rename_work_fn(struct work_struct *w) {
     return;
   }
 
-  resolve_absolute_path(rw->oldpath, &rw->old_base, abs_old, PATH_MAX);
-  resolve_absolute_path(rw->newpath, &rw->new_base, abs_new, PATH_MAX);
+  resolve_absolute_path(rw->oldpath, &rw->old_base, abs_old, PATH_MAX, 0);
+  resolve_absolute_path(rw->newpath, &rw->new_base, abs_new, PATH_MAX, 0);
   av_behavior_check_rename(rw->pid, abs_old, abs_new, rw->target_pid);
 
   kfree(abs_new);
