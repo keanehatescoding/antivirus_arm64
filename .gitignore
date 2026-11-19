@@ -9,6 +9,8 @@ __pycache__/
 *.mod.o
 *.symvers
 *.order
+# Kernel build dependency files
+.*.o.d
 .tmp_versions/
 .*.cmd
 Module.symvers

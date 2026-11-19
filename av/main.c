@@ -278,7 +278,7 @@ static struct kprobe kp_openat = {
  * counter) completely, unlike the rename side, which has probed
  * renameat2() all along. */
 static struct kprobe kp_openat2 = {
-    .symbol_name = "__arm64_sys_openat2",
+    .symbol_name = "do_sys_openat2",
 };
 /* No kp_unlink/kp_rename here: arm64's native syscall table (see
  * include/uapi/asm-generic/unistd.h) never had raw unlink(2)/rename(2)
@@ -535,122 +535,6 @@ static void normalize_abs_path(char *path, size_t path_len) {
   kfree(tmp);
 }
 
-/* Lexically resolves `path` against `dirpath` (the dfd's directory) under
- * RESOLVE_IN_ROOT semantics: every leading '/' and every '..' is scoped
- * inside `dirpath`, so the result can never climb above it (mirroring
- * the kernel's chroot-like resolution). Pure string manipulation, no
- * filesystem access - same rationale as normalize_abs_path(). On
- * allocation failure or an over-deep path, leaves `out` with a
- * best-effort result rather than dropping the event. */
-static void normalize_in_root_path(const char *dirpath, const char *path,
-                                   char *out, size_t out_len) {
-  char *stack[128];
-  int depth = 0;
-  int base_depth = 0;
-  char *d_tmp;
-  char *u_tmp;
-  char *saveptr, *tok;
-  bool overflowed = false;
-  int i;
-
-  d_tmp = kstrdup(dirpath, GFP_KERNEL);
-  u_tmp = kstrdup(path, GFP_KERNEL);
-  if (!d_tmp || !u_tmp) {
-    /* Degraded: keep a root-aware identity when it fits, else the raw
-     * path - never a truncated string. */
-    int _need = snprintf(out, out_len, "%s/%s", dirpath, path);
-    if (_need < 0 || (size_t)_need >= out_len)
-      strscpy(out, path, out_len);
-    kfree(d_tmp);
-    kfree(u_tmp);
-    return;
-  }
-
-  /* Base components: the dfd's own directory, which is the root of
-   * the scoped resolution and can never be popped by '..'. */
-  saveptr = d_tmp;
-  while ((tok = strsep(&saveptr, "/")) != NULL) {
-    if (tok[0] == '\0' || (tok[0] == '.' && tok[1] == '\0'))
-      continue;
-    if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0') {
-      if (depth > 0)
-        depth--;
-      continue;
-    }
-    if (depth < (int)ARRAY_SIZE(stack)) {
-      stack[depth++] = tok;
-    } else {
-      overflowed = true;
-      break;
-    }
-  }
-  base_depth = depth;
-
-  if (!overflowed) {
-    char *cursor = u_tmp;
-
-    /* Strip leading slashes - under RESOLVE_IN_ROOT they do not denote
-     * the filesystem root, just the scoped one. */
-    while (*cursor == '/')
-      cursor++;
-
-    saveptr = cursor;
-    while ((tok = strsep(&saveptr, "/")) != NULL) {
-      if (tok[0] == '\0' || (tok[0] == '.' && tok[1] == '\0'))
-        continue;
-      if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0') {
-        if (depth > base_depth)
-          depth--;
-        /* else: stay at the scoped root */
-        continue;
-      }
-      if (depth < (int)ARRAY_SIZE(stack)) {
-        stack[depth++] = tok;
-      } else {
-        overflowed = true;
-        break;
-      }
-    }
-  }
-
-  if (overflowed) {
-    int _need = snprintf(out, out_len, "%s/%s", dirpath, path);
-    if (_need < 0 || (size_t)_need >= out_len)
-      strscpy(out, path, out_len);
-    kfree(d_tmp);
-    kfree(u_tmp);
-    return;
-  }
-
-  {
-    size_t _total = 0;
-    if (depth == 0)
-      _total = 1;
-    else
-      for (i = 0; i < depth; i++)
-        _total += 1 + strlen(stack[i]);
-    if (_total >= out_len) {
-      int _need = snprintf(out, out_len, "%s/%s", dirpath, path);
-      if (_need < 0 || (size_t)_need >= out_len)
-        strscpy(out, path, out_len);
-      kfree(d_tmp);
-      kfree(u_tmp);
-      return;
-    }
-  }
-
-  out[0] = '\0';
-  if (depth == 0)
-    strlcat(out, "/", out_len);
-  for (i = 0; i < depth; i++) {
-    strlcat(out, "/", out_len);
-    strlcat(out, stack[i], out_len);
-  }
-
-  kfree(d_tmp);
-  kfree(u_tmp);
-}
-
 /* Resolves `path` into a NUL-terminated absolute path string written
  * into `out` (capacity out_len), using `base` (captured by
  * resolve_dfd_path() above, in atomic context, back when `path` was
@@ -676,41 +560,10 @@ static void normalize_in_root_path(const char *dirpath, const char *path,
  * failure this falls back to copying `path` through unresolved rather
  * than dropping the event - a degraded (pre-fix) check on this one
  * call is better than silently skipping it. */
-#ifndef RESOLVE_IN_ROOT
-#define RESOLVE_IN_ROOT 0x10
-#endif
-
-static void normalize_in_root_path(const char *dirpath, const char *path,
-                                   char *out, size_t out_len);
-
 static void resolve_absolute_path(const char *path, const struct path *base,
-                                  char *out, size_t out_len, u64 resolve) {
+                                  char *out, size_t out_len) {
   char *tmp;
   char *dirpath;
-  bool in_root = (resolve & RESOLVE_IN_ROOT) != 0;
-
-  /* RESOLVE_IN_ROOT scopes every path - including one that starts with
-   * '/' or contains '..' - inside the dfd's directory, mirroring the
-   * kernel's chroot-like resolution. Treat such a path as relative to
-   * `base` rather than as an absolute filesystem path. */
-  if (in_root) {
-    tmp = kmalloc(PATH_MAX, GFP_KERNEL);
-    if (!tmp) {
-      strscpy(out, path, out_len);
-      return;
-    }
-
-    dirpath = d_path(base, tmp, PATH_MAX);
-    if (IS_ERR(dirpath)) {
-      strscpy(out, path, out_len);
-      kfree(tmp);
-      return;
-    }
-
-    normalize_in_root_path(dirpath, path, out, out_len);
-    kfree(tmp);
-    return;
-  }
 
   if (path[0] == '/') {
     strscpy(out, path, out_len);
@@ -1485,7 +1338,7 @@ static char *av_exec_lexical_path(const struct av_work *aw,
   buf = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!buf)
     return NULL;
-  resolve_absolute_path(aw->exec_name, &aw->pwd, buf, PATH_MAX, 0);
+  resolve_absolute_path(aw->exec_name, &aw->pwd, buf, PATH_MAX);
   if (buf[0] != '/' || !strcmp(buf, canonical) ||
       strcmp(kbasename(buf), kbasename(canonical)) ||
       !av_exec_key_names_file(aw, buf)) {
@@ -1895,9 +1748,6 @@ struct av_openat_work {
               * writes across threads, since each thread got its own
               * independent counter. */
   int flags;
-  u64 resolve; /* openat2 how.resolve, preserved so scoped-root
-                * semantics (RESOLVE_IN_ROOT) survive into path
-                * resolution and dedup. 0 for plain openat. */
   struct path base; /* dfd resolved to a struct path at kprobe time -
                      * see resolve_dfd_path(). `path` below is
                      * resolved against THIS in av_openat_work_fn(),
@@ -1920,7 +1770,7 @@ static void av_openat_work_fn(struct work_struct *w) {
     return;
   }
 
-  resolve_absolute_path(ow->path, &ow->base, abs_path, PATH_MAX, ow->resolve);
+  resolve_absolute_path(ow->path, &ow->base, abs_path, PATH_MAX);
   av_behavior_check_openat(ow->pid, abs_path, ow->flags, ow->target_pid);
 
   kfree(abs_path);
@@ -1946,7 +1796,7 @@ static void av_openat_work_fn(struct work_struct *w) {
  * /etc/shadow while behavior.c only ever saw the bare string
  * "shadow". */
 static void schedule_openat_work(const char __user *user_filename, int dfd,
-                                 int flags, u64 resolve) {
+                                 int flags) {
   struct av_openat_work *ow;
   struct path base;
 
@@ -1960,11 +1810,22 @@ static void schedule_openat_work(const char __user *user_filename, int dfd,
   if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)))
     return;
 
-  /* Resolve dfd BEFORE allocating/copying anything else - if the fd
-   * doesn't resolve (bogus/racing close) there's nothing useful to
-   * queue work for. */
-  if (!resolve_dfd_path(dfd, &base))
-    return;
+  /* Resolve dfd before allocating/copying anything else. An invalid dfd
+   * normally means there's nothing useful to queue work for - but Linux
+   * ignores dfd entirely for an absolute, unscoped pathname (dfd only
+   * matters for relative paths), so such an
+   * open can still succeed and must not be dropped. Provide a referenced
+   * cwd base (compatible with the worker's unconditional path_put()) in
+   * that case; relative/scoped paths still require a real dfd. */
+  if (!resolve_dfd_path(dfd, &base)) {
+    char first = '\0';
+
+    if (get_user(first, user_filename))
+      return;
+    if (first != '/')
+      return;
+    get_fs_pwd(current->fs, &base);
+  }
 
   if (!av_work_admit_nonexec()) {
     path_put(&base);
@@ -1991,7 +1852,6 @@ static void schedule_openat_work(const char __user *user_filename, int dfd,
   }
 
   ow->flags = flags;
-  ow->resolve = resolve;
   ow->pid = task_tgid_nr(current);
   ow->target_pid = get_task_pid(current, PIDTYPE_PID);
   INIT_WORK(&ow->work, av_openat_work_fn);
@@ -2005,7 +1865,7 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
     return 0;
 
   schedule_openat_work((const char __user *)real_regs->regs[1],
-                       (int)real_regs->regs[0], (int)real_regs->regs[2], 0);
+                       (int)real_regs->regs[0], (int)real_regs->regs[2]);
 
   return 0;
 }
@@ -2020,47 +1880,36 @@ struct av_open_how {
   u64 resolve;
 };
 
-/* openat2(int dfd, const char __user *filename, struct open_how __user *how,
- * size_t size) - same arm64 register mapping as openat (dfd still first,
- * filename second), with the open flags reachable only through the
- * user-provided `how` rather than a plain int argument. `how` is copied
- * out here, in the atomic pre-handler, the same way the pathname is:
- * copy_from_user() from a possibly-not-yet-resident page is exactly what
- * the exec hook moved away from (issue #2), but here a failed copy costs
- * one heuristic event, not the whole exec check - behavior.c's hooks have
- * always treated a path they could not copy as a dropped event.
- *
- * `size` is validated by the kernel itself: anything below
- * sizeof(struct open_how) is answered -EINVAL before any file is opened,
- * so there is no event to record and this hook leaves it alone. A larger
- * size is a forward-compatible caller the kernel accepts, and the copy
- * is still bounded by this struct's size. Only the low 32 bits of
- * how->flags can ever hold an O_* bit; the upper half carries
- * openat2-only open flags (e.g. OPENAT2_REGULAR), which the heuristics
- * do not key on - exactly matching how the openat hook reads its `int
- * flags` argument. */
+/* openat2 is hooked at do_sys_openat2() rather than the arm64 syscall
+ * wrapper: by that point the kernel has already copied the caller's
+ * struct open_how into kernel-owned memory via copy_struct_from_user(),
+ * so the handler reads a kernel pointer (no user-memory faults) and
+ * observes the same flags the kernel acts on. `size` validation happens
+ * in the wrapper, so a too-small how never reaches this hook. Only the
+ * low 32 bits of how->flags can ever hold an O_* bit; the upper half
+ * carries openat2-only open flags (e.g. OPENAT2_REGULAR), which the
+ * heuristics do not key on - exactly matching how the openat hook reads
+ * its `int flags` argument. */
+/* cppcheck-suppress constParameterCallback */
 static int handler_pre_openat2(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
-  const char __user *user_filename;
-  struct av_open_how how;
-  unsigned long size;
-  int dfd;
+  int dfd = (int)regs->regs[0];
+  const char __user *user_filename = (const char __user *)regs->regs[1];
+  const struct av_open_how *how = (const struct av_open_how *)regs->regs[2];
+  struct av_open_how khow;
 
-  if (!real_regs)
+  /* do_sys_openat2() is reached only after the syscall wrapper has
+   * successfully copied the caller's struct open_how into kernel-owned
+   * memory, so `how` points at that kernel copy rather than userspace -
+   * read it directly (no copy_from_user / user-fault handling) and
+   * observe the same flags the kernel will act on. */
+  if (!user_filename || !how)
     return 0;
 
-  dfd = (int)real_regs->regs[0];
-  user_filename = (const char __user *)real_regs->regs[1];
-  size = (unsigned long)real_regs->regs[3];
-  if (!user_filename || size < sizeof(how))
+  memset(&khow, 0, sizeof(khow));
+  if (copy_from_kernel_nofault(&khow, how, sizeof(khow)))
     return 0;
 
-  memset(&how, 0, sizeof(how));
-  if (copy_from_user(&how, (const void __user *)real_regs->regs[2],
-                     sizeof(how)))
-    return 0;
-
-  schedule_openat_work(user_filename, dfd, (int)how.flags, how.resolve);
+  schedule_openat_work(user_filename, dfd, (int)khow.flags);
 
   return 0;
 }
@@ -2094,7 +1943,7 @@ static void av_unlink_work_fn(struct work_struct *w) {
     return;
   }
 
-  resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX, 0);
+  resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX);
   av_behavior_check_unlink(uw->pid, abs_path, uw->target_pid);
 
   kfree(abs_path);
@@ -2220,8 +2069,8 @@ static void av_rename_work_fn(struct work_struct *w) {
     return;
   }
 
-  resolve_absolute_path(rw->oldpath, &rw->old_base, abs_old, PATH_MAX, 0);
-  resolve_absolute_path(rw->newpath, &rw->new_base, abs_new, PATH_MAX, 0);
+  resolve_absolute_path(rw->oldpath, &rw->old_base, abs_old, PATH_MAX);
+  resolve_absolute_path(rw->newpath, &rw->new_base, abs_new, PATH_MAX);
   av_behavior_check_rename(rw->pid, abs_old, abs_new, rw->target_pid);
 
   kfree(abs_new);
