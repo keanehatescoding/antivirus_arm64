@@ -556,8 +556,11 @@ static void normalize_in_root_path(const char *dirpath, const char *path,
   d_tmp = kstrdup(dirpath, GFP_KERNEL);
   u_tmp = kstrdup(path, GFP_KERNEL);
   if (!d_tmp || !u_tmp) {
-    /* Degraded: keep the raw path rather than a partial result. */
-    strscpy(out, path, out_len);
+    /* Degraded: keep a root-aware identity when it fits, else the raw
+     * path - never a truncated string. */
+    int _need = snprintf(out, out_len, "%s/%s", dirpath, path);
+    if (_need < 0 || (size_t)_need >= out_len)
+      strscpy(out, path, out_len);
     kfree(d_tmp);
     kfree(u_tmp);
     return;
@@ -611,10 +614,29 @@ static void normalize_in_root_path(const char *dirpath, const char *path,
   }
 
   if (overflowed) {
-    strscpy(out, path, out_len);
+    int _need = snprintf(out, out_len, "%s/%s", dirpath, path);
+    if (_need < 0 || (size_t)_need >= out_len)
+      strscpy(out, path, out_len);
     kfree(d_tmp);
     kfree(u_tmp);
     return;
+  }
+
+  {
+    size_t _total = 0;
+    if (depth == 0)
+      _total = 1;
+    else
+      for (i = 0; i < depth; i++)
+        _total += 1 + strlen(stack[i]);
+    if (_total >= out_len) {
+      int _need = snprintf(out, out_len, "%s/%s", dirpath, path);
+      if (_need < 0 || (size_t)_need >= out_len)
+        strscpy(out, path, out_len);
+      kfree(d_tmp);
+      kfree(u_tmp);
+      return;
+    }
   }
 
   out[0] = '\0';
