@@ -2263,7 +2263,16 @@ static bool unlink_dir_is(const struct path *root, const char *spelled,
  * exe file is looked up here and dropped before returning. Any failure
  * returns false, which only drops the lexical-key match, like
  * unlink_dir_is(). A process that swaps its exe with PR_SET_MM_EXE_FILE
- * is judged by the file it holds at this point. */
+ * is judged by the file it holds at this point.
+ *
+ * Native executables only. For a shebang script mm->exe_file is the
+ * interpreter, so its name never equals the script's and this returns
+ * false: a script that is moved, has its directory alias repointed and
+ * then unlinks itself through the alias is NOT caught by this fallback,
+ * where the earlier lexical-only match did catch it. Closing that needs
+ * the file identity recorded at exec compared with the inode captured at
+ * unlink time, which the atomic unlinkat probe cannot read (issue
+ * #230). */
 static bool unlink_names_held_exe(struct pid *target_pid,
                                   const struct path *root,
                                   const char *spelled) {
