@@ -92,6 +92,7 @@
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/kdev_t.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
@@ -386,6 +387,36 @@ module_param(av_toctou_test_delay_ms, int, 0644);
 MODULE_PARM_DESC(av_toctou_test_delay_ms,
                  "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove the digest still comes from the executed image (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
+/* TEST ONLY: a barrier placed after av_work_fn()'s d_path() and before
+ * av_exec_lexical_path(). The QEMU boot test renames the image while the
+ * exec worker of ONE tgid is parked here, to check that the lexical key is
+ * validated against the file's current name and parent, not the d_path()
+ * string. A fixed sleep could not prove the rename came first: a slow
+ * parent resumes after the sleep and the worker validates the original
+ * image, so the case passed without running the race. Instead the worker
+ * bumps av_lexkey_test_parked on reaching the barrier (the test's
+ * acknowledgement) and waits until av_lexkey_test_hold is cleared, which
+ * the test does only after the rename and alias change are done.
+ *
+ * Default 0 = disabled, so production is unaffected (the barrier is not
+ * even entered). Scoped to av_lexkey_test_hold_tgid so no unrelated exec
+ * can park or ack. The wait is capped at AV_LEXKEY_TEST_HOLD_MAX_MS, so a
+ * test that dies cannot wedge a worker. The _test_ infix marks these as
+ * never operational knobs. */
+#define AV_LEXKEY_TEST_HOLD_MAX_MS 5000
+static int av_lexkey_test_hold;      /* = 0: disabled unless a test sets it */
+static int av_lexkey_test_hold_tgid; /* only this tgid's worker parks */
+static int av_lexkey_test_parked;    /* ack: workers that reached the barrier */
+module_param(av_lexkey_test_hold, int, 0644);
+MODULE_PARM_DESC(av_lexkey_test_hold,
+                 "TEST ONLY: 1 parks the exec worker of av_lexkey_test_hold_tgid between d_path() and its lexical self-delete key check until cleared (capped at 5s); never set in production");
+module_param(av_lexkey_test_hold_tgid, int, 0644);
+MODULE_PARM_DESC(av_lexkey_test_hold_tgid,
+                 "TEST ONLY: tgid whose exec worker av_lexkey_test_hold parks");
+module_param(av_lexkey_test_parked, int, 0444);
+MODULE_PARM_DESC(av_lexkey_test_parked,
+                 "TEST ONLY: number of exec workers that reached the lexical key barrier");
+
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
     atomic_dec(&av_inflight_work);
@@ -552,14 +583,89 @@ static void normalize_abs_path(char *path, size_t path_len) {
  * failure this falls back to copying `path` through unresolved rather
  * than dropping the event - a degraded (pre-fix) check on this one
  * call is better than silently skipping it. */
-static void resolve_absolute_path(const char *path, const struct path *base,
-                                  char *out, size_t out_len) {
+/* True when `root` is this worker's own root, i.e. names d_path()
+ * spells from here are also spelled from `root`. Any failure says no,
+ * which only costs the caller an optimization. */
+static bool av_root_is_workers(const struct path *root) {
+  char *buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  char *p;
+  bool same;
+
+  if (!buf)
+    return false;
+  p = d_path(root, buf, PATH_MAX);
+  same = !IS_ERR(p) && !strcmp(p, "/");
+  kfree(buf);
+  return same;
+}
+
+/* d_path() spells `base` from this worker's root, which is not the
+ * root the task resolved its names from once it has chroot()ed: there
+ * a task rooted at /j that unlinks "alias/tool" from its "/" removes
+ * the host's /j/alias/tool, which d_path() spells "/j/alias/tool" - the
+ * same string as the task's own absolute "/j/alias/tool", which is the
+ * host's /j/j/alias/tool. The self-delete check's lexical key and its
+ * unlink_dir_is() lookup both work in the task's coordinates (absolute
+ * spellings arrive that way, and the lookups start at the captured
+ * root), so a relative spelling has to be rendered there too, or the
+ * two collide (CodeRabbit on x86 #229).
+ *
+ * Only d_path() is exported, not __d_path(), so this renders `root`
+ * the same way and strips it as a prefix, after path_is_under() has
+ * confirmed `base` lies beneath it. Rewrites `dirpath` (d_path()'s
+ * rendering of `base`, in a buffer the caller owns) and returns the
+ * root-relative spelling, which points into that buffer, or an
+ * ERR_PTR when there is none: `base` outside `root` (a cwd left
+ * outside a chroot), or a rendering that doesn't start with root's. */
+static char *av_rebase_on_root(char *dirpath, const struct path *base,
+                               const struct path *root) {
+  char *buf, *rootpath;
+  char *ret = ERR_PTR(-EXDEV);
+
+  if (!path_is_under(base, root))
+    return ERR_PTR(-EXDEV);
+  buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  if (!buf)
+    return ERR_PTR(-ENOMEM);
+  rootpath = d_path(root, buf, PATH_MAX);
+  if (IS_ERR(rootpath)) {
+    ret = rootpath;
+  } else if (!strcmp(rootpath, "/")) {
+    ret = dirpath; /* not chrooted: nothing to strip */
+  } else {
+    size_t len = strlen(rootpath);
+
+    if (!strncmp(dirpath, rootpath, len)) {
+      if (dirpath[len] == '/') {
+        ret = dirpath + len;
+      } else if (!dirpath[len]) {
+        /* `base` is the root itself: "/". len >= 2 here, so the
+         * byte before the terminator is root's last character,
+         * which is no longer needed. */
+        dirpath[len - 1] = '/';
+        ret = dirpath + len - 1;
+      }
+    }
+  }
+  kfree(buf);
+  return ret;
+}
+
+/* `root`, when non-NULL, renders a relative `path` from that root
+ * instead of this worker's (see av_rebase_on_root()); when `base` lies
+ * outside it the result is the unresolved fallback, which no
+ * self-delete key ever matches. An absolute `path` is already spelled
+ * from the task's root and is used as is. */
+static void join_base_path(const char *path, const struct path *base,
+                           const struct path *root, char *out,
+                           size_t out_len, bool normalize) {
   char *tmp;
   char *dirpath;
 
   if (path[0] == '/') {
     strscpy(out, path, out_len);
-    normalize_abs_path(out, out_len);
+    if (normalize)
+      normalize_abs_path(out, out_len);
     return;
   }
 
@@ -570,6 +676,8 @@ static void resolve_absolute_path(const char *path, const struct path *base,
   }
 
   dirpath = d_path(base, tmp, PATH_MAX);
+  if (!IS_ERR(dirpath) && root)
+    dirpath = av_rebase_on_root(dirpath, base, root);
   if (IS_ERR(dirpath))
     strscpy(out, path, out_len);
   else {
@@ -611,11 +719,50 @@ static void resolve_absolute_path(const char *path, const struct path *base,
 
     if (need < 0 || (size_t)need >= out_len)
       strscpy(out, path, out_len);
-    else
+    else if (normalize)
       normalize_abs_path(out, out_len);
   }
 
   kfree(tmp);
+}
+
+static void resolve_absolute_path(const char *path, const struct path *base,
+                                  char *out, size_t out_len) {
+  join_base_path(path, base, NULL, out, out_len, true);
+}
+
+/* The unlink target made absolute but spelled exactly as the syscall
+ * walks it: no "." / ".." collapsing. The kernel follows a directory
+ * symlink before applying a ".." after it, so the collapsed spelling
+ * can name a different directory than the one the unlink touches. The
+ * self-delete check confirms its lexical match against this (see
+ * unlink_dir_is() in behavior.c). Spelled from `root`, the unlinking
+ * task's own, which is where unlink_dir_is() resolves it from and
+ * where the exec's lexical key was spelled (see av_rebase_on_root()).
+ * Returns NULL when that spelling is unavailable, which only drops a
+ * lexical-key match; *owned is set when the result must be
+ * kfree()d. */
+static const char *unlink_spelled_path(const char *path,
+                                       const struct path *base,
+                                       const struct path *root,
+                                       char **owned) {
+  char *buf;
+
+  *owned = NULL;
+  if (path[0] == '/')
+    return path;
+  if (!root)
+    return NULL;
+  buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  if (!buf)
+    return NULL;
+  join_base_path(path, base, root, buf, PATH_MAX, false);
+  if (buf[0] != '/') {
+    kfree(buf);
+    return NULL;
+  }
+  *owned = buf;
+  return buf;
 }
 
 struct av_work {
@@ -1245,16 +1392,36 @@ static const char *av_exec_self_delete_key(const struct file *f,
   return kstrndup(canonical, len - sfx_len, GFP_KERNEL) ?: canonical;
 }
 
-/* True when `key` (an absolute, lexically normalized name for the
- * executed file) names aw->file itself: its directory, resolved
- * following symlinks from the exec'ing task's root, is the directory
- * entry the executed dentry hangs off, on the same mount. Same
- * directory plus same final name (checked by the caller) means the
- * same directory entry. So a key that differs from d_path() only
- * because a DIRECTORY on the way is a symlink is accepted, and one
- * whose final component is a symlink to the file (/tmp/link/tool ->
- * /tmp/real/tool) is rejected even though the basenames match:
- * unlinking it only removes the symlink (CodeRabbit on x86 #229).
+/* True when `key` (an absolute name for the executed file, spelled
+ * as exec walked it, not collapsed: see av_exec_lexical_path()) names
+ * aw->file itself: its directory, resolved following symlinks from the
+ * exec'ing task's root, is the directory entry the executed dentry
+ * hangs off, on the same mount, and its final component is that
+ * dentry's name. Same directory plus same final name means the same
+ * directory entry. So a key
+ * that differs from d_path() only because a DIRECTORY on the way is a
+ * symlink is accepted, and one whose final component is a symlink to
+ * the file (/tmp/link/tool -> /tmp/real/tool) is rejected even though
+ * the basenames match: unlinking it only removes the symlink
+ * (CodeRabbit on x86 #229).
+ *
+ * The name and the parent are read from the dentry together, inside
+ * one d_seq window, which __d_move() bumps around changing both. The
+ * final component used to be compared with the earlier d_path()
+ * string instead, so a rename in between could pair the old name with
+ * the new parent: exec /tmp/alias/tool (alias -> /tmp/a), and after
+ * d_path() move the image to /tmp/b/renamed and point the alias at
+ * /tmp/b. "tool" still matched the stale string, /tmp/alias resolved
+ * to the image's new parent, and an unlink of /tmp/alias/tool, an
+ * unrelated /tmp/b/tool, was taken for a self-delete (CodeRabbit on
+ * x86 #229). A dentry still being renamed after a few tries loses
+ * the key, like any other failure here.
+ *
+ * On success *parent_out holds a reference to the parent it validated,
+ * for the caller to record and then dput(). Reading the parent again
+ * later could see a different one if the image was renamed in between,
+ * recording a directory the key was never checked against (CodeRabbit
+ * on #229). On failure *parent_out is left alone.
  *
  * The parent is compared rather than the file, so an image already
  * unlinked before this runs still passes: its dentry keeps d_parent.
@@ -1264,14 +1431,18 @@ static const char *av_exec_self_delete_key(const struct file *f,
  * chroot or mount namespace, whose names d_path() here does not
  * spell; /dev/fd and /proc/self links, which resolve against this
  * worker), returns false and loses only the second key. */
+#define AV_EXEC_KEY_SNAPSHOT_TRIES 4
 static bool av_exec_key_names_file(const struct av_work *aw,
-                                   const char *key) {
+                                   const char *key,
+                                   struct dentry **parent_out) {
+  struct dentry *dentry = aw->file->f_path.dentry;
   const char *slash = strrchr(key, '/');
+  struct name_snapshot name;
   struct dentry *parent;
   struct path dir;
   char *dirname;
   bool same;
-  int err;
+  int err, tries = 0;
 
   if (!aw->has_root || !slash)
     return false;
@@ -1284,10 +1455,28 @@ static bool av_exec_key_names_file(const struct av_work *aw,
   if (err)
     return false;
 
-  parent = dget_parent(aw->file->f_path.dentry);
-  same = dir.mnt == aw->file->f_path.mnt && dir.dentry == parent;
-  dput(parent);
+  for (;;) {
+    unsigned int seq = read_seqcount_begin(&dentry->d_seq);
+
+    parent = dget_parent(dentry);
+    take_dentry_name_snapshot(&name, dentry);
+    if (!read_seqcount_retry(&dentry->d_seq, seq))
+      break;
+    release_dentry_name_snapshot(&name);
+    dput(parent);
+    if (++tries == AV_EXEC_KEY_SNAPSHOT_TRIES) {
+      path_put(&dir);
+      return false;
+    }
+  }
+  same = dir.mnt == aw->file->f_path.mnt && dir.dentry == parent &&
+         !strcmp((const char *)name.name.name, slash + 1);
+  release_dentry_name_snapshot(&name);
   path_put(&dir);
+  if (same)
+    *parent_out = parent;
+  else
+    dput(parent);
   return same;
 }
 
@@ -1316,28 +1505,53 @@ static bool av_exec_key_names_file(const struct av_work *aw,
  * FILE itself, whether the final name differs (/usr/bin/python ->
  * python3.12) or matches (/tmp/link/tool -> /tmp/real/tool); unlinking
  * that name only removes the symlink, so it must not count as deleting
- * the executed binary. The basename comparison is the cheap filter;
- * av_exec_key_names_file() is the identity check. */
+ * the executed binary. av_exec_key_names_file() is the identity check;
+ * it compares the final component with the dentry's current name, not
+ * with `canonical`, which a rename since d_path() can leave stale. */
 static char *av_exec_lexical_path(const struct av_work *aw,
-                                  const char *canonical) {
+                                  const char *canonical,
+                                  struct dentry **parent_out) {
   char *buf;
 
+  *parent_out = NULL;
   if (!aw->exec_name || canonical[0] != '/')
     return NULL;
-  if (aw->exec_name[0] != '/' && !aw->has_pwd)
+  if (!aw->has_root || (aw->exec_name[0] != '/' && !aw->has_pwd))
     return NULL;
 
   buf = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!buf)
     return NULL;
-  resolve_absolute_path(aw->exec_name, &aw->pwd, buf, PATH_MAX);
-  if (buf[0] != '/' || !strcmp(buf, canonical) ||
-      strcmp(kbasename(buf), kbasename(canonical)) ||
-      !av_exec_key_names_file(aw, buf)) {
-    kfree(buf);
-    return NULL;
-  }
+  /* From the task's root, like av_exec_key_names_file()'s lookup
+   * below and the unlink side's spelling (av_rebase_on_root()).
+   *
+   * Validated as spelled, collapsed only afterwards for the key: with
+   * /tmp/x/link -> /tmp/y/sub, an exec of /tmp/x/link/../tool runs
+   * /tmp/y/tool, because the kernel follows the link before the "..".
+   * The collapsed /tmp/x/tool would send the directory check to /tmp/x
+   * and drop the key, so an unlink of the same spelling matched
+   * nothing (CodeRabbit on #229). The unlink side works the same way:
+   * unlink_dir_is() walks the raw spelling, the hash uses the
+   * collapsed one. */
+  join_base_path(aw->exec_name, &aw->pwd, &aw->root, buf, PATH_MAX, false);
+  if (buf[0] != '/' || !av_exec_key_names_file(aw, buf, parent_out))
+    goto drop;
+  normalize_abs_path(buf, PATH_MAX);
+  /* Equal to `canonical` makes the key redundant only when both are
+   * spelled from the same root. `canonical` is this worker's d_path(),
+   * the key the task's: a task chrooted to /j, with /j/j -> ., that
+   * execs "j/tool" has the key /j/tool and the canonical name /j/tool,
+   * but its unlink of "j/tool" spells /j/tool from its root and
+   * /j/j/tool from this worker's, so only the key matches it
+   * (CodeRabbit on #229). */
+  if (!strcmp(buf, canonical) && av_root_is_workers(&aw->root))
+    goto drop;
   return buf;
+drop:
+  dput(*parent_out);
+  *parent_out = NULL;
+  kfree(buf);
+  return NULL;
 }
 
 /* Identity of the pinned exec file in the form userspace fstat() reports
@@ -1407,6 +1621,8 @@ static void av_work_fn(struct work_struct *w) {
   char *abs_path;
   char *esc_path;
   char *lex_path;
+  const struct inode *lex_dir = NULL;
+  struct dentry *lex_parent = NULL;
   const char *sd_key;
   const char *log_path;
   int ret;
@@ -1465,7 +1681,26 @@ static void av_work_fn(struct work_struct *w) {
       memmove(abs_path, p, strlen(p) + 1);
   }
   sd_key = av_exec_self_delete_key(aw->file, abs_path);
-  lex_path = av_exec_lexical_path(aw, sd_key);
+  /* TEST-ONLY barrier (see av_lexkey_test_hold), between d_path() and
+   * the lexical key's check of the file's name and parent. Only one
+   * worker matches the tgid, so the unlocked increment is fine. */
+  if (READ_ONCE(av_lexkey_test_hold) &&
+      READ_ONCE(av_lexkey_test_hold_tgid) == aw->tgid) {
+    unsigned long deadline =
+        jiffies + msecs_to_jiffies(AV_LEXKEY_TEST_HOLD_MAX_MS);
+
+    WRITE_ONCE(av_lexkey_test_parked, READ_ONCE(av_lexkey_test_parked) + 1);
+    while (READ_ONCE(av_lexkey_test_hold) && time_before(jiffies, deadline))
+      msleep(5);
+  }
+  lex_path = av_exec_lexical_path(aw, sd_key, &lex_parent);
+  /* The lexical key's directory: the very parent av_exec_lexical_path()
+   * validated the key against, not a second dget_parent(), which a
+   * rename in between could move. Recorded so the unlink check can tell
+   * when that name has since been pointed somewhere else. The reference
+   * is dropped right after recording, not held through the scan. */
+  if (lex_parent)
+    lex_dir = d_inode(lex_parent);
   /* Escaped rendering of abs_path for the dmesg lines below (CWE-117 -
    * see av_log.h). The recorded identity (av_behavior_record_exec) and
    * the daemon message keep the raw bytes; only log lines use this.
@@ -1500,7 +1735,7 @@ static void av_work_fn(struct work_struct *w) {
      * we could not hash. An empty hash never matches the trust table,
      * so this actively clears the exemption while restoring a
      * comparable exec_path. */
-    av_behavior_record_exec(aw->tgid, sd_key, lex_path, "",
+    av_behavior_record_exec(aw->tgid, sd_key, lex_path, lex_dir, "",
                             aw->start_time);
     goto out;
   }
@@ -1509,8 +1744,10 @@ static void av_work_fn(struct work_struct *w) {
    * immediately it'll never reach the unlink hook anyway, and this
    * keeps the recording logic in one place rather than duplicated
    * across the signature-match/daemon-match/clean branches. */
-  av_behavior_record_exec(aw->tgid, sd_key, lex_path, digest.sha256,
-                          aw->start_time);
+  av_behavior_record_exec(aw->tgid, sd_key, lex_path, lex_dir,
+                          digest.sha256, aw->start_time);
+  dput(lex_parent);
+  lex_parent = NULL;
 
   if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
     snprintf(reason, sizeof(reason), "signature:%s", sig_name);
@@ -1613,6 +1850,7 @@ static void av_work_fn(struct work_struct *w) {
   }
 
 out:
+  dput(lex_parent); /* still held only if hashing failed */
   if (sd_key != abs_path)
     kfree(sd_key);
   kfree(abs_path);
@@ -1864,14 +2102,26 @@ struct av_unlink_work {
                      * dfd arg) this is always the cwd capture, same
                      * as AT_FDCWD would give unlinkat(). Released
                      * via path_put() in av_unlink_work_fn(). */
+  struct path root; /* the unlinker's root at kprobe time, which the
+                     * self-delete check resolves a lexical match's
+                     * directory from (this worker's own root is a
+                     * private nullfs on newer kernels). Only valid
+                     * when has_root. */
+  bool has_root;
   char path[PATH_MAX];
 };
 
 static void av_unlink_work_fn(struct work_struct *w) {
   struct av_unlink_work *uw = container_of(w, struct av_unlink_work, work);
   char *abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
+  const char *spelled;
+  char *spelled_buf;
+  char *lexical = NULL;
+  bool path_is_workers;
 
   if (!abs_path) {
+    if (uw->has_root)
+      path_put(&uw->root);
     path_put(&uw->base);
     put_pid(uw->target_pid);
     kfree(uw);
@@ -1880,9 +2130,31 @@ static void av_unlink_work_fn(struct work_struct *w) {
   }
 
   resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX);
-  av_behavior_check_unlink(uw->pid, abs_path, uw->target_pid);
+  spelled = unlink_spelled_path(uw->path, &uw->base,
+                                uw->has_root ? &uw->root : NULL, &spelled_buf);
+  /* The lexical-key form: `spelled` collapsed the way the exec's key
+   * was. Not abs_path, which a chroot()ed task's relative spelling
+   * renders in this worker's coordinates (see av_rebase_on_root()). */
+  if (spelled && spelled[0] == '/') {
+    lexical = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (lexical) {
+      strscpy(lexical, spelled, PATH_MAX);
+      normalize_abs_path(lexical, PATH_MAX);
+    }
+  }
+  /* abs_path is spelled from this worker's root, like the exec's d_path()
+   * key, unless the task spelled it absolute from a root of its own. */
+  path_is_workers = uw->path[0] != '/' || !uw->has_root ||
+                    av_root_is_workers(&uw->root);
+  av_behavior_check_unlink(uw->pid, abs_path, path_is_workers, lexical,
+                           spelled, uw->has_root ? &uw->root : NULL,
+                           uw->target_pid);
 
+  kfree(lexical);
+  kfree(spelled_buf);
   kfree(abs_path);
+  if (uw->has_root)
+    path_put(&uw->root);
   path_put(&uw->base);
   put_pid(uw->target_pid);
   kfree(uw);
@@ -1929,6 +2201,12 @@ static int schedule_unlink_work(const char __user *user_path, int dfd) {
     }
   }
 
+  /* Atomic-safe like get_fs_pwd(): fs->lock and a refcount. */
+  uw->has_root = false;
+  if (current->fs) {
+    get_fs_root(current->fs, &uw->root);
+    uw->has_root = true;
+  }
   uw->pid = task_tgid_nr(current);
   uw->target_pid = get_task_pid(current, PIDTYPE_PID);
   INIT_WORK(&uw->work, av_unlink_work_fn);
