@@ -410,11 +410,12 @@ jobs:
             exit 1
           fi
 
-          # Self-delete correlation through a directory symlink
-          # (CodeRabbit on #110): exec via a symlinked dir, unlink via
-          # either spelling, must still be killed as a self-deleting
-          # binary. Guards the lexical second key av.ko records next to
-          # the d_path() one.
+          # Self-delete detection (#130): unlinking or renaming over
+          # the directory entry a process was exec'd from must be
+          # killed however the name is spelled (directory symlinks,
+          # "..", bind mounts, /proc/self/cwd), and unrelated unlinks
+          # and other hard links must not be. Guards the dentry-identity
+          # match av.ko does in its security_inode_unlink/rename probes.
           if ! grep -q "QEMU_TEST: self-delete correlation check passed" \
                serial.log; then
             echo "::error::init reported PASS but the self-delete" \
