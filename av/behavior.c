@@ -1993,6 +1993,12 @@ static void behavior_gc_fn(struct work_struct *w) {
         nsamples++;
         sampled_here++;
       }
+      /* cppcheck-suppress knownConditionTrueFalse
+       * False positive, same class as the hash_for_each_possible()
+       * sites below: cppcheck can't expand hlist_for_each_entry_safe()
+       * without full kernel headers, so it never sees the loop body
+       * run and concludes `cut_short` keeps its initial false. At
+       * runtime the body sets it when the batch fills mid-bucket. */
       if (cut_short)
         break; /* stay on bkt; skip resumes inside it next batch */
       /* Bucket fully walked - even if the batch filled on its last

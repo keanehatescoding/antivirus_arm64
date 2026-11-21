@@ -105,10 +105,10 @@ cover.
 tests/run_all.sh
 ```
 
-Runs thirteen suites in a fixed order: the eight that need neither root
+Runs fourteen suites in a fixed order: the nine that need neither root
 nor a loaded module first (including the Python 3 avd_client,
-procfs_client, and incremental-build regressions), then the exec gate,
-then the ones that insmod `av.ko`.
+procfs_client, incremental-build, and quarantine-unlink regressions),
+then the exec gate, then the ones that insmod `av.ko`.
 On a non-aarch64 host the module-dependent ones skip loudly and
 `test_detection.sh` cross-compiles and QEMU-boot-tests instead. Two scripts
 are deliberately **not** in `run_all.sh` (`test_avctl_timeouts.sh` and

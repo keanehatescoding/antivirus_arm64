@@ -735,6 +735,30 @@ static void move_sd_x_image(void) {
   write_file("/tmp/sd_xb/x", "not the executable\n");
 }
 
+/* Case Y's on_record hook, run after av.ko has recorded the exec of
+ * /tmp/sd_y/alias/y (alias -> /tmp/sd_ya): move the image into
+ * /tmp/sd_yb and point the alias there, so the child's unlink through
+ * the alias removes the image from a directory the exec never saw. */
+static void move_sd_y_image(void) {
+  if (rename("/tmp/sd_ya/y", "/tmp/sd_yb/y") != 0)
+    die("rename /tmp/sd_ya/y");
+  if (unlink("/tmp/sd_y/alias") != 0)
+    die("unlink /tmp/sd_y/alias");
+  if (symlink("/tmp/sd_yb", "/tmp/sd_y/alias") != 0)
+    die("symlink /tmp/sd_y/alias -> /tmp/sd_yb");
+}
+
+/* Case Z's on_record hook: move the image into /tmp/sd_zb as in case Y,
+ * but point the alias at /tmp/sd_zc, which holds an unrelated "z". */
+static void move_sd_z_image(void) {
+  if (rename("/tmp/sd_za/z", "/tmp/sd_zb/z") != 0)
+    die("rename /tmp/sd_za/z");
+  if (unlink("/tmp/sd_z/alias") != 0)
+    die("unlink /tmp/sd_z/alias");
+  if (symlink("/tmp/sd_zc", "/tmp/sd_z/alias") != 0)
+    die("symlink /tmp/sd_z/alias -> /tmp/sd_zc");
+}
+
 int main(int argc, char *const argv[]) {
   if (argc > 1 && !strcmp(argv[1], "--clean-marker")) {
     _exit(42);
@@ -1627,6 +1651,92 @@ int main(int argc, char *const argv[]) {
                  stat("/tmp/sd_xb/x", &st) == 0) {
         outmsg("QEMU_TEST: FAIL: self-delete case x's unlink did not "
                "remove /tmp/sd_xb/x and leave /tmp/sd_xb/renamed\n");
+        failed = 1;
+      }
+    }
+    /* Y: a native executable moved to another directory, the alias
+     * repointed there, then unlinked through the alias -> killed. The
+     * child execs /tmp/sd_y/alias/y, alias -> /tmp/sd_ya. Once the exec
+     * is recorded the image moves to /tmp/sd_yb/y and the alias follows
+     * it, so the unlink through the alias removes the image. The name
+     * the unlink spells no longer sits in the directory the exec saw;
+     * the exec'd dentry is what identifies it (CodeRabbit on #134). */
+    if (!failed) {
+      int code, sig, saw_record, killed;
+      struct stat st;
+      pid_t child;
+
+      if (mkdir("/tmp/sd_y", 0755) != 0 || mkdir("/tmp/sd_ya", 0755) != 0 ||
+          mkdir("/tmp/sd_yb", 0755) != 0)
+        die("mkdir case y dirs");
+      if (symlink("/tmp/sd_ya", "/tmp/sd_y/alias") != 0)
+        die("symlink /tmp/sd_y/alias");
+      copy_file("/init", "/tmp/sd_ya/y");
+      killed = run_self_delete_case("/tmp/sd_y/alias/y", "--self-unlink",
+                                    "/tmp/sd_y/alias/y", NULL, "/tmp/sd_ya/y",
+                                    move_sd_y_image, &code, &sig, &saw_record,
+                                    &child);
+      outmsg("QEMU_TEST: self-delete case y (image moved, alias followed): "
+             "exec /tmp/sd_y/alias/y, image -> /tmp/sd_yb/y, alias -> "
+             "/tmp/sd_yb, unlink /tmp/sd_y/alias/y -> %s (exit=%d sig=%d, "
+             "exec record %s)\n",
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (!saw_record) {
+        outmsg("QEMU_TEST: FAIL: self-delete case y never logged the exec "
+               "record for /tmp/sd_ya/y, so the move was not made after it\n");
+        failed = 1;
+      } else if (!killed) {
+        outmsg("QEMU_TEST: FAIL: self-delete case y expected a kill (exit=%d;"
+               " 44 = sync read, 45 = unlink)\n",
+               code);
+        failed = 1;
+      } else if (!saw_kill_reason(child, "self-deleting binary")) {
+        outmsg("QEMU_TEST: FAIL: self-delete case y was killed but dmesg has "
+               "no reason=\"self-deleting binary ...\" pid=%d line\n",
+               (int)child);
+        failed = 1;
+      } else if (stat("/tmp/sd_yb/y", &st) == 0) {
+        outmsg("QEMU_TEST: FAIL: self-delete case y's unlink did not remove "
+               "/tmp/sd_yb/y - the alias retarget did not take effect\n");
+        failed = 1;
+      }
+    }
+    /* Z: the same move, but the alias is pointed at a different
+     * directory holding an unrelated "z" -> NOT killed. The image sits
+     * in /tmp/sd_zb, the exec recorded /tmp/sd_za, and the unlink
+     * through /tmp/sd_z/alias removes /tmp/sd_zc/z, a different dentry
+     * from the image. This is the negative control for case y. */
+    if (!failed) {
+      int code, sig, saw_record, killed;
+      struct stat st;
+      pid_t child;
+
+      if (mkdir("/tmp/sd_z", 0755) != 0 || mkdir("/tmp/sd_za", 0755) != 0 ||
+          mkdir("/tmp/sd_zb", 0755) != 0 || mkdir("/tmp/sd_zc", 0755) != 0)
+        die("mkdir case z dirs");
+      if (symlink("/tmp/sd_za", "/tmp/sd_z/alias") != 0)
+        die("symlink /tmp/sd_z/alias");
+      copy_file("/init", "/tmp/sd_za/z");
+      copy_file("/init", "/tmp/sd_zc/z");
+      killed = run_self_delete_case("/tmp/sd_z/alias/z", "--self-unlink",
+                                    "/tmp/sd_z/alias/z", NULL, "/tmp/sd_za/z",
+                                    move_sd_z_image, &code, &sig, &saw_record,
+                                    &child);
+      outmsg("QEMU_TEST: self-delete case z (image moved, decoy unlinked): "
+             "exec /tmp/sd_z/alias/z, image -> /tmp/sd_zb/z, alias -> "
+             "/tmp/sd_zc, unlink /tmp/sd_z/alias/z -> %s (exit=%d sig=%d, "
+             "exec record %s)\n",
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (!saw_record || killed || code != 43) {
+        outmsg("QEMU_TEST: FAIL: self-delete case z expected a seen exec "
+               "record, no kill and exit 43 (44 = sync read, 45 = unlink)\n");
+        failed = 1;
+      } else if (stat("/tmp/sd_zb/z", &st) != 0 ||
+                 stat("/tmp/sd_zc/z", &st) == 0) {
+        outmsg("QEMU_TEST: FAIL: self-delete case z's unlink did not remove "
+               "/tmp/sd_zc/z and leave /tmp/sd_zb/z\n");
         failed = 1;
       }
     }
