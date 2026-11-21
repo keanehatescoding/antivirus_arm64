@@ -92,6 +92,7 @@
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/kdev_t.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
@@ -386,15 +387,35 @@ module_param(av_toctou_test_delay_ms, int, 0644);
 MODULE_PARM_DESC(av_toctou_test_delay_ms,
                  "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove the digest still comes from the executed image (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
-/* TEST ONLY, like av_toctou_test_delay_ms (same default, clamp and
- * read-once), but placed after av_work_fn()'s d_path() and before
- * av_exec_lexical_path(): the QEMU boot test renames the image in that
- * window to check that the lexical key is validated against the file's
- * current name, not the d_path() string. */
-static int av_lexkey_test_delay_ms; /* = 0: disabled unless a test sets it */
-module_param(av_lexkey_test_delay_ms, int, 0644);
-MODULE_PARM_DESC(av_lexkey_test_delay_ms,
-                 "TEST ONLY: ms to sleep between the exec work's d_path() and its lexical self-delete key check (default 0 = disabled; clamped to [0, 2000]); never set in production");
+/* TEST ONLY: a barrier placed after av_work_fn()'s d_path() and before
+ * av_exec_lexical_path(). The QEMU boot test renames the image while the
+ * exec worker of ONE tgid is parked here, to check that the lexical key is
+ * validated against the file's current name and parent, not the d_path()
+ * string. A fixed sleep could not prove the rename came first: a slow
+ * parent resumes after the sleep and the worker validates the original
+ * image, so the case passed without running the race. Instead the worker
+ * bumps av_lexkey_test_parked on reaching the barrier (the test's
+ * acknowledgement) and waits until av_lexkey_test_hold is cleared, which
+ * the test does only after the rename and alias change are done.
+ *
+ * Default 0 = disabled, so production is unaffected (the barrier is not
+ * even entered). Scoped to av_lexkey_test_hold_tgid so no unrelated exec
+ * can park or ack. The wait is capped at AV_LEXKEY_TEST_HOLD_MAX_MS, so a
+ * test that dies cannot wedge a worker. The _test_ infix marks these as
+ * never operational knobs. */
+#define AV_LEXKEY_TEST_HOLD_MAX_MS 5000
+static int av_lexkey_test_hold;      /* = 0: disabled unless a test sets it */
+static int av_lexkey_test_hold_tgid; /* only this tgid's worker parks */
+static int av_lexkey_test_parked;    /* ack: workers that reached the barrier */
+module_param(av_lexkey_test_hold, int, 0644);
+MODULE_PARM_DESC(av_lexkey_test_hold,
+                 "TEST ONLY: 1 parks the exec worker of av_lexkey_test_hold_tgid between d_path() and its lexical self-delete key check until cleared (capped at 5s); never set in production");
+module_param(av_lexkey_test_hold_tgid, int, 0644);
+MODULE_PARM_DESC(av_lexkey_test_hold_tgid,
+                 "TEST ONLY: tgid whose exec worker av_lexkey_test_hold parks");
+module_param(av_lexkey_test_parked, int, 0444);
+MODULE_PARM_DESC(av_lexkey_test_parked,
+                 "TEST ONLY: number of exec workers that reached the lexical key barrier");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1660,16 +1681,17 @@ static void av_work_fn(struct work_struct *w) {
       memmove(abs_path, p, strlen(p) + 1);
   }
   sd_key = av_exec_self_delete_key(aw->file, abs_path);
-  /* TEST-ONLY delay (see av_lexkey_test_delay_ms), between d_path() and
-   * the lexical key's check of the file's name and parent. */
-  {
-    int delay_ms = READ_ONCE(av_lexkey_test_delay_ms);
+  /* TEST-ONLY barrier (see av_lexkey_test_hold), between d_path() and
+   * the lexical key's check of the file's name and parent. Only one
+   * worker matches the tgid, so the unlocked increment is fine. */
+  if (READ_ONCE(av_lexkey_test_hold) &&
+      READ_ONCE(av_lexkey_test_hold_tgid) == aw->tgid) {
+    unsigned long deadline =
+        jiffies + msecs_to_jiffies(AV_LEXKEY_TEST_HOLD_MAX_MS);
 
-    if (delay_ms > 0) {
-      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
-        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
-      msleep(delay_ms);
-    }
+    WRITE_ONCE(av_lexkey_test_parked, READ_ONCE(av_lexkey_test_parked) + 1);
+    while (READ_ONCE(av_lexkey_test_hold) && time_before(jiffies, deadline))
+      msleep(5);
   }
   lex_path = av_exec_lexical_path(aw, sd_key, &lex_parent);
   /* The lexical key's directory: the very parent av_exec_lexical_path()

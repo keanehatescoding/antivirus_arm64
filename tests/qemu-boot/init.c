@@ -166,7 +166,10 @@
 #define TOCTOU_WQ_DELAY_MS 150
 #define TOCTOU_LINGER_US ((TOCTOU_WQ_DELAY_MS + 400) * 1000)
 #define TOCTOU_DELAY_PARAM "/sys/module/av/parameters/av_toctou_test_delay_ms"
-#define LEXKEY_DELAY_PARAM "/sys/module/av/parameters/av_lexkey_test_delay_ms"
+#define LEXKEY_HOLD_PARAM "/sys/module/av/parameters/av_lexkey_test_hold"
+#define LEXKEY_HOLD_TGID_PARAM \
+  "/sys/module/av/parameters/av_lexkey_test_hold_tgid"
+#define LEXKEY_PARKED_PARAM "/sys/module/av/parameters/av_lexkey_test_parked"
 
 static void outmsg(const char *fmt, ...) {
   static char buf[65536];
@@ -310,6 +313,22 @@ static void write_param_int(const char *path, int val) {
     die("write module param");
   }
   close(fd);
+}
+
+/* Reads an integer sysfs/module-param attribute (see write_param_int()). */
+static int read_param_int(const char *path) {
+  char buf[16];
+  ssize_t n;
+  int fd = open(path, O_RDONLY);
+
+  if (fd < 0)
+    die("open module param for read (rebuild av.ko with the lexkey knobs?)");
+  n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0)
+    die("read module param");
+  buf[n] = '\0';
+  return (int)strtol(buf, NULL, 10);
 }
 
 /* Writes `n` copies of byte `c` to `path` (0700, like write_file()).
@@ -625,14 +644,20 @@ static void stop_avd(pid_t pid) {
  * path are then spelled from inside that root. Cases R and S. */
 static const char *sd_chroot_dir;
 /* Set around a run_self_delete_case() call to run in the parent right
- * after the fork, before it waits for the exec record: case X's rename
- * while av_lexkey_test_delay_ms parks the exec worker after d_path(). */
+ * after the fork, before it waits for the exec record. Case X uses it
+ * for the rename, together with sd_lexkey_barrier below. */
 static void (*sd_before_record)(void);
-/* Case X: av_lexkey_test_delay_ms, and how far into it the parent
- * renames. The child's exec and the worker's d_path() land well inside
- * the first; the record line proves they did (it names the old path). */
-#define SELF_DELETE_LEXKEY_DELAY_MS 2000
-#define SELF_DELETE_LEXKEY_RENAME_MS 500
+/* Set (with sd_before_record) to run that hook only while the child's
+ * exec worker is parked at av_lexkey_test_hold's barrier, between
+ * d_path() and the lexical key check. The child is held before its exec
+ * until the parent has armed the barrier for the child's pid; the hook
+ * runs after av.ko acknowledges the worker is parked
+ * (av_lexkey_test_parked), and the worker is released only once the
+ * hook has finished. If the worker never parks, the case fails instead
+ * of passing without having exercised the race. The record line still
+ * names the old path, which shows the hook ran after d_path(). */
+static int sd_lexkey_barrier;
+#define SELF_DELETE_LEXKEY_PARK_WAIT_MS 10000
 
 static int run_self_delete_case(const char *exec_path, const char *mode,
                                 const char *recorded_path,
@@ -640,12 +665,15 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
                                 void (*on_record)(void), int *exit_code,
                                 int *term_sig, int *saw_record) {
   int sync_fd[2];
+  int gate_fd[2] = {-1, -1};
   pid_t pid;
   char needle[256];
   int waited = 0;
 
   if (pipe(sync_fd) != 0)
     die("pipe(self-delete sync)");
+  if (sd_lexkey_barrier && pipe(gate_fd) != 0)
+    die("pipe(self-delete lexkey gate)");
   pid = fork();
   if (pid < 0)
     die("fork(self-delete)");
@@ -654,6 +682,17 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
                            (char *)unlink_path, NULL};
 
     close(sync_fd[1]);
+    if (sd_lexkey_barrier) {
+      char g;
+
+      /* Held until the parent has armed the barrier for this pid, so
+       * the exec worker cannot run before it can park. Done before the
+       * dup2() below so the gate fds can never be clobbered by it. */
+      close(gate_fd[1]);
+      if (read(gate_fd[0], &g, 1) != 1)
+        _exit(124);
+      close(gate_fd[0]);
+    }
     if (sync_fd[0] != 3) {
       if (dup2(sync_fd[0], 3) < 0)
         _exit(126);
@@ -665,8 +704,42 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
     _exit(127);
   }
   close(sync_fd[0]);
-  if (sd_before_record)
+  if (sd_lexkey_barrier) {
+    int parked_before = read_param_int(LEXKEY_PARKED_PARAM);
+    int parked_wait = 0;
+    int parked;
+
+    close(gate_fd[0]);
+    write_param_int(LEXKEY_HOLD_TGID_PARAM, (int)pid);
+    write_param_int(LEXKEY_HOLD_PARAM, 1);
+    if (write(gate_fd[1], "x", 1) != 1)
+      die("write(self-delete lexkey gate)");
+    close(gate_fd[1]);
+    while (read_param_int(LEXKEY_PARKED_PARAM) == parked_before &&
+           parked_wait < SELF_DELETE_LEXKEY_PARK_WAIT_MS) {
+      struct timespec ts = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000L};
+
+      nanosleep(&ts, NULL);
+      parked_wait += 10;
+    }
+    parked = read_param_int(LEXKEY_PARKED_PARAM) != parked_before;
+    if (parked && sd_before_record)
+      sd_before_record();
+    write_param_int(LEXKEY_HOLD_PARAM, 0);
+    write_param_int(LEXKEY_HOLD_TGID_PARAM, 0);
+    if (!parked) {
+      /* The barrier was never reached: report it as a missing record,
+       * which the caller fails on, after letting the child finish. */
+      *saw_record = 0;
+      if (write(sync_fd[1], "x", 1) != 1 && errno != EPIPE)
+        die("write(self-delete sync)");
+      close(sync_fd[1]);
+      (void)wait_for_exit(pid, 15000, exit_code, term_sig);
+      return 0;
+    }
+  } else if (sd_before_record) {
     sd_before_record();
+  }
 
   snprintf(needle, sizeof(needle), "path=\"%s\" pid=%d ", recorded_path,
            (int)pid);
@@ -707,11 +780,11 @@ static void retarget_sd_ralias(void) {
     die("symlink /tmp/sd_ralias -> /tmp/sd_other");
 }
 
-/* Case X's sd_before_record hook: once the exec worker has parked
- * after d_path(), move the image to /tmp/sd_xb/renamed, point
- * /tmp/sd_x/alias at /tmp/sd_xb, and put an unrelated "x" there. */
+/* Case X's sd_before_record hook, run while the exec worker is parked
+ * after d_path() (see sd_lexkey_barrier): move the image to
+ * /tmp/sd_xb/renamed, point /tmp/sd_x/alias at /tmp/sd_xb, and put an
+ * unrelated "x" there. */
 static void move_sd_x_image(void) {
-  usleep(SELF_DELETE_LEXKEY_RENAME_MS * 1000);
   if (rename("/tmp/sd_xa/x", "/tmp/sd_xb/renamed") != 0)
     die("rename /tmp/sd_xa/x");
   if (unlink("/tmp/sd_x/alias") != 0)
@@ -1491,13 +1564,13 @@ int main(int argc, char *const argv[]) {
       if (symlink("/tmp/sd_xa", "/tmp/sd_x/alias") != 0)
         die("symlink /tmp/sd_x/alias");
       copy_file("/init", "/tmp/sd_xa/x");
-      write_param_int(LEXKEY_DELAY_PARAM, SELF_DELETE_LEXKEY_DELAY_MS);
+      sd_lexkey_barrier = 1;
       sd_before_record = move_sd_x_image;
       killed = run_self_delete_case("/tmp/sd_x/alias/x", "--self-unlink",
                                     "/tmp/sd_xa/x", "/tmp/sd_x/alias/x", NULL,
                                     &code, &sig, &saw_record);
       sd_before_record = NULL;
-      write_param_int(LEXKEY_DELAY_PARAM, 0);
+      sd_lexkey_barrier = 0;
       outmsg("QEMU_TEST: self-delete case x (image renamed after d_path()): "
              "exec /tmp/sd_x/alias/x, image -> /tmp/sd_xb/renamed, alias "
              "-> /tmp/sd_xb, unlink /tmp/sd_x/alias/x -> %s (exit=%d sig=%d, "
@@ -1505,9 +1578,10 @@ int main(int argc, char *const argv[]) {
              killed ? "killed" : "not killed", code, sig,
              saw_record ? "seen" : "not seen in log");
       if (!saw_record || killed || code != 43) {
-        outmsg("QEMU_TEST: FAIL: self-delete case x expected a seen exec "
-               "record at /tmp/sd_xa/x, no kill and exit 43 (44 = sync "
-               "read, 45 = unlink)\n");
+        outmsg("QEMU_TEST: FAIL: self-delete case x expected the exec "
+               "worker to park at the lexkey barrier, a seen exec record at "
+               "/tmp/sd_xa/x, no kill and exit 43 (44 = sync read, 45 = "
+               "unlink)\n");
         failed = 1;
       } else if (stat("/tmp/sd_xb/renamed", &st) != 0 ||
                  stat("/tmp/sd_xb/x", &st) == 0) {
