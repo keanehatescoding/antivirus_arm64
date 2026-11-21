@@ -659,6 +659,47 @@ static void (*sd_before_record)(void);
 static int sd_lexkey_barrier;
 #define SELF_DELETE_LEXKEY_PARK_WAIT_MS 10000
 
+/* Pid of the child the last run_self_delete_case() forked, and whether
+ * its wait_for_exit() timed out (so the harness SIGKILLed it). Callers
+ * that judge a kill read these: the exit status alone cannot tell
+ * av.ko's SIGKILL from the harness's, and a reason line left by an
+ * earlier attempt for the same path says nothing about this child. */
+static pid_t sd_last_pid;
+static int sd_last_wait_timed_out;
+
+/* True if `log` has one line holding the self-delete kill event for
+ * `path` and exactly `pid` (the line ends right after the pid, so pid 12
+ * cannot match pid 123). All four fields must sit on the same line. */
+static int log_has_self_delete_kill(const char *log, const char *path,
+                                    pid_t pid) {
+  char path_field[320], pid_field[32];
+  const char *line = log;
+
+  snprintf(path_field, sizeof(path_field), "path=\"%s\" ", path);
+  snprintf(pid_field, sizeof(pid_field), " pid=%d", (int)pid);
+  while (*line) {
+    const char *eol = strchr(line, '\n');
+    size_t len = eol ? (size_t)(eol - line) : strlen(line);
+    char buf[1024];
+
+    if (len < sizeof(buf)) {
+      size_t plen = strlen(pid_field);
+
+      memcpy(buf, line, len);
+      buf[len] = '\0';
+      if (strstr(buf, "event=detected action=kill") &&
+          strstr(buf, path_field) &&
+          strstr(buf, "reason=\"self-deleting binary") &&
+          len >= plen && !strcmp(buf + len - plen, pid_field))
+        return 1;
+    }
+    if (!eol)
+      break;
+    line = eol + 1;
+  }
+  return 0;
+}
+
 static int run_self_delete_case(const char *exec_path, const char *mode,
                                 const char *recorded_path,
                                 const char *unlink_path,
@@ -677,6 +718,8 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
   pid = fork();
   if (pid < 0)
     die("fork(self-delete)");
+  sd_last_pid = pid;
+  sd_last_wait_timed_out = 0;
   if (pid == 0) {
     char *const cargv[] = {(char *)exec_path, (char *)mode,
                            (char *)unlink_path, NULL};
@@ -734,15 +777,25 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
       if (write(sync_fd[1], "x", 1) != 1 && errno != EPIPE)
         die("write(self-delete sync)");
       close(sync_fd[1]);
-      (void)wait_for_exit(pid, 15000, exit_code, term_sig);
+      sd_last_wait_timed_out =
+          !wait_for_exit(pid, 15000, exit_code, term_sig);
       return 0;
     }
   } else if (sd_before_record) {
     sd_before_record();
   }
 
-  snprintf(needle, sizeof(needle), "path=\"%s\" pid=%d ", recorded_path,
-           (int)pid);
+  /* event=hash-error carries the same path= pid= fields but is logged
+   * BEFORE av_behavior_record_exec(), so a hook that needs the entry to
+   * exist (case G's retarget) waits for the event=clean type=fail-open
+   * line, which is logged after it. */
+  if (on_record)
+    snprintf(needle, sizeof(needle),
+             "event=clean type=fail-open path=\"%s\" pid=%d ", recorded_path,
+             (int)pid);
+  else
+    snprintf(needle, sizeof(needle), "path=\"%s\" pid=%d ", recorded_path,
+             (int)pid);
   *saw_record = 0;
   while (waited < SELF_DELETE_RECORD_WAIT_MS) {
     struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
@@ -767,8 +820,10 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
   if (write(sync_fd[1], "x", 1) != 1 && errno != EPIPE)
     die("write(self-delete sync)");
   close(sync_fd[1]);
-  (void)wait_for_exit(pid, 15000, exit_code, term_sig);
-  return *term_sig == SIGKILL;
+  sd_last_wait_timed_out = !wait_for_exit(pid, 15000, exit_code, term_sig);
+  /* A timeout makes wait_for_exit() SIGKILL the child itself: that is a
+   * harness failure, never a detection. */
+  return !sd_last_wait_timed_out && *term_sig == SIGKILL;
 }
 
 /* Case G's on_record hook: re-point /tmp/sd_ralias from /tmp/sd_real
@@ -1145,7 +1200,7 @@ int main(int argc, char *const argv[]) {
 
       write_param_int(TOCTOU_DELAY_PARAM, SELF_DELETE_EARLY_DELAY_MS);
       for (size_t i = 0; i < sizeof(early) / sizeof(early[0]); i++) {
-        char real[64], alias[64], recorded[80], reason_line[128];
+        char real[64], alias[64], recorded[80];
         int code, sig, saw_record, killed;
 
         snprintf(real, sizeof(real), "/tmp/sd_real/%s", early[i].name);
@@ -1169,23 +1224,27 @@ int main(int argc, char *const argv[]) {
                early[i].name, alias, early[i].unlink,
                killed ? "killed" : "not killed", code, sig,
                saw_record ? "seen" : "not seen in log");
-        snprintf(reason_line, sizeof(reason_line),
-                 "path=\"%s\" reason=\"self-deleting binary", early[i].unlink);
         if (!saw_record) {
           outmsg("QEMU_TEST: FAIL: self-delete case %s never logged the "
                  "\"%s\" record in %d attempts - the unlink-before-d_path() "
                  "ordering it tests was not reached\n",
                  early[i].name, recorded, SELF_DELETE_EARLY_ATTEMPTS);
           failed = 1;
+        } else if (sd_last_wait_timed_out) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s: child pid %d did not "
+                 "exit within the wait (harness SIGKILL, not a detection)\n",
+                 early[i].name, (int)sd_last_pid);
+          failed = 1;
         } else if (!killed) {
           outmsg("QEMU_TEST: FAIL: self-delete case %s expected a kill%s\n",
                  early[i].name,
                  code == 45 ? " (helper's first unlink failed)" : "");
           failed = 1;
-        } else if (!strstr(read_kernel_log(), reason_line)) {
+        } else if (!log_has_self_delete_kill(read_kernel_log(),
+                                             early[i].unlink, sd_last_pid)) {
           outmsg("QEMU_TEST: FAIL: self-delete case %s was killed but dmesg "
-                 "has no %s\" line\n",
-                 early[i].name, reason_line);
+                 "has no self-delete kill line for pid %d (%s)\n",
+                 early[i].name, (int)sd_last_pid, early[i].unlink);
           failed = 1;
         }
       }

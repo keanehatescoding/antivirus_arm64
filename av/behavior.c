@@ -2245,6 +2245,91 @@ static bool unlink_dir_is(const struct path *root, const char *spelled,
   return same;
 }
 
+/* Held-executable identity check, the alternative to unlink_dir_is()'s
+ * exec-time parent. The process holds its image open (mm->exe_file), so
+ * that dentry's name and parent describe where the executed file lives
+ * NOW, even after a rename moved it out of the directory recorded at
+ * exec, and they survive its unlink (an unlinked dentry keeps d_parent
+ * and d_name). The unlink names that file when its final component is
+ * the dentry's name and its directory, resolved by the kernel from the
+ * task's root, is the dentry's parent.
+ *
+ * exec /tmp/alias/tool (alias -> /tmp/a), rename /tmp/a/tool to
+ * /tmp/b/tool, point alias at /tmp/b, unlink /tmp/alias/tool: the
+ * recorded parent is still A, but the image's parent is B and the
+ * spelling resolves to B. An unrelated decoy lives in some other
+ * directory, or under another name, so it does not match. Needs neither
+ * the unlink to have landed nor a reference held across the exec: the
+ * exe file is looked up here and dropped before returning. Any failure
+ * returns false, which only drops the lexical-key match, like
+ * unlink_dir_is(). A process that swaps its exe with PR_SET_MM_EXE_FILE
+ * is judged by the file it holds at this point. */
+static bool unlink_names_held_exe(struct pid *target_pid,
+                                  const struct path *root,
+                                  const char *spelled) {
+  const char *slash = spelled ? strrchr(spelled, '/') : NULL;
+  struct task_struct *task;
+  struct mm_struct *mm;
+  struct file *exe_file;
+  struct dentry *exe_dentry, *exe_parent;
+  struct path p;
+  char *dirname;
+  bool same = false;
+  int err;
+
+  if (!target_pid || !root || !slash || spelled[0] != '/')
+    return false;
+  if (!slash[1] || !strcmp(slash + 1, ".") || !strcmp(slash + 1, ".."))
+    return false;
+
+  rcu_read_lock();
+  task = pid_task(target_pid, PIDTYPE_PID);
+  if (task)
+    get_task_struct(task);
+  rcu_read_unlock();
+  if (!task)
+    return false;
+  mm = get_task_mm(task);
+  put_task_struct(task);
+  if (!mm)
+    return false;
+  rcu_read_lock();
+  exe_file = get_file_rcu(&mm->exe_file);
+  rcu_read_unlock();
+  mmput(mm);
+  if (!exe_file)
+    return false;
+
+  dirname = kstrndup(spelled, slash == spelled ? 1 : slash - spelled,
+                     GFP_KERNEL);
+  if (!dirname) {
+    fput(exe_file);
+    return false;
+  }
+  err = vfs_path_lookup(root->dentry, root->mnt, dirname,
+                        LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &p);
+  kfree(dirname);
+  if (err) {
+    fput(exe_file);
+    return false;
+  }
+
+  exe_dentry = exe_file->f_path.dentry;
+  exe_parent = dget_parent(exe_dentry);
+  if (!IS_ROOT(exe_dentry) && d_inode(exe_parent) &&
+      d_inode(exe_parent) == d_inode(p.dentry)) {
+    struct name_snapshot name;
+
+    take_dentry_name_snapshot(&name, exe_dentry);
+    same = !strcmp(name.name.name, slash + 1);
+    release_dentry_name_snapshot(&name);
+  }
+  dput(exe_parent);
+  path_put(&p);
+  fput(exe_file);
+  return same;
+}
+
 void av_behavior_check_unlink(pid_t pid, const char *path,
                               bool path_is_workers, const char *lexical,
                               const char *spelled,
@@ -2310,7 +2395,8 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
   mutex_unlock(&behavior_lock);
 
   if (lexical_dir)
-    self_delete = unlink_dir_is(root, spelled, lexical_dir);
+    self_delete = unlink_dir_is(root, spelled, lexical_dir) ||
+                  unlink_names_held_exe(target_pid, root, spelled);
 
   sensitive = path_is_sensitive(path);
 
