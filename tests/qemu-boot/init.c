@@ -290,6 +290,22 @@ static void copy_file(const char *src, const char *dst) {
   close(out);
 }
 
+/* True when `path` exists and holds exactly `text`. */
+static int file_holds(const char *path, const char *text) {
+  char buf[256];
+  ssize_t n;
+  int fd = open(path, O_RDONLY);
+
+  if (fd < 0)
+    return 0;
+  n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n < 0)
+    return 0;
+  buf[n] = '\0';
+  return strcmp(buf, text) == 0;
+}
+
 /* Set an integer sysfs/module-param attribute. Unlike write_file() this
  * does NOT pass O_CREAT/O_TRUNC: the target is an existing kernel
  * attribute, and a failure to open it is a real error worth reporting
@@ -1114,6 +1130,18 @@ int main(int argc, char *const argv[]) {
          "self-deleting binary", NULL,
          "failed execve() of another file, then unlink own image"},
     };
+    /* Filesystem effects the kill reason alone does not prove: a reason
+     * shows a hook reported a match, not that the operation went
+     * through. Looked up by case name; cases not listed have none. */
+    static const struct {
+      const char *name;
+      const char *gone;     /* must NOT exist afterwards, or NULL */
+      const char *holds;    /* must exist afterwards ... */
+      const char *holds_txt; /* ... holding exactly this, or NULL */
+    } effects[] = {
+        {"n", "/tmp/sd_real/n_decoy", "/tmp/sd_real/n", "decoy\n"},
+        {"p", "/tmp/sd_alias/p_moved", NULL, NULL},
+    };
     int failed = 0;
 
     if (mkdir("/tmp/sd_real", 0755) != 0)
@@ -1180,19 +1208,42 @@ int main(int argc, char *const argv[]) {
                "the case needs to survive\n",
                cases[i].name, cases[i].survivor);
         failed = 1;
+      } else {
+        for (size_t e = 0; e < sizeof(effects) / sizeof(effects[0]); e++) {
+          if (strcmp(effects[e].name, cases[i].name) != 0)
+            continue;
+          if (effects[e].gone && lstat(effects[e].gone, &st) == 0) {
+            outmsg("QEMU_TEST: FAIL: self-delete case %s left %s in place - "
+                   "the deletion did not happen\n",
+                   cases[i].name, effects[e].gone);
+            failed = 1;
+          } else if (effects[e].holds &&
+                     !file_holds(effects[e].holds, effects[e].holds_txt)) {
+            outmsg("QEMU_TEST: FAIL: self-delete case %s: %s does not hold "
+                   "the expected content - the rename did not replace it\n",
+                   cases[i].name, effects[e].holds);
+            failed = 1;
+          }
+        }
       }
     }
     /* av.ko keeps the exec'd dentry only as a compared cookie, never a
-     * reference: a held dentry or vfsmount would make this -EBUSY. The
-     * exec worker's own file reference is dropped just after it logs
-     * the record, so allow it a moment. */
+     * reference. This checks the mount half of that: a leaked vfsmount
+     * (or struct path) reference on /tmp/sd_bind makes this umount
+     * -EBUSY. It cannot see a leaked dentry reference - that does not
+     * pin the bind mount, and /tmp still owns the superblock - which
+     * would only surface as a "busy inodes" report when the last mount
+     * of that superblock shuts down. The exec worker's own file
+     * reference is dropped just after it logs the record, so allow it a
+     * moment. */
     if (!failed) {
       int tries = 0;
 
       while (umount2("/tmp/sd_bind", 0) != 0) {
         if (errno != EBUSY || ++tries >= 40) {
           outmsg("QEMU_TEST: FAIL: umount /tmp/sd_bind after the "
-                 "self-delete cases: %s\n",
+                 "self-delete cases (a mount reference may have leaked): "
+                 "%s\n",
                  strerror(errno));
           failed = 1;
           break;

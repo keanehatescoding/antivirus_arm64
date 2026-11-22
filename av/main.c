@@ -290,6 +290,12 @@ static struct kprobe kp_inode_unlink = {
 static struct kprobe kp_inode_rename = {
     .symbol_name = "security_inode_rename",
 };
+/* With CONFIG_SECURITY=n both are inline stubs, so there is no symbol to
+ * probe and register_kprobe() fails. That costs only self-delete
+ * detection, not the module, so a failed registration is a warning and
+ * these record which probes actually need unregistering. */
+static bool kp_inode_unlink_on;
+static bool kp_inode_rename_on;
 static struct kprobe kp_openat = {
     .symbol_name = "__arm64_sys_openat",
 };
@@ -2376,27 +2382,26 @@ static int __init av_init(void) {
 
   kp_inode_unlink.pre_handler = handler_pre_inode_unlink;
   ret = register_kprobe(&kp_inode_unlink);
-  if (ret < 0) {
-    pr_err("kernel-av: register_kprobe(security_inode_unlink) failed: %d\n",
-           ret);
-    goto err_kp_bprm_committing;
-  }
+  if (ret < 0)
+    pr_warn("kernel-av: register_kprobe(security_inode_unlink) failed: %d - "
+            "self-delete detection unavailable (CONFIG_SECURITY=n?)\n",
+            ret);
+  else
+    kp_inode_unlink_on = true;
 
   kp_inode_rename.pre_handler = handler_pre_inode_rename;
   ret = register_kprobe(&kp_inode_rename);
-  if (ret < 0) {
-    pr_err("kernel-av: register_kprobe(security_inode_rename) failed: %d\n",
-           ret);
-    goto err_kp_inode_unlink;
-  }
+  if (ret < 0)
+    pr_warn("kernel-av: register_kprobe(security_inode_rename) failed: %d - "
+            "rename-over-own-binary detection unavailable "
+            "(CONFIG_SECURITY=n?)\n",
+            ret);
+  else
+    kp_inode_rename_on = true;
 
   pr_info("kernel-av: loaded, %zu signature(s) active\n", av_sigtable_count());
   return 0;
 
-err_kp_inode_unlink:
-  unregister_kprobe(&kp_inode_unlink);
-err_kp_bprm_committing:
-  unregister_kprobe(&kp_bprm_committing);
 err_kp_renameat2:
   unregister_kprobe(&kp_renameat2);
 err_kp_renameat:
@@ -2427,8 +2432,10 @@ err_crypto:
 }
 
 static void __exit av_exit(void) {
-  unregister_kprobe(&kp_inode_rename);
-  unregister_kprobe(&kp_inode_unlink);
+  if (kp_inode_rename_on)
+    unregister_kprobe(&kp_inode_rename);
+  if (kp_inode_unlink_on)
+    unregister_kprobe(&kp_inode_unlink);
   unregister_kprobe(&kp_bprm_committing);
   unregister_kprobe(&kp_renameat2);
   unregister_kprobe(&kp_renameat);

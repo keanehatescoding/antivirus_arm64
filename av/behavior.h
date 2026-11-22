@@ -1,9 +1,11 @@
 /*
  * behavior.h - v0.8.0: behavioral heuristics.
  *
- * Four signals, all deferred to a workqueue (never the atomic kprobe
- * path - see main.c's architecture note, this is the same lesson from
- * v0.1.0 applied again):
+ * Four signals. Three are decided on a workqueue, never in the atomic
+ * kprobe path (see main.c's architecture note, the same lesson from
+ * v0.1.0 applied again); the self-delete match (3) is the exception,
+ * decided in the kprobe by a lock-free dentry comparison, with only its
+ * report deferred:
  *   1. Rapid write-intent file opens in a short window (ransomware-like:
  *      touching many files fast)
  *   2. Write-intent opens or deletions targeting sensitive paths
@@ -15,11 +17,17 @@
  *      document.docx.crypt), plus renames touching a sensitive path
  *      on either end - see av_behavior_check_rename() below
  *
- * All per-PROCESS state lives in a single mutex-protected hashtable,
- * since (unlike sigtable.c, which is read/written from arbitrary
- * process contexts) every access here now happens from workqueue
- * context only - the atomic kprobe handlers in main.c do nothing but
- * copy a path string and schedule work.
+ * Per-PROCESS state is split across two locking domains:
+ *   - the behavior hashtable (write-open counters, rename windows, ...)
+ *     is protected by one mutex and is only touched from workqueue
+ *     (sleepable) context. Unlike sigtable.c, which is read/written
+ *     from arbitrary process contexts, nothing atomic reaches it: the
+ *     kprobe handlers in main.c copy a path string and schedule work.
+ *   - the exec identity table (self-delete detection, the
+ *     av_behavior_exec_ident_*() calls below) has its own raw spinlock
+ *     for writers and RCU for readers, because its stage, commit and
+ *     match operations run directly in kprobe (atomic) context. Only
+ *     av_behavior_report_self_delete() is sleepable.
  *
  * IMPORTANT: every `pid_t pid` below is a tgid (thread-group/process
  * ID, i.e. what `ps` calls PID), NOT the individual calling thread's

@@ -64,7 +64,11 @@ Targets arm64 (aarch64) kernels 5.7+ only (the behavioral hooks resolve
 page for why x86_64 isn't supported). The exec hook needs nothing beyond
 `CONFIG_KPROBES=y`: at load time it binds to `bprm_execve`, the kernel's
 single caller of the binfmt search, and falls back to
-`security_bprm_check`. `make CC=clang LLVM=1` builds against a Clang-built kernel.
+`security_bprm_check`. Self-delete detection additionally probes
+`security_inode_unlink()`/`security_inode_rename()`; with
+`CONFIG_SECURITY=n` those are inline stubs, so the module still loads and
+every other detection path works, but self-delete detection is off (a
+warning is logged). `make CC=clang LLVM=1` builds against a Clang-built kernel.
 Behavioral thresholds are load-time module params; see the wiki's
 **Behavioral Heuristics** page.
 

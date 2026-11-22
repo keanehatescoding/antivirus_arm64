@@ -2254,7 +2254,10 @@ struct av_exec_ident {
  * any realistic system and costs ~6.5 MiB at most. */
 #define MAX_EXEC_IDENTS 65536
 static DEFINE_HASHTABLE(exec_ident_table, EXEC_IDENT_BITS);
-static DEFINE_SPINLOCK(exec_ident_lock);
+/* Raw, not spinlock_t: stage and commit take it from kprobe pre-handlers
+ * (atomic context, IRQs off). On PREEMPT_RT spinlock_t is a sleeping
+ * lock, which is invalid there. Nothing under it sleeps or allocates. */
+static DEFINE_RAW_SPINLOCK(exec_ident_lock);
 static unsigned int exec_ident_count; /* under exec_ident_lock */
 
 static void exec_ident_free_rcu(struct rcu_head *rcu) {
@@ -2323,9 +2326,9 @@ static unsigned int exec_ident_sweep_dead(void) {
   unsigned int removed;
 
   rcu_read_lock();
-  spin_lock_irqsave(&exec_ident_lock, flags);
+  raw_spin_lock_irqsave(&exec_ident_lock, flags);
   removed = exec_ident_sweep_dead_locked();
-  spin_unlock_irqrestore(&exec_ident_lock, flags);
+  raw_spin_unlock_irqrestore(&exec_ident_lock, flags);
   rcu_read_unlock();
   return removed;
 }
@@ -2345,7 +2348,7 @@ void av_behavior_exec_ident_stage(const struct file *file) {
   fresh = kzalloc(sizeof(*fresh), GFP_ATOMIC);
 
   rcu_read_lock();
-  spin_lock_irqsave(&exec_ident_lock, flags);
+  raw_spin_lock_irqsave(&exec_ident_lock, flags);
   n = exec_ident_find_locked(tgid);
   if (n) {
     /* Not visible to readers - see the struct. */
@@ -2365,7 +2368,7 @@ void av_behavior_exec_ident_stage(const struct file *file) {
       fresh = NULL;
     }
   }
-  spin_unlock_irqrestore(&exec_ident_lock, flags);
+  raw_spin_unlock_irqrestore(&exec_ident_lock, flags);
   rcu_read_unlock();
 
   kfree(fresh);
@@ -2384,7 +2387,7 @@ void av_behavior_exec_ident_commit(void) {
    * when something is staged, which is nearly always true here. */
   next = kzalloc(sizeof(*next), GFP_ATOMIC);
 
-  spin_lock_irqsave(&exec_ident_lock, flags);
+  raw_spin_lock_irqsave(&exec_ident_lock, flags);
   n = exec_ident_find_locked(tgid);
   if (n && n->has_staged) {
     if (next) {
@@ -2400,7 +2403,7 @@ void av_behavior_exec_ident_commit(void) {
       exec_ident_drop_locked(n);
     }
   }
-  spin_unlock_irqrestore(&exec_ident_lock, flags);
+  raw_spin_unlock_irqrestore(&exec_ident_lock, flags);
 
   kfree(next);
 }
@@ -2636,13 +2639,13 @@ void av_behavior_exit(void) {
     struct av_exec_ident *n;
     unsigned long flags;
 
-    spin_lock_irqsave(&exec_ident_lock, flags);
+    raw_spin_lock_irqsave(&exec_ident_lock, flags);
     hash_for_each_safe(exec_ident_table, bkt, tmp, n, node) {
       /* cppcheck-suppress uninitvar
        * Same false positive as in exec_ident_sweep_dead_locked(). */
       exec_ident_drop_locked(n);
     }
-    spin_unlock_irqrestore(&exec_ident_lock, flags);
+    raw_spin_unlock_irqrestore(&exec_ident_lock, flags);
     rcu_barrier();
   }
 
