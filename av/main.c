@@ -299,6 +299,14 @@ static bool kp_inode_rename_on;
 static struct kprobe kp_openat = {
     .symbol_name = "__arm64_sys_openat",
 };
+/* openat2() is a separate syscall, not a variant of openat() - without
+ * its own kprobe every write-intent open through it bypasses both
+ * write-open heuristics (sensitive-path writes and the rapid-write
+ * counter) completely, unlike the rename side, which has probed
+ * renameat2() all along. */
+static struct kprobe kp_openat2 = {
+    .symbol_name = "do_sys_openat2",
+};
 /* No kp_unlink/kp_rename here: arm64's native syscall table (see
  * include/uapi/asm-generic/unistd.h) never had raw unlink(2)/rename(2)
  * entries in the first place - those "old" syscalls were dropped in
@@ -1769,46 +1777,48 @@ static void av_openat_work_fn(struct work_struct *w) {
  * before this fix, not resolving it at all) let a caller reach
  * /etc/shadow while behavior.c only ever saw the bare string
  * "shadow". */
-static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
-  const char __user *user_filename;
-  int dfd;
-  int flags;
+static void schedule_openat_work(const char __user *user_filename, int dfd,
+                                 int flags) {
   struct av_openat_work *ow;
   struct path base;
 
-  if (!real_regs)
-    return 0;
-
-  user_filename = (const char __user *)real_regs->regs[1];
   if (!user_filename)
-    return 0;
+    return;
 
-  dfd = (int)real_regs->regs[0];
-  flags = (int)real_regs->regs[2];
   /* Skip the allocation/copy entirely for read-only opens - this is
    * the overwhelming majority of opens on a normal system, and
    * filtering here (still atomic-safe - just an integer test) avoids
    * scheduling work for events behavior.c would discard anyway. */
   if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)))
-    return 0;
+    return;
 
-  /* Resolve dfd BEFORE allocating/copying anything else - if the fd
-   * doesn't resolve (bogus/racing close) there's nothing useful to
-   * queue work for. */
-  if (!resolve_dfd_path(dfd, &base))
-    return 0;
+  /* Resolve dfd before allocating/copying anything else. An invalid dfd
+   * normally means there's nothing useful to queue work for - but Linux
+   * ignores dfd entirely for an absolute, unscoped pathname (dfd only
+   * matters for relative paths), so such an
+   * open can still succeed and must not be dropped. Provide a referenced
+   * cwd base (compatible with the worker's unconditional path_put()) in
+   * that case; relative/scoped paths still require a real dfd. */
+  if (!resolve_dfd_path(dfd, &base)) {
+    char first = '\0';
+
+    if (get_user(first, user_filename))
+      return;
+    if (first != '/')
+      return;
+    get_fs_pwd(current->fs, &base);
+  }
 
   if (!av_work_admit_nonexec()) {
     path_put(&base);
-    return 0;
+    return;
   }
 
   ow = kmalloc(sizeof(*ow), GFP_ATOMIC);
   if (!ow) {
     path_put(&base);
     av_work_release();
-    return 0;
+    return;
   }
   ow->base = base;
 
@@ -1819,7 +1829,7 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
       path_put(&ow->base);
       kfree(ow);
       av_work_release();
-      return 0;
+      return;
     }
   }
 
@@ -1828,6 +1838,60 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
   ow->target_pid = get_task_pid(current, PIDTYPE_PID);
   INIT_WORK(&ow->work, av_openat_work_fn);
   queue_work(av_wq, &ow->work);
+}
+
+static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
+  const struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
+
+  if (!real_regs)
+    return 0;
+
+  schedule_openat_work((const char __user *)real_regs->regs[1],
+                       (int)real_regs->regs[0], (int)real_regs->regs[2]);
+
+  return 0;
+}
+
+/* The UAPI struct open_how (include/uapi/linux/openat2.h) - laid out
+ * here rather than #include'd because only the kernel-internal copy of
+ * that header is guaranteed to exist across the build matrix, while
+ * this file needs nothing from it beyond the fixed field order. */
+struct av_open_how {
+  u64 flags;
+  u64 mode;
+  u64 resolve;
+};
+
+/* openat2 is hooked at do_sys_openat2() rather than the arm64 syscall
+ * wrapper: by that point the kernel has already copied the caller's
+ * struct open_how into kernel-owned memory via copy_struct_from_user(),
+ * so the handler reads a kernel pointer (no user-memory faults) and
+ * observes the same flags the kernel acts on. `size` validation happens
+ * in the wrapper, so a too-small how never reaches this hook. Only the
+ * low 32 bits of how->flags can ever hold an O_* bit; the upper half
+ * carries openat2-only open flags (e.g. OPENAT2_REGULAR), which the
+ * heuristics do not key on - exactly matching how the openat hook reads
+ * its `int flags` argument. */
+/* cppcheck-suppress constParameterCallback */
+static int handler_pre_openat2(struct kprobe *p, struct pt_regs *regs) {
+  int dfd = (int)regs->regs[0];
+  const char __user *user_filename = (const char __user *)regs->regs[1];
+  const struct av_open_how *how = (const struct av_open_how *)regs->regs[2];
+  struct av_open_how khow;
+
+  /* do_sys_openat2() is reached only after the syscall wrapper has
+   * successfully copied the caller's struct open_how into kernel-owned
+   * memory, so `how` points at that kernel copy rather than userspace -
+   * read it directly (no copy_from_user / user-fault handling) and
+   * observe the same flags the kernel will act on. */
+  if (!user_filename || !how)
+    return 0;
+
+  memset(&khow, 0, sizeof(khow));
+  if (copy_from_kernel_nofault(&khow, how, sizeof(khow)))
+    return 0;
+
+  schedule_openat_work(user_filename, dfd, (int)khow.flags);
 
   return 0;
 }
@@ -2352,11 +2416,18 @@ static int __init av_init(void) {
     goto err_kp_bprm_check;
   }
 
+  kp_openat2.pre_handler = handler_pre_openat2;
+  ret = register_kprobe(&kp_openat2);
+  if (ret < 0) {
+    pr_err("kernel-av: register_kprobe(openat2) failed: %d\n", ret);
+    goto err_kp_openat;
+  }
+
   kp_unlinkat.pre_handler = handler_pre_unlinkat;
   ret = register_kprobe(&kp_unlinkat);
   if (ret < 0) {
     pr_err("kernel-av: register_kprobe(unlinkat) failed: %d\n", ret);
-    goto err_kp_openat;
+    goto err_kp_openat2;
   }
 
   kp_renameat.pre_handler = handler_pre_renameat;
@@ -2408,6 +2479,8 @@ err_kp_renameat:
   unregister_kprobe(&kp_renameat);
 err_kp_unlinkat:
   unregister_kprobe(&kp_unlinkat);
+err_kp_openat2:
+  unregister_kprobe(&kp_openat2);
 err_kp_openat:
   unregister_kprobe(&kp_openat);
 err_kp_bprm_check:
@@ -2440,6 +2513,7 @@ static void __exit av_exit(void) {
   unregister_kprobe(&kp_renameat2);
   unregister_kprobe(&kp_renameat);
   unregister_kprobe(&kp_unlinkat);
+  unregister_kprobe(&kp_openat2);
   unregister_kprobe(&kp_openat);
   unregister_kprobe(&kp_bprm_check);
   /* destroy_workqueue() flushes all pending work first, so no work
