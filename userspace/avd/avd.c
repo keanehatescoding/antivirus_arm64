@@ -413,6 +413,7 @@ struct scan_task {
   struct scan_ident ident;
   char path[PATH_MAX];
   char sha256_hex[65];
+  struct timespec received; /* CLOCK_MONOTONIC, when the request arrived */
 };
 
 static struct scan_task *queue_head, *queue_tail;
@@ -2126,6 +2127,14 @@ struct scan_result {
    * there YARA itself never reached a verdict, so clean would be a
    * claim about content that was never examined. */
   bool incomplete;
+  /* True when no verdict could be produced at all, as opposed to a scan
+   * that ran and some layer of it was inconclusive: the scan worker
+   * crashed, replied garbage or missed its deadline, or none was free
+   * before the request's deadline. Always implies `incomplete`.
+   * Callers that can say "no verdict" (the kernel reply, via
+   * AV_VERDICT_UNAVAILABLE) must not turn it into CLEAN, and it is not
+   * recorded in verdict history, which only holds verdicts. */
+  bool unavailable;
 };
 
 /* Shared byte budget for the YARA snapshot copies (see
@@ -2145,8 +2154,21 @@ static size_t yara_snapshot_inflight = 0;
  * many bytes the worker may use, so in a worker "reserve" means "fits
  * in what the daemon granted" and nothing is accounted locally. */
 static bool scanproc_child_mode;
+static int scanproc_child_sfd = -1;
 static uint64_t scanproc_child_granted;
 static uint64_t scanproc_child_hint;
+static int scanproc_child_timeout_secs; /* 0 = avd_scan_timeout_secs */
+
+static void scanproc_child_notify_release(void);
+
+/* YARA timeout for the scan in progress. In a worker the daemon passes
+ * down what is left of the request's time budget (it may have queued
+ * for a worker); in the daemon it is the plain tunable. */
+static int scan_yara_timeout_secs(void) {
+  if (scanproc_child_mode && scanproc_child_timeout_secs > 0)
+    return scanproc_child_timeout_secs;
+  return avd_scan_timeout_secs;
+}
 
 static bool yara_snapshot_reserve(size_t need) {
   bool ok = false;
@@ -2169,8 +2191,11 @@ static bool yara_snapshot_reserve(size_t need) {
  * purely defensive so an accounting bug can never wedge the budget
  * above zero and starve all future YARA scans. */
 static void yara_snapshot_release(size_t held) {
-  if (scanproc_child_mode)
+  if (scanproc_child_mode) {
+    /* The daemon owns the budget; tell it the snapshot is gone. */
+    scanproc_child_notify_release();
     return;
+  }
   pthread_mutex_lock(&yara_snapshot_lock);
   if (yara_snapshot_inflight >= held)
     yara_snapshot_inflight -= held;
@@ -2446,7 +2471,7 @@ static void scan_core(int fd, const char *path, const char *sha256_hex,
         } else {
           ret = yr_rules_scan_mem(compiled_rules, snap, total, 0,
                                   yara_callback, &ctx,
-                                  avd_scan_timeout_secs);
+                                  scan_yara_timeout_secs());
           if (ret != ERROR_SUCCESS) {
             /* File vanished, permission denied, scan timeout, etc. -
              * fail open here too, matching the kernel side's own
@@ -2615,21 +2640,23 @@ record:
  *     with SCM_RIGHTS (never a path to re-open: the worker scans the
  *     exact file the daemon already vetted). A reply is a fixed-size
  *     struct, validated field by field before the daemon trusts it.
- *   - The caller's own thread (scan worker thread, fanotify thread or
- *     control-socket connection thread) checks out an idle worker, does
- *     the round trip and checks it back in. All the daemon's existing
- *     queueing and concurrency limits therefore stay as they were.
+ *   - The caller's own thread (netlink scan thread, fanotify thread or
+ *     control-socket connection thread - all three share the one pool)
+ *     checks out an idle worker, does the round trip and checks it back
+ *     in. Waiting for a worker is bounded by the request's deadline.
  *   - Quarantine and verdict history stay in the daemon (perform_scan()).
  *
  * Failure handling: a worker that crashes, replies garbage or overruns
- * its deadline is killed and retired, and that scan reports CLEAN with
- * `incomplete` set - the same "did not finish" signal every caller
- * already understands (fail-open, or deny when fail-closed). The file is
- * never re-scanned in the daemon, so a file that crashes a parser cannot
- * take the daemon down with it. Retired workers are not replaced yet
- * (respawning from a multithreaded daemon needs a pre-thread supervisor,
- * a later step); once every worker is gone, scans fall back to running
- * in the daemon so the AV does not go blind.
+ * its deadline is killed and retired, and no worker free in time is
+ * reported the same way. Either yields CLEAN with `incomplete` AND
+ * `unavailable` set: callers that can tell the kernel "no verdict" do
+ * (handle_scan_request()), the SCAN command reports INCOMPLETE, and the
+ * fanotify gate applies its fail-open/fail-closed policy. The file is
+ * never re-scanned in the daemon, so a file that crashes a parser
+ * cannot take the daemon down with it. Retired workers are not
+ * replaced yet (respawning from a multithreaded daemon needs a
+ * pre-thread supervisor, a later step); once every worker is gone,
+ * scans fall back to running in the daemon so the AV does not go blind.
  *
  * scanproc_init() must run before the first pthread_create(): forking
  * from a multithreaded process is only safe up to exec, and the workers
@@ -2639,16 +2666,22 @@ record:
 #define AVD_SCAN_PROCS_MIN 0
 #define AVD_SCAN_PROCS_MAX 64
 /* Wall-clock allowance on top of AVD_SCAN_TIMEOUT_SECS before a worker
- * is declared hung: the YARA stage honours the timeout itself, but the
+ * is declared hung: the YARA stage honours its timeout itself, but the
  * SHA-256, ssdeep and TLSH stages only have size caps. */
 #define AVD_SCANPROC_SLACK_SECS 30
-#define SCANPROC_MAGIC 0x41565331u /* "AVS1" */
+#define SCANPROC_MAGIC 0x41565332u /* "AVS2" */
+#define SCANPROC_MSG_RESULT 1u
+/* Worker -> daemon, mid-scan: the YARA snapshot has been freed, so the
+ * daemon may hand its share of the budget to someone else. */
+#define SCANPROC_MSG_RELEASE 2u
 
 struct scanproc_req {
   uint32_t magic;
   uint32_t pid;
   uint64_t granted;       /* YARA snapshot bytes the daemon reserved */
   uint64_t inflight_hint; /* daemon-wide in-flight bytes, for the log */
+  uint32_t timeout_secs;  /* YARA timeout for this scan, from the budget
+                           * the request has left */
   uint8_t on_demand;
   char path[PATH_MAX];
   char sha256_hex[65];
@@ -2656,6 +2689,7 @@ struct scanproc_req {
 
 struct scanproc_resp {
   uint32_t magic;
+  uint32_t kind; /* SCANPROC_MSG_RESULT or SCANPROC_MSG_RELEASE */
   uint32_t owner_uid; /* (uint32_t)-1 if the worker's fstat() failed */
   int32_t score;
   uint8_t verdict;
@@ -2671,12 +2705,37 @@ struct scanproc {
   bool busy;  /* guarded by scanproc_lock */
 };
 
+/* A retired worker that did not exit within the bounded wait (stuck in
+ * uninterruptible I/O). Its snapshot may still be resident, so the
+ * budget it was granted stays charged until it is actually reaped. */
+struct scanproc_pending {
+  pid_t pid;
+  size_t held;
+};
+
 static struct scanproc *scanprocs;
 static int scanproc_n;
 static int scanproc_alive; /* guarded by scanproc_lock */
+static struct scanproc_pending scanproc_pending[AVD_SCAN_PROCS_MAX];
+static int scanproc_pending_n; /* guarded by scanproc_lock */
 static int scanproc_slack_secs = AVD_SCANPROC_SLACK_SECS;
 static pthread_mutex_t scanproc_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t scanproc_cv = PTHREAD_COND_INITIALIZER;
+
+/* A caller waiting for a worker. Waiters form a FIFO and a returning
+ * worker is handed straight to the head of it. A plain condvar would
+ * let the thread that just finished a scan check the worker out again
+ * before a sleeping waiter ever got the lock, starving it until its
+ * deadline - and a starved scan is reported as "no verdict", which
+ * fail-closed turns into a denied exec. All fields are guarded by
+ * scanproc_lock. */
+struct scanproc_waiter {
+  struct scanproc_waiter *next;
+  pthread_cond_t cv; /* CLOCK_MONOTONIC, to match the deadlines */
+  struct scanproc *slot; /* set when a worker is handed over */
+  bool queued;           /* still on the list */
+  bool none;             /* no worker is left alive at all */
+};
+static struct scanproc_waiter *scanproc_wait_head, *scanproc_wait_tail;
 
 static void scanproc_close_other_fds(int keep) {
   bool ok = false;
@@ -2741,6 +2800,22 @@ static ssize_t scanproc_recv_req(int sfd, struct scanproc_req *req,
   return n;
 }
 
+/* Called (via yara_snapshot_release()) from inside scan_core() in a
+ * worker, right after the snapshot buffer was freed. */
+static void scanproc_child_notify_release(void) {
+  struct scanproc_resp m;
+  ssize_t n;
+
+  memset(&m, 0, sizeof(m));
+  m.magic = SCANPROC_MAGIC;
+  m.kind = SCANPROC_MSG_RELEASE;
+  do {
+    n = send(scanproc_child_sfd, &m, sizeof(m), MSG_NOSIGNAL);
+  } while (n < 0 && errno == EINTR);
+  if (n != (ssize_t)sizeof(m))
+    _exit(1);
+}
+
 /* Worker main loop. Never returns. */
 static void scanproc_child_main(int sfd, pid_t parent) {
   struct sigaction sa;
@@ -2767,6 +2842,7 @@ static void scanproc_child_main(int sfd, pid_t parent) {
    * promptly and are not lost if this process is killed. */
   setvbuf(stdout, NULL, _IOLBF, 0);
 
+  scanproc_child_sfd = sfd;
   scanproc_child_mode = true;
 
   for (;;) {
@@ -2790,6 +2866,10 @@ static void scanproc_child_main(int sfd, pid_t parent) {
 
     scanproc_child_granted = req.granted;
     scanproc_child_hint = req.inflight_hint;
+    scanproc_child_timeout_secs =
+        (req.timeout_secs >= 1 && req.timeout_secs <= AVD_SCAN_TIMEOUT_MAX)
+            ? (int)req.timeout_secs
+            : 0;
 
     scan_core(fd, req.path, req.sha256_hex, req.pid, req.on_demand != 0,
               &result, &owner_uid);
@@ -2797,6 +2877,7 @@ static void scanproc_child_main(int sfd, pid_t parent) {
 
     memset(&resp, 0, sizeof(resp));
     resp.magic = SCANPROC_MAGIC;
+    resp.kind = SCANPROC_MSG_RESULT;
     resp.owner_uid = (uint32_t)owner_uid;
     resp.score = (int32_t)result.score;
     resp.verdict = result.verdict;
@@ -2874,76 +2955,205 @@ static void scanproc_init(int want) {
          scanproc_alive, want);
 }
 
-/* Park until an idle live worker exists. Returns NULL once no worker is
- * left alive. Every busy worker is released within the dispatch
- * deadline (or retired), so this cannot wait forever. */
-static struct scanproc *scanproc_checkout(void) {
-  struct scanproc *got = NULL;
-  int i;
+/* Collect retired workers that finally exited, without blocking, and
+ * only then give back the budget they were granted. */
+static void scanproc_reap_pending(void) {
+  size_t freed[AVD_SCAN_PROCS_MAX];
+  int nfreed = 0;
 
   pthread_mutex_lock(&scanproc_lock);
-  while (!got && scanproc_alive > 0) {
-    for (i = 0; i < scanproc_n; i++) {
-      if (scanprocs[i].alive && !scanprocs[i].busy) {
-        scanprocs[i].busy = true;
-        got = &scanprocs[i];
-        break;
-      }
+  for (int i = 0; i < scanproc_pending_n;) {
+    pid_t r = waitpid(scanproc_pending[i].pid, NULL, WNOHANG);
+
+    if (r == 0) {
+      i++;
+      continue;
     }
-    if (!got)
-      pthread_cond_wait(&scanproc_cv, &scanproc_lock);
+    /* Reaped (r == pid) or already gone (r < 0): either way no process
+     * of ours still holds that memory. */
+    freed[nfreed++] = scanproc_pending[i].held;
+    scanproc_pending[i] = scanproc_pending[--scanproc_pending_n];
   }
   pthread_mutex_unlock(&scanproc_lock);
-  return got;
+
+  for (int i = 0; i < nfreed; i++)
+    if (freed[i])
+      yara_snapshot_release(freed[i]);
 }
 
-static void scanproc_checkin(struct scanproc *sp) {
+enum { SCANPROC_CO_OK, SCANPROC_CO_NONE, SCANPROC_CO_TIMEOUT };
+
+static void scanproc_waiter_init(struct scanproc_waiter *w) {
+  pthread_condattr_t ca;
+
+  memset(w, 0, sizeof(*w));
+  /* Deadlines are CLOCK_MONOTONIC; the condvar must wait on the same
+   * clock or a wall-clock step would stretch or cut the wait. */
+  pthread_condattr_init(&ca);
+  pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+  pthread_cond_init(&w->cv, &ca);
+  pthread_condattr_destroy(&ca);
+}
+
+/* No worker is left alive: wake every waiter so it can fall back.
+ * Called with scanproc_lock held. */
+static void scanproc_fail_waiters_locked(void) {
+  for (struct scanproc_waiter *w = scanproc_wait_head; w; w = w->next) {
+    w->none = true;
+    w->queued = false;
+    pthread_cond_signal(&w->cv);
+  }
+  scanproc_wait_head = scanproc_wait_tail = NULL;
+}
+
+/* Take an idle live worker, queueing in FIFO order behind earlier
+ * callers if there is none, until `deadline` (CLOCK_MONOTONIC).
+ * SCANPROC_CO_NONE means no worker is left alive at all. Every busy
+ * worker is returned within its dispatch deadline (or retired), so even
+ * a caller without a deadline of its own cannot wait forever. */
+static int scanproc_checkout(const struct timespec *deadline,
+                             struct scanproc **slot) {
+  struct scanproc_waiter w;
+  int rc;
+
+  scanproc_reap_pending();
+
   pthread_mutex_lock(&scanproc_lock);
-  sp->busy = false;
-  pthread_cond_signal(&scanproc_cv);
+  *slot = NULL;
+  if (scanproc_alive == 0) {
+    pthread_mutex_unlock(&scanproc_lock);
+    return SCANPROC_CO_NONE;
+  }
+  if (!scanproc_wait_head) {
+    for (int i = 0; i < scanproc_n; i++) {
+      if (scanprocs[i].alive && !scanprocs[i].busy) {
+        scanprocs[i].busy = true;
+        *slot = &scanprocs[i];
+        pthread_mutex_unlock(&scanproc_lock);
+        return SCANPROC_CO_OK;
+      }
+    }
+  }
+
+  scanproc_waiter_init(&w);
+  w.queued = true;
+  if (scanproc_wait_tail)
+    scanproc_wait_tail->next = &w;
+  else
+    scanproc_wait_head = &w;
+  scanproc_wait_tail = &w;
+
+  while (!w.slot && !w.none) {
+    if (pthread_cond_timedwait(&w.cv, &scanproc_lock, deadline) == ETIMEDOUT)
+      break;
+  }
+
+  if (w.slot) {
+    /* Also covers a hand-over that raced with the timeout. */
+    *slot = w.slot;
+    rc = SCANPROC_CO_OK;
+  } else if (w.none) {
+    rc = SCANPROC_CO_NONE;
+  } else {
+    struct scanproc_waiter **pp = &scanproc_wait_head;
+    struct scanproc_waiter *prev = NULL;
+
+    while (*pp && *pp != &w) {
+      prev = *pp;
+      pp = &(*pp)->next;
+    }
+    if (*pp) {
+      *pp = w.next;
+      if (scanproc_wait_tail == &w)
+        scanproc_wait_tail = prev;
+    }
+    rc = SCANPROC_CO_TIMEOUT;
+  }
+  pthread_mutex_unlock(&scanproc_lock);
+  pthread_cond_destroy(&w.cv);
+  return rc;
+}
+
+/* Give the worker to the longest-waiting caller, or mark it idle. */
+static void scanproc_checkin(struct scanproc *sp) {
+  struct scanproc_waiter *w;
+
+  pthread_mutex_lock(&scanproc_lock);
+  w = scanproc_wait_head;
+  if (w) {
+    scanproc_wait_head = w->next;
+    if (!scanproc_wait_head)
+      scanproc_wait_tail = NULL;
+    w->queued = false;
+    w->slot = sp; /* stays busy: it now belongs to the waiter */
+    pthread_cond_signal(&w->cv);
+  } else {
+    sp->busy = false;
+  }
   pthread_mutex_unlock(&scanproc_lock);
 }
 
 /* Reap `pid`, waiting a bounded time: a worker stuck in uninterruptible
  * I/O (a hung network mount, say) survives SIGKILL until the I/O ends,
- * and that must not wedge the calling thread as well. */
-static void scanproc_reap(pid_t pid) {
+ * and that must not wedge the calling thread as well. Returns false if
+ * the process was still around when the wait ran out. */
+static bool scanproc_reap(pid_t pid) {
   for (int t = 0; t < 200; t++) {
-    pid_t r = waitpid(pid, NULL, WNOHANG);
-
-    if (r != 0)
-      return;
+    if (waitpid(pid, NULL, WNOHANG) != 0)
+      return true;
     usleep(10000);
   }
   fprintf(stderr, "avd: scan worker pid %d did not exit after SIGKILL\n",
           (int)pid);
+  return false;
 }
 
-/* Retire a worker the caller currently holds. */
-static void scanproc_retire(struct scanproc *sp, const char *why) {
+/* Retire a worker the caller currently holds. `held` is the snapshot
+ * budget still charged for its scan: it goes back only once the process
+ * is known to be gone - immediately if the reap succeeds, otherwise
+ * when scanproc_reap_pending() later sees it exit. */
+static void scanproc_retire(struct scanproc *sp, const char *why,
+                            size_t held) {
   pid_t pid = sp->pid;
+  bool reaped;
   int left;
 
   kill(pid, SIGKILL);
-  scanproc_reap(pid);
+  reaped = scanproc_reap(pid);
   close(sp->fd);
   pthread_mutex_lock(&scanproc_lock);
   sp->alive = false;
   sp->busy = false;
   left = --scanproc_alive;
-  pthread_cond_broadcast(&scanproc_cv);
+  if (left == 0)
+    scanproc_fail_waiters_locked();
+  if (!reaped && scanproc_pending_n < AVD_SCAN_PROCS_MAX) {
+    scanproc_pending[scanproc_pending_n].pid = pid;
+    scanproc_pending[scanproc_pending_n].held = held;
+    scanproc_pending_n++;
+    held = 0;
+  }
   pthread_mutex_unlock(&scanproc_lock);
+  if (held)
+    yara_snapshot_release(held);
   fprintf(stderr,
           "avd: scan worker pid %d retired (%s); %d worker(s) left%s\n",
           (int)pid, why, left,
           left == 0 ? " - falling back to in-process scanning" : "");
 }
 
-/* One request/reply exchange. 0 on success, -1 on any failure, -2 if
- * the reply missed the deadline. */
+#define SCANPROC_RT_OK 0
+#define SCANPROC_RT_BROKEN (-1)   /* connection broken or exchange unclear */
+#define SCANPROC_RT_DEADLINE (-2) /* no reply before the deadline */
+#define SCANPROC_RT_NOT_SENT (-3) /* local pre-send failure: the worker never
+                                   * saw the request and is still healthy */
+
+/* One request/reply exchange. `*held` is the snapshot budget currently
+ * charged for this scan; a RELEASE message from the worker returns it
+ * and zeroes it. */
 static int scanproc_roundtrip(struct scanproc *sp, int fd,
                               const struct scanproc_req *req,
-                              struct scanproc_resp *resp) {
+                              struct scanproc_resp *resp, size_t *held) {
   union {
     char buf[CMSG_SPACE(sizeof(int))];
     struct cmsghdr align;
@@ -2973,8 +3183,10 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
   do {
     n = sendmsg(sp->fd, &mh, MSG_NOSIGNAL);
   } while (n < 0 && errno == EINTR);
+  if (n < 0 && (errno == ENOMEM || errno == ENOBUFS))
+    return SCANPROC_RT_NOT_SENT; /* the kernel refused to queue it */
   if (n != (ssize_t)sizeof(*req))
-    return -1;
+    return SCANPROC_RT_BROKEN;
 
   for (;;) {
     long ms;
@@ -2984,20 +3196,35 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
     ms = (long)(deadline.tv_sec - now.tv_sec) * 1000L +
          (deadline.tv_nsec - now.tv_nsec) / 1000000L;
     if (ms <= 0)
-      return -2;
+      return SCANPROC_RT_DEADLINE;
     rc = poll(&pfd, 1, ms > INT_MAX ? INT_MAX : (int)ms);
     if (rc < 0 && errno == EINTR)
       continue;
     if (rc < 0)
-      return -1;
-    if (rc > 0)
-      break;
-  }
+      return SCANPROC_RT_BROKEN;
+    if (rc == 0)
+      continue; /* re-check the deadline above */
 
-  do {
-    n = recv(sp->fd, resp, sizeof(*resp), 0);
-  } while (n < 0 && errno == EINTR);
-  return n == (ssize_t)sizeof(*resp) ? 0 : -1;
+    /* MSG_TRUNC makes recv() report the real packet length even when it
+     * is longer than the buffer, so an oversized reply fails the length
+     * check instead of being accepted as its first sizeof(*resp) bytes. */
+    do {
+      n = recv(sp->fd, resp, sizeof(*resp), MSG_TRUNC | MSG_DONTWAIT);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+      continue;
+    if (n != (ssize_t)sizeof(*resp))
+      return SCANPROC_RT_BROKEN;
+
+    if (resp->magic == SCANPROC_MAGIC && resp->kind == SCANPROC_MSG_RELEASE) {
+      if (*held) {
+        yara_snapshot_release(*held);
+        *held = 0;
+      }
+      continue;
+    }
+    return SCANPROC_RT_OK;
+  }
 }
 
 /* Structural checks on a worker's reply. The worker parses attacker-
@@ -3005,11 +3232,14 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
  * untrusted. rule_name is sanitised rather than rejected: it ends up in
  * logs, quarantine metadata and the kernel verdict, so control
  * characters (log/line injection) must not survive, but an unusual name
- * is not a reason to kill a healthy worker. */
+ * is not a reason to kill a healthy worker. The score is not range
+ * checked: YARA `weight` metadata is signed, and a rule that convicts
+ * through `override` can carry any value. */
 static bool scanproc_resp_valid(struct scanproc_resp *r) {
   size_t len;
 
-  if (r->magic != SCANPROC_MAGIC || r->incomplete > 1 || r->score < 0)
+  if (r->magic != SCANPROC_MAGIC || r->kind != SCANPROC_MSG_RESULT ||
+      r->incomplete > 1)
     return false;
   if (r->verdict != AV_VERDICT_CLEAN && r->verdict != AV_VERDICT_MALICIOUS)
     return false;
@@ -3032,53 +3262,109 @@ static bool scanproc_resp_valid(struct scanproc_resp *r) {
   return true;
 }
 
+/* Fill `out` for a scan that produced no verdict. */
+static void scan_unavailable(const char *sha256_hex, struct scan_result *out) {
+  memset(out, 0, sizeof(*out));
+  out->verdict = AV_VERDICT_CLEAN;
+  out->incomplete = true;
+  out->unavailable = true;
+  if (sha256_hex && sha256_hex[0])
+    snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", sha256_hex);
+}
+
 /* scan_core() in a worker process when the pool is up, in-process
- * otherwise. Same contract as scan_core(). */
+ * otherwise. Same contract as scan_core(), plus: `deadline`
+ * (CLOCK_MONOTONIC, NULL = avd_scan_timeout_secs from now) bounds the
+ * whole request. Waiting for a free worker ends there, and the YARA
+ * stage gets only the time the request has left, so queueing behind
+ * another scan cannot push the answer past the kernel's reply window.
+ * The in-process path ignores it: it has no queue of its own to bound. */
 static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
                           uint32_t pid, bool on_demand,
+                          const struct timespec *deadline,
                           struct scan_result *out, uid_t *owner_uid_out) {
   struct scanproc *sp;
   struct scanproc_req req;
   struct scanproc_resp resp;
+  struct timespec now, dl;
   struct stat st;
   size_t need = 0;
-  bool reserved = false;
+  size_t held = 0;
+  long left_ms;
   bool have_st;
   int rc;
 
-  if (!scanprocs || !(sp = scanproc_checkout())) {
+  if (!scanprocs) {
     scan_core(fd, path, sha256_hex, pid, on_demand, out, owner_uid_out);
+    return;
+  }
+
+  if (deadline) {
+    dl = *deadline;
+  } else {
+    clock_gettime(CLOCK_MONOTONIC, &dl);
+    dl.tv_sec += avd_scan_timeout_secs;
+  }
+
+  have_st = fstat(fd, &st) == 0;
+  *owner_uid_out = have_st ? st.st_uid : (uid_t)-1;
+
+  rc = scanproc_checkout(&dl, &sp);
+  if (rc == SCANPROC_CO_NONE) {
+    scan_core(fd, path, sha256_hex, pid, on_demand, out, owner_uid_out);
+    return;
+  }
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  left_ms = (long)(dl.tv_sec - now.tv_sec) * 1000L +
+            (dl.tv_nsec - now.tv_nsec) / 1000000L;
+  /* The YARA timeout has one-second granularity, so less than a second
+   * left is not enough to scan anything. */
+  if (rc == SCANPROC_CO_TIMEOUT || left_ms < 1000) {
+    if (rc == SCANPROC_CO_OK)
+      scanproc_checkin(sp);
+    fprintf(stderr,
+            "avd: no scan worker free in time for \"%s\" - reporting no "
+            "verdict\n",
+            path);
+    scan_unavailable(sha256_hex, out);
     return;
   }
 
   /* The snapshot budget is daemon-wide, so the daemon reserves it and
    * tells the worker how much it may use; a file that grew since is
-   * refused by the worker, never silently over budget. */
-  have_st = fstat(fd, &st) == 0;
+   * refused by the worker, never silently over budget. The grant is
+   * given back when the worker says its snapshot is freed, not when the
+   * whole scan ends (fuzzy/TLSH hashing needs no snapshot). */
   if (have_st && S_ISREG(st.st_mode) && st.st_size > 0 &&
       st.st_size <= (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
     need = (size_t)st.st_size;
-    reserved = yara_snapshot_reserve(need);
+    if (yara_snapshot_reserve(need))
+      held = need;
   }
 
   memset(&req, 0, sizeof(req));
   req.magic = SCANPROC_MAGIC;
   req.pid = pid;
   req.on_demand = on_demand ? 1 : 0;
-  req.granted = reserved ? need : 0;
-  req.inflight_hint = (need && !reserved) ? yara_snapshot_inflight_bytes() : 0;
+  req.granted = held;
+  req.inflight_hint = (need && !held) ? yara_snapshot_inflight_bytes() : 0;
+  {
+    long secs = (left_ms + 999) / 1000;
+
+    if (secs > avd_scan_timeout_secs)
+      secs = avd_scan_timeout_secs;
+    req.timeout_secs = (uint32_t)secs;
+  }
   snprintf(req.path, sizeof(req.path), "%s", path);
   snprintf(req.sha256_hex, sizeof(req.sha256_hex), "%s",
            sha256_hex ? sha256_hex : "");
 
-  rc = scanproc_roundtrip(sp, fd, &req, &resp);
-  if (reserved)
-    yara_snapshot_release(need);
+  rc = scanproc_roundtrip(sp, fd, &req, &resp, &held);
 
-  memset(out, 0, sizeof(*out));
-  out->verdict = AV_VERDICT_CLEAN;
-
-  if (rc == 0 && scanproc_resp_valid(&resp)) {
+  if (rc == SCANPROC_RT_OK && scanproc_resp_valid(&resp)) {
+    if (held)
+      yara_snapshot_release(held); /* YARA never ran, or never released */
+    memset(out, 0, sizeof(*out));
     out->verdict = resp.verdict;
     out->score = resp.score;
     out->incomplete = resp.incomplete != 0;
@@ -3091,23 +3377,37 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
     return;
   }
 
-  /* The worker is not trusted to continue after a bad exchange. The
-   * file is deliberately not re-scanned here. */
-  scanproc_retire(sp, rc == -2   ? "scan deadline exceeded"
-                      : rc == 0 ? "invalid reply"
-                                : "crashed or protocol error");
-  fprintf(stderr, "avd: scan of \"%s\" did not complete in a worker - "
-                  "reporting incomplete\n",
-          path);
-  out->incomplete = true;
-  if (sha256_hex && sha256_hex[0])
-    snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", sha256_hex);
-  *owner_uid_out = have_st ? st.st_uid : (uid_t)-1;
+  if (rc == SCANPROC_RT_NOT_SENT) {
+    /* The request never left the daemon (socket buffer memory), so the
+     * worker is fine and nothing was granted to it in practice. */
+    if (held)
+      yara_snapshot_release(held);
+    scanproc_checkin(sp);
+    fprintf(stderr,
+            "avd: could not hand \"%s\" to a scan worker: %s - reporting no "
+            "verdict\n",
+            path, strerror(errno));
+  } else {
+    /* The worker is not trusted to continue after a bad exchange, and
+     * its snapshot may still be resident, so the grant stays charged
+     * until it is confirmed gone. The file is deliberately not
+     * re-scanned here. */
+    scanproc_retire(sp,
+                    rc == SCANPROC_RT_DEADLINE ? "scan deadline exceeded"
+                    : rc == SCANPROC_RT_OK     ? "invalid reply"
+                                               : "crashed or protocol error",
+                    held);
+    fprintf(stderr,
+            "avd: scan of \"%s\" did not complete in a worker - reporting "
+            "no verdict\n",
+            path);
+  }
+  scan_unavailable(sha256_hex, out);
 }
 
 /* Stop idle workers at shutdown: closing the socket ends the worker's
- * loop. A worker still held by a detached control-socket connection
- * thread is left to exit with the daemon (EOF or PDEATHSIG). */
+ * loop. By now no scan caller is running (see ctl_scan_close_and_drain()
+ * and the joined worker/fanotify threads), so none is busy. */
 static void scanproc_shutdown(void) {
   pid_t pids[AVD_SCAN_PROCS_MAX];
   int fds[AVD_SCAN_PROCS_MAX];
@@ -3126,7 +3426,8 @@ static void scanproc_shutdown(void) {
       scanproc_alive--;
     }
   }
-  pthread_cond_broadcast(&scanproc_cv);
+  if (scanproc_alive == 0)
+    scanproc_fail_waiters_locked();
   pthread_mutex_unlock(&scanproc_lock);
 
   for (int i = 0; i < n; i++)
@@ -3144,6 +3445,7 @@ static void scanproc_shutdown(void) {
       scanproc_reap(pids[i]);
     }
   }
+  scanproc_reap_pending();
 }
 
 /*
@@ -3153,23 +3455,31 @@ static void scanproc_shutdown(void) {
  * This wrapper applies those side effects from the returned struct, so
  * a later privilege split can run scan_core() in an unprivileged
  * worker and keep quarantine_file()/record_verdict_history() here, in
- * the root parent. (`pid` and `on_demand` reach scan_core() only so the
+ * the root parent. `deadline` (CLOCK_MONOTONIC, NULL = default) bounds
+ * the request when scanning runs in worker processes. (`pid` and
+ * `on_demand` reach scan_core() only so the
  * "avd: scan ..." log line keeps its exact format.) Behaviour is
  * unchanged from the old single function: same order (quarantine, then
  * history), same arguments.
  */
 static void perform_scan(int fd, const char *path, const char *sha256_hex,
                          uint32_t pid, bool on_demand,
+                         const struct timespec *deadline,
                          struct scan_result *out) {
   uid_t owner_uid;
 
-  scan_dispatch(fd, path, sha256_hex, pid, on_demand, out, &owner_uid);
+  scan_dispatch(fd, path, sha256_hex, pid, on_demand, deadline, out,
+                &owner_uid);
 
   if (out->verdict == AV_VERDICT_MALICIOUS)
     quarantine_file(fd, path, out->rule_name, out->sha256_hex);
 
-  record_verdict_history(pid, owner_uid, path, out->sha256_hex, out->verdict,
-                         out->rule_name, out->score, on_demand);
+  /* No verdict was produced, so there is nothing to record: history
+   * would otherwise show CLEAN for a file nobody examined. */
+  if (!out->unavailable)
+    record_verdict_history(pid, owner_uid, path, out->sha256_hex,
+                           out->verdict, out->rule_name, out->score,
+                           on_demand);
 }
 
 /* Opens `p` for scanning: O_NONBLOCK + fstat/S_ISREG, same as cmd_scan()'s
@@ -3210,8 +3520,10 @@ static bool scan_ident_matches(const struct stat *st,
 
 static void handle_scan_request(uint64_t reqid, uint32_t pid,
                                 const struct scan_ident *ident,
-                                const char *path, const char *sha256_hex) {
+                                const char *path, const char *sha256_hex,
+                                const struct timespec *deadline) {
   struct scan_result result;
+  uint8_t verdict;
   struct stat st;
   const char *what = "";
   int fd;
@@ -3315,13 +3627,41 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
    * inode into quarantine and only unlinks `path` after an lstat()
    * re-check that its dev/ino still match the fd, which a swapped-in
    * decoy fails, so the decoy is never removed. */
-  perform_scan(fd, path, sha256_hex, pid, false, &result);
+  perform_scan(fd, path, sha256_hex, pid, false, deadline, &result);
 
-  if (send_verdict(reqid, result.verdict, result.rule_name) < 0)
+  verdict = result.verdict;
+  if (result.unavailable) {
+    /* The scan produced no verdict (worker failure, or none free in
+     * time). Answering CLEAN would make the kernel log event=clean and
+     * skip its fail-open/fail-closed daemon policy, so a file the
+     * worker might have convicted would simply run. AV_VERDICT_
+     * UNAVAILABLE gets that policy applied - but only a kernel that
+     * sent the file identity understands it (see the !ident->present
+     * branch above), so an older one still gets the old fail-open
+     * CLEAN. */
+    if (ident->present) {
+      verdict = AV_VERDICT_UNAVAILABLE;
+      fprintf(stderr,
+              "avd: reqid=%llu: no scan result for \"%s\" - answering "
+              "UNAVAILABLE\n",
+              (unsigned long long)reqid, path);
+    } else {
+      fprintf(stderr,
+              "avd: reqid=%llu: no scan result for \"%s\" and the kernel "
+              "predates UNAVAILABLE - answering CLEAN (fail open)\n",
+              (unsigned long long)reqid, path);
+    }
+  }
+
+  if (send_verdict(reqid, verdict,
+                   verdict == AV_VERDICT_UNAVAILABLE ? NULL
+                                                     : result.rule_name) < 0)
     fprintf(stderr,
             "avd: failed to send %s verdict for reqid=%llu \"%s\" - "
             "kernel side will fail open on timeout\n",
-            result.verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
+            verdict == AV_VERDICT_MALICIOUS     ? "MALICIOUS"
+            : verdict == AV_VERDICT_UNAVAILABLE ? "UNAVAILABLE"
+                                                : "CLEAN",
             (unsigned long long)reqid, path);
 
   close(fd);
@@ -3345,6 +3685,9 @@ static bool enqueue_scan_task(uint64_t reqid, uint32_t pid,
   if (!task)
     return false;
 
+  /* Before any queue backpressure wait: the kernel's reply window runs
+   * from when it sent the request, not from when the task got a slot. */
+  clock_gettime(CLOCK_MONOTONIC, &task->received);
   task->next = NULL;
   task->reqid = reqid;
   task->pid = pid;
@@ -3403,8 +3746,16 @@ static void *scan_worker_main(void *arg) {
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
 
-    handle_scan_request(task->reqid, task->pid, &task->ident, task->path,
-                        task->sha256_hex);
+    {
+      /* The request's budget is avd's own scan timeout, which the
+       * kernel's reply window (daemon_timeout_ms, 12 s by default) is
+       * sized to leave headroom over. */
+      struct timespec dl = task->received;
+
+      dl.tv_sec += avd_scan_timeout_secs;
+      handle_scan_request(task->reqid, task->pid, &task->ident, task->path,
+                          task->sha256_hex, &dl);
+    }
     free(task);
   }
 
@@ -3750,7 +4101,7 @@ static void fanexec_handle_event(const struct fanotify_event_metadata *md) {
    * all to be fed from here instead of from handle_scan_request()'s
    * open(path). That is the entire fix for gap 1: there is no second
    * open() for anyone to race. */
-  perform_scan(md->fd, path, NULL, md->pid, false, &result);
+  perform_scan(md->fd, path, NULL, md->pid, false, NULL, &result);
 
   if (result.verdict == AV_VERDICT_MALICIOUS) {
     decision = FAN_DENY;
@@ -4713,6 +5064,41 @@ static void cmd_quarantine_delete(int fd, const char *id) {
   write_all(fd, "OK\n", 3);
 }
 
+/* Control-socket connection threads are detached, so shutdown cannot
+ * join them. cmd_scan() runs the scanner (rules, corpora, worker pool)
+ * on such a thread, so shutdown closes this gate and waits for the
+ * scans already in flight before it frees any of that state. */
+static pthread_mutex_t ctl_scan_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ctl_scan_idle = PTHREAD_COND_INITIALIZER;
+static int ctl_scan_inflight;
+static bool ctl_scan_closed;
+
+static bool ctl_scan_enter(void) {
+  bool ok;
+
+  pthread_mutex_lock(&ctl_scan_lock);
+  ok = !ctl_scan_closed;
+  if (ok)
+    ctl_scan_inflight++;
+  pthread_mutex_unlock(&ctl_scan_lock);
+  return ok;
+}
+
+static void ctl_scan_leave(void) {
+  pthread_mutex_lock(&ctl_scan_lock);
+  if (--ctl_scan_inflight == 0)
+    pthread_cond_broadcast(&ctl_scan_idle);
+  pthread_mutex_unlock(&ctl_scan_lock);
+}
+
+static void ctl_scan_close_and_drain(void) {
+  pthread_mutex_lock(&ctl_scan_lock);
+  ctl_scan_closed = true;
+  while (ctl_scan_inflight > 0)
+    pthread_cond_wait(&ctl_scan_idle, &ctl_scan_lock);
+  pthread_mutex_unlock(&ctl_scan_lock);
+}
+
 static void cmd_scan(int fd, const char *path) {
   struct scan_result result;
   char row[PATH_MAX + 256];
@@ -4756,13 +5142,24 @@ static void cmd_scan(int fd, const char *path) {
     return;
   }
 
-  perform_scan(sfd, path, NULL, 0, true, &result);
+  if (!ctl_scan_enter()) {
+    close(sfd);
+    send_err(fd, "avd is shutting down");
+    return;
+  }
+  perform_scan(sfd, path, NULL, 0, true, NULL, &result);
+  ctl_scan_leave();
   close(sfd);
 
   write_all(fd, "OK\n", 3);
   write_all(fd, "COUNT 1\n", 8);
+  /* A detection stands even if some other layer was inconclusive, but a
+   * CLEAN that did not finish scanning must not be reported as CLEAN:
+   * it gets its own verdict word (docs/avd-socket-protocol.md). */
   snprintf(row, sizeof(row), "%s\t%s\t%d\t%s\n",
-           result.verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
+           result.verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS"
+           : result.incomplete                    ? "INCOMPLETE"
+                                                  : "CLEAN",
            result.rule_name, result.score, result.sha256_hex);
   write_all(fd, row, strlen(row));
   write_all(fd, "END\n", 4);
@@ -5873,6 +6270,7 @@ int main(int argc, char **argv) {
       control_sock_fd = -1;
       unlink(control_sock_path);
     }
+    ctl_scan_close_and_drain();
     scanproc_shutdown();
     free(workers);
     /* fanexec_aborted counts as a failed run for the same reason
