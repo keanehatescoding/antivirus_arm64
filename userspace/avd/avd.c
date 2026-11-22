@@ -2157,17 +2157,42 @@ static bool scanproc_child_mode;
 static int scanproc_child_sfd = -1;
 static uint64_t scanproc_child_granted;
 static uint64_t scanproc_child_hint;
-static int scanproc_child_timeout_secs; /* 0 = avd_scan_timeout_secs */
+static struct timespec scanproc_child_deadline;
+static bool scanproc_child_have_deadline;
+
+/* How much of the request's remaining time is held back from the YARA
+ * stage so the worker can reply before the deadline that kills it.
+ * Without it a scan that runs to its YARA timeout - the outcome a
+ * hostile file has most influence over - would finish at the same
+ * instant as the deadline and cost a healthy worker its life. */
+#define AVD_SCANPROC_REPLY_MARGIN_MS 1000
 
 static void scanproc_child_notify_release(void);
 
-/* YARA timeout for the scan in progress. In a worker the daemon passes
- * down what is left of the request's time budget (it may have queued
- * for a worker); in the daemon it is the plain tunable. */
+/* YARA timeout for the scan in progress. In the daemon it is the plain
+ * tunable. In a worker it is derived from the request's absolute
+ * deadline at the moment YARA starts, so time already spent queueing
+ * for a worker and hashing the file counts against it, minus the reply
+ * margin. It is rounded up and never below one second (0 would mean "no
+ * timeout" to YARA); the absolute deadline the daemon enforces in
+ * scanproc_roundtrip() is what is exact, and only a request with about a
+ * second or less left can have YARA run into it. */
 static int scan_yara_timeout_secs(void) {
-  if (scanproc_child_mode && scanproc_child_timeout_secs > 0)
-    return scanproc_child_timeout_secs;
-  return avd_scan_timeout_secs;
+  struct timespec now;
+  long left_ms, secs;
+
+  if (!scanproc_child_mode || !scanproc_child_have_deadline)
+    return avd_scan_timeout_secs;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  left_ms = (long)(scanproc_child_deadline.tv_sec - now.tv_sec) * 1000L +
+            (scanproc_child_deadline.tv_nsec - now.tv_nsec) / 1000000L;
+  secs = (left_ms - AVD_SCANPROC_REPLY_MARGIN_MS + 999) / 1000;
+  if (secs < 1)
+    secs = 1;
+  if (secs > avd_scan_timeout_secs)
+    secs = avd_scan_timeout_secs;
+  return (int)secs;
 }
 
 static bool yara_snapshot_reserve(size_t need) {
@@ -2669,12 +2694,6 @@ record:
 #define AVD_SCAN_PROCS_DEFAULT 0
 #define AVD_SCAN_PROCS_MIN 0
 #define AVD_SCAN_PROCS_MAX 64
-/* How much of the request's remaining time is held back from the YARA
- * stage so the worker can finish hashing and reply before the deadline
- * that kills it. Without it a scan that runs to its YARA timeout - the
- * outcome a hostile file has most influence over - would finish at the
- * same instant as the deadline and cost a healthy worker its life. */
-#define AVD_SCANPROC_REPLY_MARGIN_MS 1000
 #define SCANPROC_MAGIC 0x41565332u /* "AVS2" */
 #define SCANPROC_MSG_RESULT 1u
 /* Worker -> daemon, mid-scan: the YARA snapshot has been freed, so the
@@ -2686,8 +2705,8 @@ struct scanproc_req {
   uint32_t pid;
   uint64_t granted;       /* YARA snapshot bytes the daemon reserved */
   uint64_t inflight_hint; /* daemon-wide in-flight bytes, for the log */
-  uint32_t timeout_secs;  /* YARA timeout for this scan, from the budget
-                           * the request has left */
+  int64_t deadline_sec;   /* the request's absolute deadline, in the */
+  int64_t deadline_nsec;  /* system-wide CLOCK_MONOTONIC; 0 = none */
   uint8_t on_demand;
   char path[PATH_MAX];
   char sha256_hex[65];
@@ -2871,10 +2890,11 @@ static void scanproc_child_main(int sfd, pid_t parent) {
 
     scanproc_child_granted = req.granted;
     scanproc_child_hint = req.inflight_hint;
-    scanproc_child_timeout_secs =
-        (req.timeout_secs >= 1 && req.timeout_secs <= AVD_SCAN_TIMEOUT_MAX)
-            ? (int)req.timeout_secs
-            : 0;
+    scanproc_child_have_deadline = req.deadline_sec > 0 &&
+                                   req.deadline_nsec >= 0 &&
+                                   req.deadline_nsec < 1000000000L;
+    scanproc_child_deadline.tv_sec = (time_t)req.deadline_sec;
+    scanproc_child_deadline.tv_nsec = (long)req.deadline_nsec;
 
     scan_core(fd, req.path, req.sha256_hex, req.pid, req.on_demand != 0,
               &result, &owner_uid);
@@ -3284,9 +3304,11 @@ static void scan_unavailable(const char *sha256_hex, struct scan_result *out) {
 /* scan_core() in a worker process when the pool is up, in-process
  * otherwise. Same contract as scan_core(), plus: `deadline`
  * (CLOCK_MONOTONIC, NULL = avd_scan_timeout_secs from now) bounds the
- * whole request. Waiting for a free worker ends there, and the YARA
- * stage gets only the time the request has left, so queueing behind
- * another scan cannot push the answer past the kernel's reply window.
+ * whole request. Waiting for a free worker ends there, the worker
+ * itself is given the deadline and sizes its YARA timeout from what is
+ * left when YARA starts (after queueing and hashing), and a worker still
+ * silent at the deadline is retired - so queueing behind another scan
+ * cannot push the answer past the kernel's reply window.
  * The in-process path ignores it: it has no queue of its own to bound. */
 static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
                           uint32_t pid, bool on_demand,
@@ -3363,20 +3385,9 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
   req.on_demand = on_demand ? 1 : 0;
   req.granted = held;
   req.inflight_hint = (need && !held) ? yara_snapshot_inflight_bytes() : 0;
-  {
-    /* Time left minus the reply margin, rounded up and never zero (0
-     * would mean "default"). The YARA timeout has one-second
-     * granularity; the absolute deadline in scanproc_roundtrip() is
-     * what is exact, and only a request with about a second or less
-     * left can have its YARA stage run into it. */
-    long secs = (left_ms - AVD_SCANPROC_REPLY_MARGIN_MS + 999) / 1000;
-
-    if (secs < 1)
-      secs = 1;
-    if (secs > avd_scan_timeout_secs)
-      secs = avd_scan_timeout_secs;
-    req.timeout_secs = (uint32_t)secs;
-  }
+  /* The worker derives its YARA timeout from this when YARA starts. */
+  req.deadline_sec = (int64_t)dl.tv_sec;
+  req.deadline_nsec = (int64_t)dl.tv_nsec;
   snprintf(req.path, sizeof(req.path), "%s", path);
   snprintf(req.sha256_hex, sizeof(req.sha256_hex), "%s",
            sha256_hex ? sha256_hex : "");

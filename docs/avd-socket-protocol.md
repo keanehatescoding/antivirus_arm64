@@ -222,19 +222,25 @@ it gets there.
   descriptor; quarantine and verdict history stay in the daemon. To
   avoid callers waiting for a worker, set `N` to at least the sum of
   those three (16 with the defaults).
-  - *The whole request is bounded.* A request has
+  - *The request is bounded - with two exceptions.* A request has
     `AVD_SCAN_TIMEOUT_SECS` from when it arrived (kernel-triggered) or
     started (the other paths). If no worker is free by then the scan
     reports no verdict instead of queueing past the kernel's reply
-    window; the YARA timeout of a scan that did get a worker is cut to
-    the time left minus a one-second margin for the worker to finish
-    hashing and reply (so a YARA timeout is an ordinary `INCOMPLETE`,
-    not a missed deadline - with the default 10 s the YARA stage gets
-    9 s in worker mode); and a worker that has not replied by that same
-    deadline (including during hashing, which has no timeout of its own)
-    is killed and retired. So even a hung worker cannot keep a caller,
-    including a `SCAN` client with its own shorter timeout, waiting past
-    the request's budget.
+    window. The worker is handed the deadline itself and takes its YARA
+    timeout from what is left when YARA starts - after queueing and
+    after hashing - minus a one-second margin for it to reply (so a YARA
+    timeout is an ordinary `INCOMPLETE`, not a missed deadline; with the
+    default 10 s and an immediate worker, YARA gets about 9 s). A worker
+    still silent at the deadline, including during hashing, which has no
+    timeout of its own, is killed and retired. The exceptions: (1) once
+    the last worker has been retired, a request that still has time left
+    is scanned in the daemon, and that scan does not enforce the
+    remaining deadline - it uses the plain `AVD_SCAN_TIMEOUT_SECS` YARA
+    timeout; (2) retiring a worker is synchronous: the kill is normally
+    reaped in milliseconds, but a worker stuck in uninterruptible I/O can
+    hold the caller for up to about two more seconds. A client's own
+    timeout (such as `avctl`'s) should therefore leave a few seconds of
+    headroom over `AVD_SCAN_TIMEOUT_SECS`.
   - *A scan with no verdict* (worker crashed, replied malformed data,
     missed the request's deadline, or no worker was free in time) is never reported as clean. The kernel gets
     `AV_VERDICT_UNAVAILABLE`, so its fail-open/fail-closed daemon policy
