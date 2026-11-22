@@ -2467,7 +2467,6 @@ static void scan_core(int fd, const char *path, const char *sha256_hex,
            * file really is empty now. */
           if (fstat(fd, &yara_st) != 0 || yara_st.st_size != 0)
             out->incomplete = true;
-          yara_snapshot_release(scan_len);
         } else {
           ret = yr_rules_scan_mem(compiled_rules, snap, total, 0,
                                   yara_callback, &ctx,
@@ -2511,9 +2510,14 @@ static void scan_core(int fd, const char *path, const char *sha256_hex,
                     path, total, scan_len);
             out->incomplete = true;
           }
-          yara_snapshot_release(scan_len);
         }
+        /* Free first, then give the budget back: in a scan worker the
+         * release is what lets the daemon grant these bytes to another
+         * worker, which must not happen while this buffer is still
+         * allocated. (The allocation-failure and scan-error paths do
+         * the same in their own order.) */
         free(snap);
+        yara_snapshot_release(scan_len);
       }
     }
   }
@@ -2646,9 +2650,9 @@ record:
  *     in. Waiting for a worker is bounded by the request's deadline.
  *   - Quarantine and verdict history stay in the daemon (perform_scan()).
  *
- * Failure handling: a worker that crashes, replies garbage or overruns
- * its deadline is killed and retired, and no worker free in time is
- * reported the same way. Either yields CLEAN with `incomplete` AND
+ * Failure handling: a worker that crashes, replies garbage or has not
+ * answered by the request's deadline is killed and retired, and no worker
+ * free in time is reported the same way. Either yields CLEAN with `incomplete` AND
  * `unavailable` set: callers that can tell the kernel "no verdict" do
  * (handle_scan_request()), the SCAN command reports INCOMPLETE, and the
  * fanotify gate applies its fail-open/fail-closed policy. The file is
@@ -2665,10 +2669,12 @@ record:
 #define AVD_SCAN_PROCS_DEFAULT 0
 #define AVD_SCAN_PROCS_MIN 0
 #define AVD_SCAN_PROCS_MAX 64
-/* Wall-clock allowance on top of AVD_SCAN_TIMEOUT_SECS before a worker
- * is declared hung: the YARA stage honours its timeout itself, but the
- * SHA-256, ssdeep and TLSH stages only have size caps. */
-#define AVD_SCANPROC_SLACK_SECS 30
+/* How much of the request's remaining time is held back from the YARA
+ * stage so the worker can finish hashing and reply before the deadline
+ * that kills it. Without it a scan that runs to its YARA timeout - the
+ * outcome a hostile file has most influence over - would finish at the
+ * same instant as the deadline and cost a healthy worker its life. */
+#define AVD_SCANPROC_REPLY_MARGIN_MS 1000
 #define SCANPROC_MAGIC 0x41565332u /* "AVS2" */
 #define SCANPROC_MSG_RESULT 1u
 /* Worker -> daemon, mid-scan: the YARA snapshot has been freed, so the
@@ -2718,7 +2724,6 @@ static int scanproc_n;
 static int scanproc_alive; /* guarded by scanproc_lock */
 static struct scanproc_pending scanproc_pending[AVD_SCAN_PROCS_MAX];
 static int scanproc_pending_n; /* guarded by scanproc_lock */
-static int scanproc_slack_secs = AVD_SCANPROC_SLACK_SECS;
 static pthread_mutex_t scanproc_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* A caller waiting for a worker. Waiters form a FIFO and a returning
@@ -3148,12 +3153,19 @@ static void scanproc_retire(struct scanproc *sp, const char *why,
 #define SCANPROC_RT_NOT_SENT (-3) /* local pre-send failure: the worker never
                                    * saw the request and is still healthy */
 
-/* One request/reply exchange. `*held` is the snapshot budget currently
- * charged for this scan; a RELEASE message from the worker returns it
- * and zeroes it. */
+/* One request/reply exchange, bounded by the request's absolute
+ * `deadline` (CLOCK_MONOTONIC): a worker that has not replied by then
+ * is reported as SCANPROC_RT_DEADLINE and retired, so a late reply can
+ * never be taken for the next scan's result, and the caller is never
+ * kept past the budget it was given. (The YARA stage honours its own
+ * timeout, but the SHA-256, ssdeep and TLSH stages only have size
+ * caps - this is what bounds them.) `*held` is the snapshot budget
+ * currently charged for this scan; a RELEASE message from the worker
+ * returns it and zeroes it. */
 static int scanproc_roundtrip(struct scanproc *sp, int fd,
                               const struct scanproc_req *req,
-                              struct scanproc_resp *resp, size_t *held) {
+                              struct scanproc_resp *resp, size_t *held,
+                              const struct timespec *deadline) {
   union {
     char buf[CMSG_SPACE(sizeof(int))];
     struct cmsghdr align;
@@ -3161,7 +3173,7 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
   struct iovec iov = {.iov_base = (void *)req, .iov_len = sizeof(*req)};
   struct msghdr mh;
   struct cmsghdr *cm;
-  struct timespec now, deadline;
+  struct timespec now;
   struct pollfd pfd = {.fd = sp->fd, .events = POLLIN, .revents = 0};
   ssize_t n;
 
@@ -3177,9 +3189,6 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
   cm->cmsg_len = CMSG_LEN(sizeof(int));
   memcpy(CMSG_DATA(cm), &fd, sizeof(int));
 
-  clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += avd_scan_timeout_secs + scanproc_slack_secs;
-
   do {
     n = sendmsg(sp->fd, &mh, MSG_NOSIGNAL);
   } while (n < 0 && errno == EINTR);
@@ -3193,8 +3202,8 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
     int rc;
 
     clock_gettime(CLOCK_MONOTONIC, &now);
-    ms = (long)(deadline.tv_sec - now.tv_sec) * 1000L +
-         (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+    ms = (long)(deadline->tv_sec - now.tv_sec) * 1000L +
+         (deadline->tv_nsec - now.tv_nsec) / 1000000L;
     if (ms <= 0)
       return SCANPROC_RT_DEADLINE;
     rc = poll(&pfd, 1, ms > INT_MAX ? INT_MAX : (int)ms);
@@ -3306,20 +3315,18 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
     dl.tv_sec += avd_scan_timeout_secs;
   }
 
-  have_st = fstat(fd, &st) == 0;
-  *owner_uid_out = have_st ? st.st_uid : (uid_t)-1;
+  *owner_uid_out = (uid_t)-1;
 
   rc = scanproc_checkout(&dl, &sp);
-  if (rc == SCANPROC_CO_NONE) {
-    scan_core(fd, path, sha256_hex, pid, on_demand, out, owner_uid_out);
-    return;
-  }
   clock_gettime(CLOCK_MONOTONIC, &now);
   left_ms = (long)(dl.tv_sec - now.tv_sec) * 1000L +
             (dl.tv_nsec - now.tv_nsec) / 1000000L;
-  /* The YARA timeout has one-second granularity, so less than a second
-   * left is not enough to scan anything. */
-  if (rc == SCANPROC_CO_TIMEOUT || left_ms < 1000) {
+  /* A request whose deadline has passed is not started at all - not in
+   * a worker, and not in the daemon as the "no worker left" fallback:
+   * the caller can no longer use the answer. Any time left is enough to
+   * hand the file over; the absolute deadline in scanproc_roundtrip()
+   * enforces the fractional remainder. */
+  if (rc == SCANPROC_CO_TIMEOUT || left_ms <= 0) {
     if (rc == SCANPROC_CO_OK)
       scanproc_checkin(sp);
     fprintf(stderr,
@@ -3329,12 +3336,20 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
     scan_unavailable(sha256_hex, out);
     return;
   }
+  if (rc == SCANPROC_CO_NONE) {
+    scan_core(fd, path, sha256_hex, pid, on_demand, out, owner_uid_out);
+    return;
+  }
 
   /* The snapshot budget is daemon-wide, so the daemon reserves it and
    * tells the worker how much it may use; a file that grew since is
-   * refused by the worker, never silently over budget. The grant is
-   * given back when the worker says its snapshot is freed, not when the
-   * whole scan ends (fuzzy/TLSH hashing needs no snapshot). */
+   * refused by the worker, never silently over budget. The size is
+   * taken now, after any wait for a worker, so a file that grew while
+   * the request queued is granted what it needs now. The grant is given
+   * back when the worker says its snapshot is freed, not when the whole
+   * scan ends (fuzzy/TLSH hashing needs no snapshot). */
+  have_st = fstat(fd, &st) == 0;
+  *owner_uid_out = have_st ? st.st_uid : (uid_t)-1;
   if (have_st && S_ISREG(st.st_mode) && st.st_size > 0 &&
       st.st_size <= (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
     need = (size_t)st.st_size;
@@ -3349,8 +3364,15 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
   req.granted = held;
   req.inflight_hint = (need && !held) ? yara_snapshot_inflight_bytes() : 0;
   {
-    long secs = (left_ms + 999) / 1000;
+    /* Time left minus the reply margin, rounded up and never zero (0
+     * would mean "default"). The YARA timeout has one-second
+     * granularity; the absolute deadline in scanproc_roundtrip() is
+     * what is exact, and only a request with about a second or less
+     * left can have its YARA stage run into it. */
+    long secs = (left_ms - AVD_SCANPROC_REPLY_MARGIN_MS + 999) / 1000;
 
+    if (secs < 1)
+      secs = 1;
     if (secs > avd_scan_timeout_secs)
       secs = avd_scan_timeout_secs;
     req.timeout_secs = (uint32_t)secs;
@@ -3359,7 +3381,7 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
   snprintf(req.sha256_hex, sizeof(req.sha256_hex), "%s",
            sha256_hex ? sha256_hex : "");
 
-  rc = scanproc_roundtrip(sp, fd, &req, &resp, &held);
+  rc = scanproc_roundtrip(sp, fd, &req, &resp, &held, &dl);
 
   if (rc == SCANPROC_RT_OK && scanproc_resp_valid(&resp)) {
     if (held)
@@ -3466,7 +3488,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                          uint32_t pid, bool on_demand,
                          const struct timespec *deadline,
                          struct scan_result *out) {
-  uid_t owner_uid;
+  uid_t owner_uid = (uid_t)-1;
 
   scan_dispatch(fd, path, sha256_hex, pid, on_demand, deadline, out,
                 &owner_uid);

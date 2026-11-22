@@ -105,7 +105,7 @@ and avctl); the GUI mirrors the decode side in
 | `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads\tfanexec_allowed\tfanexec_denied\tfanexec_undecided\tfanexec_overflows` (the last four only on daemons new enough to report them - older daemons answer the 6-field row; clients must accept both) |
 | `VERDICTS RECENT <n>` | any, filtered | up to `n` most-recent rows *the caller owns* (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` (`path`/`rule_name` percent-escaped - decode after splitting) |
 | `QUARANTINE LIST` | any, filtered | one row per quarantined file *the caller owns*: `id\toriginal_path\ttimestamp\trule_name\tsha256` (`id`/`original_path`/`rule_name` percent-escaped - decode after splitting) |
-| `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS/INCOMPLETE)\trule_name\tscore\tsha256` (see "`SCAN` verdicts" below; `sha256` is empty only for `INCOMPLETE`) |
+| `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS/INCOMPLETE)\trule_name\tscore\tsha256` (see "`SCAN` verdicts" below; `sha256` is empty when no hash was computed) |
 | `QUARANTINE RESTORE <id>` | **root** | `OK` only, no rows |
 | `QUARANTINE DELETE <id>` | **root** | `OK` only, no rows |
 
@@ -178,32 +178,41 @@ it gets there.
   absolute path is exactly what `SCAN` is *for* (scan any file the
   daemon's own privileges can read), so there's nothing to restrict
   there beyond the existing root-only gate.
-- **`SCAN` is not rate-limited and does not share the kernel-triggered
-  scan queue.** Unlike `AV_C_SCAN_REQUEST` (which goes through the
-  bounded worker pool (size/queue depth runtime-tunable via the
-  `AVD_SCAN_THREADS`/`AVD_SCAN_QUEUE_MAX` environment variables - see
-  `docs/netlink-protocol.md`), a control-socket `SCAN` command calls
-  `perform_scan()` directly on that connection's own thread. Bounded
-  only by `AVD_CONTROL_MAX_CONNS` (how many control connections can be
-  open at once) and each connection's `AVD_CONTROL_RECV_TIMEOUT_SECS`
-  idle timeout, not by anything specific to scanning - a root-
-  authenticated client issuing many `SCAN` requests can run that many
-  scans concurrently, uncoordinated with kernel-triggered scans.
-  (With `AVD_SCAN_PROCS` set - below - `SCAN` still has no request
-  queue of its own, but it competes for the same worker processes as
-  every other scan.)
+- **`SCAN` does not share the kernel-triggered scan queue, and is capped
+  at `AVD_CONTROL_MAX_SCAN_CONNS` (4, compile-time) concurrent
+  requests.** Unlike `AV_C_SCAN_REQUEST` (which goes through the bounded
+  worker pool - size/queue depth runtime-tunable via the
+  `AVD_SCAN_THREADS`/`AVD_SCAN_QUEUE_MAX` environment variables, see
+  `docs/netlink-protocol.md`), a control-socket `SCAN` calls
+  `perform_scan()` directly on that connection's own thread. The cap
+  applies in every mode, including `AVD_SCAN_PROCS=0`: a fifth `SCAN`
+  that arrives while four are running gets
+  `ERR too many concurrent SCAN requests - try again shortly`, even if
+  control connections are free. Connections themselves are bounded by
+  `AVD_CONTROL_MAX_CONNS` and each one's `AVD_CONTROL_RECV_TIMEOUT_SECS`
+  idle timeout. `SCAN` is otherwise uncoordinated with kernel-triggered
+  scans. With `AVD_SCAN_PROCS` set (below), a `SCAN` that passed the cap
+  must also check out a scan worker, shared with every other scan path:
+  an additional constraint, not a replacement for the cap.
 - **`SCAN` verdicts.** `MALICIOUS` means a detection layer convicted the
   file; it stands even if another layer was inconclusive. `CLEAN` means
   every layer ran to a conclusion and found nothing. `INCOMPLETE` means
   nothing convicted the file but the scan did not finish - YARA was
-  skipped or timed out, the file changed under the scan, or (with
-  `AVD_SCAN_PROCS`) the scan worker failed or none was free in time.
-  An `INCOMPLETE` row has an empty `rule_name`; `sha256` may be empty
-  when a worker died before hashing. **Clients must not treat it as
-  clean.** The row keeps its four tab-separated fields, so an older
-  client that rejects unknown verdicts fails safe (`avctl` before this
-  verdict existed reports "malformed scan response"). `avctl scan`
-  prints `INCOMPLETE: <path>` and exits 1.
+  skipped or timed out, the SHA-256 read failed, the file changed under
+  the scan, or (with `AVD_SCAN_PROCS`) the scan worker failed or none was
+  free in time. An `INCOMPLETE` row has an empty `rule_name`. **Clients
+  must not treat it as clean.** The row keeps its four tab-separated
+  fields, so an older client that rejects unknown verdicts fails safe
+  (`avctl` before this verdict existed reports "malformed scan
+  response"). `avctl scan` prints `INCOMPLETE: <path>` and exits 1.
+- **The `sha256` field is empty whenever no SHA-256 was computed, under
+  any verdict.** That happens when the file is over the hash size cap
+  (an intentional skip - the scan is not marked incomplete), when
+  reading the file for the hash failed (the scan is marked incomplete,
+  yet another layer such as YARA can still convict, giving `MALICIOUS`
+  with an empty hash), or when a scan worker failed before hashing
+  (`INCOMPLETE`). Clients must accept an empty fourth field and not read
+  it as a malformed row; `avctl` prints `sha256: (not computed)`.
 - **`AVD_SCAN_PROCS=N` (default `0`, off; maximum `64`) moves the
   analysis into `N` forked worker processes.** One pool serves every
   scan path: kernel-triggered scans (`AVD_SCAN_THREADS` threads), the
@@ -213,14 +222,21 @@ it gets there.
   descriptor; quarantine and verdict history stay in the daemon. To
   avoid callers waiting for a worker, set `N` to at least the sum of
   those three (16 with the defaults).
-  - *Waiting is bounded.* A request has `AVD_SCAN_TIMEOUT_SECS` from
-    when it arrived (kernel-triggered) or started (the other paths). If
-    no worker is free by then the scan reports no verdict instead of
-    queueing past the kernel's reply window, and the YARA timeout of a
-    scan that did get a worker is cut to the time the request has left.
+  - *The whole request is bounded.* A request has
+    `AVD_SCAN_TIMEOUT_SECS` from when it arrived (kernel-triggered) or
+    started (the other paths). If no worker is free by then the scan
+    reports no verdict instead of queueing past the kernel's reply
+    window; the YARA timeout of a scan that did get a worker is cut to
+    the time left minus a one-second margin for the worker to finish
+    hashing and reply (so a YARA timeout is an ordinary `INCOMPLETE`,
+    not a missed deadline - with the default 10 s the YARA stage gets
+    9 s in worker mode); and a worker that has not replied by that same
+    deadline (including during hashing, which has no timeout of its own)
+    is killed and retired. So even a hung worker cannot keep a caller,
+    including a `SCAN` client with its own shorter timeout, waiting past
+    the request's budget.
   - *A scan with no verdict* (worker crashed, replied malformed data,
-    overran `AVD_SCAN_TIMEOUT_SECS` plus 30 s, or no worker was free in
-    time) is never reported as clean. The kernel gets
+    missed the request's deadline, or no worker was free in time) is never reported as clean. The kernel gets
     `AV_VERDICT_UNAVAILABLE`, so its fail-open/fail-closed daemon policy
     applies (a kernel too old to send file identity does not understand
     it and still gets the fail-open `CLEAN`); `SCAN` returns
