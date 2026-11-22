@@ -2173,12 +2173,13 @@ static size_t yara_snapshot_inflight_bytes(void) {
 }
 
 /*
- * Shared core of file analysis - YARA, then fuzzy/TLSH fallback,
- * quarantine on MALICIOUS, and a verdict_history record either way.
- * Used by both handle_scan_request() (kernel-triggered, netlink) and
- * cmd_scan() (on-demand, control socket) - see each caller for how
- * they report `out` over their own transport; this function touches
- * neither.
+ * Pure analysis half of file scanning - SHA-256, YARA, then fuzzy/TLSH
+ * fallback - reporting through `out` and `*owner_uid_out`. It does NOT
+ * quarantine or record history: perform_scan() below applies those
+ * from the result. Used (via perform_scan()) by handle_scan_request()
+ * (kernel-triggered, netlink), cmd_scan() (on-demand, control socket)
+ * and the fanotify exec gate - see each caller for how they report
+ * `out` over their own transport; this function touches none.
  *
  * `fd` must already be open for reading - opening is the caller's
  * responsibility, deliberately kept out of this shared core since a
@@ -2190,9 +2191,9 @@ static size_t yara_snapshot_inflight_bytes(void) {
  * `pid` is 0 for on-demand scans (no owning process - see struct
  * verdict_record's own comment).
  */
-static void perform_scan(int fd, const char *path, const char *sha256_hex,
-                         uint32_t pid, bool on_demand,
-                         struct scan_result *out) {
+static void scan_core(int fd, const char *path, const char *sha256_hex,
+                      uint32_t pid, bool on_demand, struct scan_result *out,
+                      uid_t *owner_uid_out) {
   struct yara_match_ctx ctx = {.matched = 0,
                                .match_count = 0,
                                .score = 0,
@@ -2493,7 +2494,6 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       out->verdict = AV_VERDICT_MALICIOUS;
       snprintf(out->rule_name, sizeof(out->rule_name), "%s", ctx.rule_name);
       out->score = ctx.score;
-      quarantine_file(fd, path, out->rule_name, hash);
       goto record;
     }
 
@@ -2535,7 +2535,6 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                fuzzy_name, fuzzy_score);
       printf("avd: FUZZY MATCH \"%s\" -> \"%s\" score=%d\n", path, fuzzy_name,
              fuzzy_score);
-      quarantine_file(fd, path, out->rule_name, hash);
       goto record;
     }
     if (fret < 0) {
@@ -2564,7 +2563,6 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                tlsh_name, tlsh_diff);
       printf("avd: TLSH MATCH \"%s\" -> \"%s\" diff=%d\n", path, tlsh_name,
              tlsh_diff);
-      quarantine_file(fd, path, out->rule_name, hash);
       goto record;
     }
     if (tret < 0) {
@@ -2575,6 +2573,31 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
 
 record:
   snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", hash);
+  *owner_uid_out = owner_uid;
+}
+
+/*
+ * Analysis plus the root-side consequences of it. scan_core() above
+ * only examines bytes (SHA-256, YARA, fuzzy, TLSH) and reports through
+ * `out`; it never quarantines, records history, or touches any path.
+ * This wrapper applies those side effects from the returned struct, so
+ * a later privilege split can run scan_core() in an unprivileged
+ * worker and keep quarantine_file()/record_verdict_history() here, in
+ * the root parent. (`pid` and `on_demand` reach scan_core() only so the
+ * "avd: scan ..." log line keeps its exact format.) Behaviour is
+ * unchanged from the old single function: same order (quarantine, then
+ * history), same arguments.
+ */
+static void perform_scan(int fd, const char *path, const char *sha256_hex,
+                         uint32_t pid, bool on_demand,
+                         struct scan_result *out) {
+  uid_t owner_uid;
+
+  scan_core(fd, path, sha256_hex, pid, on_demand, out, &owner_uid);
+
+  if (out->verdict == AV_VERDICT_MALICIOUS)
+    quarantine_file(fd, path, out->rule_name, out->sha256_hex);
+
   record_verdict_history(pid, owner_uid, path, out->sha256_hex, out->verdict,
                          out->rule_name, out->score, on_demand);
 }
