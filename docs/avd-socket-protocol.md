@@ -189,6 +189,19 @@ it gets there.
   idle timeout, not by anything specific to scanning - a root-
   authenticated client issuing many `SCAN` requests can run that many
   scans concurrently, uncoordinated with kernel-triggered scans.
+- **`AVD_SCAN_PROCS=N` (default `0`, off) moves the analysis into `N`
+  forked worker processes.** `perform_scan()` (and so `SCAN`, the
+  kernel-triggered scan path and the fanotify exec gate) then runs
+  `scan_core()` in a worker over a `SOCK_SEQPACKET` socketpair, passing
+  the file as a descriptor; quarantine and verdict history stay in the
+  daemon. A worker that crashes, replies malformed data or overruns
+  `AVD_SCAN_TIMEOUT_SECS` plus 30 s is killed and retired, and that
+  scan reports CLEAN with `incomplete` set (the file is never re-scanned
+  in the daemon). Retired workers are not respawned yet; once none are
+  left, scans run in the daemon again. Workers still run as root in this
+  version - this is the boundary the privilege drop builds on (#102).
+  Set `N` at least as large as `AVD_SCAN_THREADS` to avoid callers
+  queueing for a worker.
 - **`avd` must already be registered with the kernel module for the
   control socket to exist at all** - `main()` in `avd.c` still exits
   before starting the control socket if `genl_connect()`/
