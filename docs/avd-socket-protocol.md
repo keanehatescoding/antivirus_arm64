@@ -222,7 +222,7 @@ it gets there.
   descriptor; quarantine and verdict history stay in the daemon. To
   avoid callers waiting for a worker, set `N` to at least the sum of
   those three (16 with the defaults).
-  - *The request is bounded - with two exceptions.* A request has
+  - *The request is bounded - with caveats.* A request has
     `AVD_SCAN_TIMEOUT_SECS` from when it arrived (kernel-triggered) or
     started (the other paths). If no worker is free by then the scan
     reports no verdict instead of queueing past the kernel's reply
@@ -230,9 +230,14 @@ it gets there.
     timeout from what is left when YARA starts - after queueing and
     after hashing - minus a one-second margin for it to reply (so a YARA
     timeout is an ordinary `INCOMPLETE`, not a missed deadline; with the
-    default 10 s and an immediate worker, YARA gets about 9 s). A worker
+    default 10 s and an immediate worker, YARA gets about 9 s - but YARA's
+    timeout is never below one second, so when roughly a second or less
+    is left when YARA starts, as always happens with
+    `AVD_SCAN_TIMEOUT_SECS=1`, a scan that keeps going can reach the
+    deadline first and cost the worker its life; with no respawn yet, a
+    sustained run of such requests can drain the pool). A worker
     still silent at the deadline, including during hashing, which has no
-    timeout of its own, is killed and retired. The exceptions: (1) once
+    timeout of its own, is killed and retired. Two more caveats: (1) once
     the last worker has been retired, a request that still has time left
     is scanned in the daemon, and that scan does not enforce the
     remaining deadline - it uses the plain `AVD_SCAN_TIMEOUT_SECS` YARA
