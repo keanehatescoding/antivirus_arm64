@@ -2218,7 +2218,11 @@ static bool yara_snapshot_reserve(size_t need) {
   }
 
   pthread_mutex_lock(&yara_snapshot_lock);
-  if (yara_snapshot_inflight + need <= YARA_SNAPSHOT_BUDGET_BYTES) {
+  /* Compare against the remaining budget instead of summing inflight+need:
+   * a grant_bytes from a worker can be large enough to wrap size_t and
+   * make the sum appear to fit, which would uncharge other live scans. */
+  if (yara_snapshot_inflight <= YARA_SNAPSHOT_BUDGET_BYTES &&
+      need <= YARA_SNAPSHOT_BUDGET_BYTES - yara_snapshot_inflight) {
     yara_snapshot_inflight += need;
     ok = true;
   }
