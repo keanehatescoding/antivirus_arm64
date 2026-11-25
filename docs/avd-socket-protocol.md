@@ -196,7 +196,9 @@ it gets there.
   an additional constraint, not a replacement for the cap.
 - **`SCAN` verdicts.** `MALICIOUS` means a detection layer convicted the
   file; it stands even if another layer was inconclusive. `CLEAN` means
-  every layer ran to a conclusion and found nothing. `INCOMPLETE` means
+  no detection and no inconclusive scan outcome - an intentional skip
+  that counts as complete (an empty file has nothing for YARA to match)
+  does not prevent it. `INCOMPLETE` means
   nothing convicted the file but the scan did not finish - YARA was
   skipped or timed out, the SHA-256 read failed, the file changed under
   the scan, or (with `AVD_SCAN_PROCS`) the scan worker failed or none was

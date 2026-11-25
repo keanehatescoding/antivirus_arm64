@@ -2471,9 +2471,9 @@ static void scan_core(int fd, const char *path, const char *sha256_hex,
        * rather than stacking private memory without limit. */
       if (!yara_snapshot_reserve(scan_len)) {
         fprintf(stderr,
-                "avd: YARA snapshot budget exhausted (%zu in flight) - "
+                "avd: YARA snapshot budget exhausted - "
                 "skipping YARA scan of \"%s\" (%zu bytes), failing open\n",
-                yara_snapshot_inflight_bytes(), path, scan_len);
+                path, scan_len);
         out->incomplete = true;
       } else if (!(snap = malloc(scan_len))) {
         fprintf(stderr, "avd: malloc(%zu) for YARA scan of \"%s\" failed - "
@@ -3354,15 +3354,22 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
       resp->magic = SCANPROC_MAGIC;
       resp->kind = SCANPROC_MSG_GRANT_RESP;
       resp->grant_bytes = approved;
+      /* Charge the grant to this scan before sending: a send failure must
+       * still leave the bytes in *held so the caller releases them. */
+      if (approved)
+        *held += (size_t)approved;
       do {
         n = send(sp->fd, resp, sizeof(*resp), MSG_NOSIGNAL);
       } while (n < 0 && errno == EINTR);
       if (n != (ssize_t)sizeof(*resp))
         return SCANPROC_RT_BROKEN;
-      if (approved)
-        *held += (size_t)approved;
       continue;
     }
+    /* poll() rounds the wait up to whole ms, so a reply can arrive just
+     * after the deadline. Reject it here to honour the contract. */
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (scanproc_remaining_ns(deadline, &now) <= 0)
+      return SCANPROC_RT_DEADLINE;
     return SCANPROC_RT_OK;
   }
 }
