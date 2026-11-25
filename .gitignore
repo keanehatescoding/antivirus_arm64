@@ -17,6 +17,7 @@ Module.symvers
 modules.order
 userspace/avctl/avctl
 userspace/avd/avd
+userspace/av-gui/tests/__pycache__/*.pyc
 tests/netlink_test_helper
 av/compile_commands.json
 tests/qemu-boot/init
