@@ -2168,6 +2168,17 @@ static bool scanproc_child_have_deadline;
 #define AVD_SCANPROC_REPLY_MARGIN_MS 1000
 
 static void scanproc_child_notify_release(void);
+static uint64_t scanproc_child_request_grant(uint64_t need);
+
+/* Remaining time in nanoseconds from both fields. Comparing truncated
+ * milliseconds would report expiry while up to 999999 ns are still left. */
+static int64_t scanproc_remaining_ns(const struct timespec *deadline,
+                                     const struct timespec *now) {
+  if (!deadline || (deadline->tv_sec == 0 && deadline->tv_nsec == 0))
+    return INT64_MAX;
+  return (int64_t)(deadline->tv_sec - now->tv_sec) * 1000000000LL +
+         (int64_t)(deadline->tv_nsec - now->tv_nsec);
+}
 
 /* YARA timeout for the scan in progress. In the daemon it is the plain
  * tunable. In a worker it is derived from the request's absolute
@@ -2198,8 +2209,13 @@ static int scan_yara_timeout_secs(void) {
 static bool yara_snapshot_reserve(size_t need) {
   bool ok = false;
 
-  if (scanproc_child_mode)
-    return need <= scanproc_child_granted;
+  if (scanproc_child_mode) {
+    /* The size is known only after SHA-256, just before allocation. Ask
+     * the daemon for the bytes now instead of relying on a grant made
+     * before the worker was even handed the file. */
+    scanproc_child_granted = scanproc_child_request_grant((uint64_t)need);
+    return (uint64_t)need <= scanproc_child_granted;
+  }
 
   pthread_mutex_lock(&yara_snapshot_lock);
   if (yara_snapshot_inflight + need <= YARA_SNAPSHOT_BUDGET_BYTES) {
@@ -2699,6 +2715,10 @@ record:
 /* Worker -> daemon, mid-scan: the YARA snapshot has been freed, so the
  * daemon may hand its share of the budget to someone else. */
 #define SCANPROC_MSG_RELEASE 2u
+/* Worker -> daemon, when it is about to allocate a YARA snapshot: ask for
+ * bytes from the daemon-wide budget. Daemon -> worker grants what is left. */
+#define SCANPROC_MSG_GRANT_REQ 3u
+#define SCANPROC_MSG_GRANT_RESP 4u
 
 struct scanproc_req {
   uint32_t magic;
@@ -2721,6 +2741,7 @@ struct scanproc_resp {
   uint8_t incomplete;
   char rule_name[AV_RULE_NAME_MAXLEN + 1];
   char sha256_hex[65];
+  uint64_t grant_bytes; /* GRANT_REQ (needed) / GRANT_RESP (approved) */
 };
 
 struct scanproc {
@@ -2822,6 +2843,30 @@ static ssize_t scanproc_recv_req(int sfd, struct scanproc_req *req,
     return -1;
   }
   return n;
+}
+
+/* Ask the daemon for snapshot bytes at the moment the worker is about
+ * to allocate. Blocks only on this worker's own socket. */
+static uint64_t scanproc_child_request_grant(uint64_t need) {
+  struct scanproc_resp m;
+  ssize_t n;
+
+  memset(&m, 0, sizeof(m));
+  m.magic = SCANPROC_MAGIC;
+  m.kind = SCANPROC_MSG_GRANT_REQ;
+  m.grant_bytes = need;
+  do {
+    n = send(scanproc_child_sfd, &m, sizeof(m), MSG_NOSIGNAL);
+  } while (n < 0 && errno == EINTR);
+  if (n != (ssize_t)sizeof(m))
+    _exit(1);
+  do {
+    n = recv(scanproc_child_sfd, &m, sizeof(m), 0);
+  } while (n < 0 && errno == EINTR);
+  if (n != (ssize_t)sizeof(m) || m.magic != SCANPROC_MAGIC ||
+      m.kind != SCANPROC_MSG_GRANT_RESP)
+    _exit(1);
+  return m.grant_bytes;
 }
 
 /* Called (via yara_snapshot_release()) from inside scan_core() in a
@@ -3099,6 +3144,27 @@ static int scanproc_checkout(const struct timespec *deadline,
   return rc;
 }
 
+/* Hand any idle live worker to the longest-waiting caller. Used after a
+ * retirement so waiters do not stay parked on a slot that is now dead. */
+static void scanproc_handoff_idle_locked(void) {
+  struct scanproc_waiter *w = scanproc_wait_head;
+
+  if (!w)
+    return;
+  for (int i = 0; i < scanproc_n; i++) {
+    if (scanprocs[i].alive && !scanprocs[i].busy) {
+      scanprocs[i].busy = true;
+      scanproc_wait_head = w->next;
+      if (!scanproc_wait_head)
+        scanproc_wait_tail = NULL;
+      w->queued = false;
+      w->slot = &scanprocs[i];
+      pthread_cond_signal(&w->cv);
+      return;
+    }
+  }
+}
+
 /* Give the worker to the longest-waiting caller, or mark it idle. */
 static void scanproc_checkin(struct scanproc *sp) {
   struct scanproc_waiter *w;
@@ -3133,6 +3199,8 @@ static bool scanproc_reap(pid_t pid) {
   return false;
 }
 
+static void scanproc_handoff_idle_locked(void);
+
 /* Retire a worker the caller currently holds. `held` is the snapshot
  * budget still charged for its scan: it goes back only once the process
  * is known to be gone - immediately if the reap succeeds, otherwise
@@ -3144,14 +3212,26 @@ static void scanproc_retire(struct scanproc *sp, const char *why,
   int left;
 
   kill(pid, SIGKILL);
-  reaped = scanproc_reap(pid);
   close(sp->fd);
+  /* Retire the slot before waiting for exit: a worker stuck in I/O can
+   * take about two seconds to die after SIGKILL, and a caller with little
+   * time left must be able to use another worker (or take the in-process
+   * fallback when none is left) instead of waiting on this one. */
   pthread_mutex_lock(&scanproc_lock);
   sp->alive = false;
   sp->busy = false;
   left = --scanproc_alive;
-  if (left == 0)
+  if (left == 0) {
     scanproc_fail_waiters_locked();
+  } else {
+    scanproc_handoff_idle_locked();
+  }
+  pthread_mutex_unlock(&scanproc_lock);
+
+  reaped = scanproc_reap(pid);
+  /* The grant stays charged until exit is confirmed: a stuck worker may
+   * still hold its snapshot. */
+  pthread_mutex_lock(&scanproc_lock);
   if (!reaped && scanproc_pending_n < AVD_SCAN_PROCS_MAX) {
     scanproc_pending[scanproc_pending_n].pid = pid;
     scanproc_pending[scanproc_pending_n].held = held;
@@ -3209,6 +3289,16 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
   cm->cmsg_len = CMSG_LEN(sizeof(int));
   memcpy(CMSG_DATA(cm), &fd, sizeof(int));
 
+  /* Metadata lookup and scheduling can consume the last milliseconds
+   * after checkout. Do not hand a file to a worker for a request that
+   * has already expired: that would retire a healthy worker for work
+   * the caller can no longer use. */
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (scanproc_remaining_ns(deadline, &now) <= 0) {
+    errno = ETIMEDOUT;
+    return SCANPROC_RT_NOT_SENT;
+  }
+
   do {
     n = sendmsg(sp->fd, &mh, MSG_NOSIGNAL);
   } while (n < 0 && errno == EINTR);
@@ -3218,14 +3308,18 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
     return SCANPROC_RT_BROKEN;
 
   for (;;) {
+    int64_t rem_ns;
     long ms;
     int rc;
 
     clock_gettime(CLOCK_MONOTONIC, &now);
-    ms = (long)(deadline->tv_sec - now.tv_sec) * 1000L +
-         (deadline->tv_nsec - now.tv_nsec) / 1000000L;
-    if (ms <= 0)
+    rem_ns = scanproc_remaining_ns(deadline, &now);
+    if (rem_ns <= 0)
       return SCANPROC_RT_DEADLINE;
+    /* Round UP so a positive remainder never becomes a zero wait. */
+    ms = (long)((rem_ns + 999999LL) / 1000000LL);
+    if (ms <= 0)
+      ms = 1;
     rc = poll(&pfd, 1, ms > INT_MAX ? INT_MAX : (int)ms);
     if (rc < 0 && errno == EINTR)
       continue;
@@ -3250,6 +3344,23 @@ static int scanproc_roundtrip(struct scanproc *sp, int fd,
         yara_snapshot_release(*held);
         *held = 0;
       }
+      continue;
+    }
+    if (resp->magic == SCANPROC_MAGIC &&
+        resp->kind == SCANPROC_MSG_GRANT_REQ) {
+      uint64_t need = resp->grant_bytes;
+      uint64_t approved = yara_snapshot_reserve((size_t)need) ? need : 0;
+
+      resp->magic = SCANPROC_MAGIC;
+      resp->kind = SCANPROC_MSG_GRANT_RESP;
+      resp->grant_bytes = approved;
+      do {
+        n = send(sp->fd, resp, sizeof(*resp), MSG_NOSIGNAL);
+      } while (n < 0 && errno == EINTR);
+      if (n != (ssize_t)sizeof(*resp))
+        return SCANPROC_RT_BROKEN;
+      if (approved)
+        *held += (size_t)approved;
       continue;
     }
     return SCANPROC_RT_OK;
@@ -3321,7 +3432,7 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
   struct stat st;
   size_t need = 0;
   size_t held = 0;
-  long left_ms;
+  int64_t rem_ns;
   bool have_st;
   int rc;
 
@@ -3341,14 +3452,13 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
 
   rc = scanproc_checkout(&dl, &sp);
   clock_gettime(CLOCK_MONOTONIC, &now);
-  left_ms = (long)(dl.tv_sec - now.tv_sec) * 1000L +
-            (dl.tv_nsec - now.tv_nsec) / 1000000L;
+  rem_ns = scanproc_remaining_ns(&dl, &now);
   /* A request whose deadline has passed is not started at all - not in
    * a worker, and not in the daemon as the "no worker left" fallback:
    * the caller can no longer use the answer. Any time left is enough to
    * hand the file over; the absolute deadline in scanproc_roundtrip()
    * enforces the fractional remainder. */
-  if (rc == SCANPROC_CO_TIMEOUT || left_ms <= 0) {
+  if (rc == SCANPROC_CO_TIMEOUT || rem_ns <= 0) {
     if (rc == SCANPROC_CO_OK)
       scanproc_checkin(sp);
     fprintf(stderr,
@@ -3363,28 +3473,26 @@ static void scan_dispatch(int fd, const char *path, const char *sha256_hex,
     return;
   }
 
-  /* The snapshot budget is daemon-wide, so the daemon reserves it and
-   * tells the worker how much it may use; a file that grew since is
-   * refused by the worker, never silently over budget. The size is
-   * taken now, after any wait for a worker, so a file that grew while
-   * the request queued is granted what it needs now. The grant is given
-   * back when the worker says its snapshot is freed, not when the whole
-   * scan ends (fuzzy/TLSH hashing needs no snapshot). */
+  /* The snapshot budget is daemon-wide. The daemon does NOT reserve it
+   * here: two large control scans could otherwise hold the whole budget
+   * while both are still computing SHA-256, leaving a third file that
+   * reaches YARA with no grant and an avoidable INCOMPLETE. The worker
+   * requests bytes when it knows the snapshot size and is about to
+   * allocate; the daemon grants from what is available then. The size
+   * below is only a hint for the worker's budget-exhausted log line. */
   have_st = fstat(fd, &st) == 0;
   *owner_uid_out = have_st ? st.st_uid : (uid_t)-1;
   if (have_st && S_ISREG(st.st_mode) && st.st_size > 0 &&
       st.st_size <= (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
     need = (size_t)st.st_size;
-    if (yara_snapshot_reserve(need))
-      held = need;
   }
 
   memset(&req, 0, sizeof(req));
   req.magic = SCANPROC_MAGIC;
   req.pid = pid;
   req.on_demand = on_demand ? 1 : 0;
-  req.granted = held;
-  req.inflight_hint = (need && !held) ? yara_snapshot_inflight_bytes() : 0;
+  req.granted = 0; /* worker asks for bytes at allocation time */
+  req.inflight_hint = need ? yara_snapshot_inflight_bytes() : 0;
   /* The worker derives its YARA timeout from this when YARA starts. */
   req.deadline_sec = (int64_t)dl.tv_sec;
   req.deadline_nsec = (int64_t)dl.tv_nsec;

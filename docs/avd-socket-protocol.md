@@ -207,8 +207,9 @@ it gets there.
   response"). `avctl scan` prints `INCOMPLETE: <path>` and exits 1.
 - **The `sha256` field is empty whenever no SHA-256 was computed, under
   any verdict.** That happens when the file is over the hash size cap
-  (an intentional skip - the scan is not marked incomplete), when
-  reading the file for the hash failed (the scan is marked incomplete,
+  (an intentional skip - the hash skip alone does not set `INCOMPLETE`;
+  a stable file above the shared size cap is also skipped by YARA, and
+  that skip does set `INCOMPLETE`), when reading the file for the hash failed (the scan is marked incomplete,
   yet another layer such as YARA can still convict, giving `MALICIOUS`
   with an empty hash), or when a scan worker failed before hashing
   (`INCOMPLETE`). Clients must accept an empty fourth field and not read
@@ -228,11 +229,14 @@ it gets there.
     reports no verdict instead of queueing past the kernel's reply
     window. The worker is handed the deadline itself and takes its YARA
     timeout from what is left when YARA starts - after queueing and
-    after hashing - minus a one-second margin for it to reply (so a YARA
-    timeout is an ordinary `INCOMPLETE`, not a missed deadline; with the
-    default 10 s and an immediate worker, YARA gets about 9 s - but YARA's
-    timeout is never below one second, so when roughly a second or less
-    is left when YARA starts, as always happens with
+    after hashing - minus a one-second margin for it to reply. The
+    subtraction happens before the value is rounded to whole seconds, so
+    it does not guarantee a full second for cleanup and the reply: with
+    5.001 s left the worker grants YARA 5 s, leaving only a millisecond.
+    (A YARA timeout is an ordinary `INCOMPLETE`, not a missed deadline;
+    with the default 10 s and an immediate worker, YARA gets about 9 s.)
+    YARA's timeout is never below one second, so when roughly a second or
+    less is left when YARA starts - as always happens with
     `AVD_SCAN_TIMEOUT_SECS=1`, a scan that keeps going can reach the
     deadline first and cost the worker its life; with no respawn yet, a
     sustained run of such requests can drain the pool). A worker
@@ -256,10 +260,14 @@ it gets there.
     The file is never re-scanned in the daemon, and a worker that failed
     is killed and retired (not respawned yet; with none left, scans run
     in the daemon again).
-  - *YARA snapshot budget.* The daemon holds it for a scan only until
-    the worker reports its snapshot freed, not through the hashing
-    stages, and a failed worker's share is returned only once the process
-    has actually exited.
+  - *YARA snapshot budget.* The worker asks the daemon for bytes when it
+    knows the snapshot size and is about to allocate, after SHA-256 -
+    not when the request is sent, since two large scans can otherwise
+    hold the whole budget while both are still hashing. A grant may
+    therefore be charged during SHA-256. The daemon keeps it only until
+    the worker reports the snapshot freed; that notification releases it
+    before the later fuzzy/TLSH stages, which need no snapshot. A failed
+    worker's share is returned only once the process has actually exited.
   - Workers still run as root in this version; this is the boundary the
     privilege drop builds on (#102).
 - **`avd` must already be registered with the kernel module for the
