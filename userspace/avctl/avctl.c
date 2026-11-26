@@ -2040,7 +2040,8 @@ static int do_scan(const char *path)
 
         /* Tab-split instead of sscanf("%[\t]"): cmd_scan()
          * (userspace/avd/avd.c) emits "CLEAN\t\t0\t<sha>" on clean
-         * paths, i.e. an empty rule field, which %[^\t] can never
+         * paths, i.e. an empty rule field (and "INCOMPLETE\t\t0\t" with
+         * an empty hash when a scan worker failed), which %[^\t] can never
          * match (it requires at least one char). Splitting keeps the
          * empty-rule case working while still requiring exactly four
          * fields - a short/long row keeps its ""/0 initializers
@@ -2057,9 +2058,15 @@ static int do_scan(const char *path)
         *tab1 = '\0';
         *tab2 = '\0';
         *tab3 = '\0';
+        /* The hash field is empty whenever avd computed no SHA-256, under
+         * any verdict: the file is over the hash size cap (an intentional
+         * skip), the hash read failed (another layer can still convict),
+         * or a scan worker died before hashing. An empty hash is
+         * therefore not a malformed row - and rejecting it would hide a
+         * MALICIOUS verdict from a file avd may already have quarantined. */
         if (strlen(line) == 0 || strlen(line) >= sizeof(verdict) ||
             strlen(tab1 + 1) >= sizeof(rule) ||
-            strlen(tab3 + 1) == 0 || strlen(tab3 + 1) >= sizeof(sha)) {
+            strlen(tab3 + 1) >= sizeof(sha)) {
             fprintf(stderr, "avctl: malformed scan response from avd\n");
             free(resp);
             return 1;
@@ -2076,16 +2083,33 @@ static int do_scan(const char *path)
         strcpy(verdict, line);
         strcpy(rule, tab1 + 1);
         strcpy(sha, tab3 + 1);
-        if (strcmp(verdict, "MALICIOUS") && strcmp(verdict, "CLEAN")) {
+        if (strcmp(verdict, "MALICIOUS") && strcmp(verdict, "CLEAN") &&
+            strcmp(verdict, "INCOMPLETE")) {
             fprintf(stderr, "avctl: malformed scan response from avd\n");
+            free(resp);
+            return 1;
+        }
+        if (!strcmp(verdict, "INCOMPLETE")) {
+            /* The scan did not finish (a detection layer failed, or no
+             * scan worker was free in time). That is not a clean result,
+             * so say so and fail, rather than let a script or the GUI
+             * read "scanned, nothing found". */
+            printf("INCOMPLETE: %s\nsha256: %s\n", path,
+                   sha[0] ? sha : "(not computed)");
+            fprintf(stderr,
+                    "avctl: scan of %s did not finish - this is NOT a clean "
+                    "result\n",
+                    path);
             free(resp);
             return 1;
         }
         if (!strcmp(verdict, "MALICIOUS"))
             printf("MALICIOUS: %s%s%s (score=%d)\nsha256: %s\n", path,
-                   rule[0] ? " - " : "", rule, score, sha);
+                   rule[0] ? " - " : "", rule, score,
+                   sha[0] ? sha : "(not computed)");
         else
-            printf("CLEAN: %s\nsha256: %s\n", path, sha);
+            printf("CLEAN: %s\nsha256: %s\n", path,
+                   sha[0] ? sha : "(not computed)");
     } else {
         fprintf(stderr, "avctl: malformed scan response from avd\n");
         free(resp);
