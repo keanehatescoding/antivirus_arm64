@@ -44,6 +44,8 @@ scripts/             setup-hooks.sh, av-reload.sh
 
 ## Prerequisites (inside the VM)
 
+* Linux with kernel headers >= 6.12
+
 ```bash
 sudo apt update
 sudo apt install build-essential linux-headers-$(uname -r) git
@@ -59,7 +61,7 @@ dmesg | tail -20
 sudo rmmod av
 ```
 
-Targets arm64 (aarch64) kernels 5.7+ only (the behavioral hooks resolve
+Targets arm64 (aarch64) kernels 6.12+ only (the behavioral hooks resolve
 `__arm64_sys_*` syscall symbols by name — see the wiki's **Kernel Module**
 page for why x86_64 isn't supported). The exec hook needs nothing beyond
 `CONFIG_KPROBES=y`: at load time it binds to `bprm_execve`, the kernel's
