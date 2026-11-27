@@ -1,9 +1,11 @@
 /*
  * behavior.h - v0.8.0: behavioral heuristics.
  *
- * Four signals, all deferred to a workqueue (never the atomic kprobe
- * path - see main.c's architecture note, this is the same lesson from
- * v0.1.0 applied again):
+ * Four signals. Three are decided on a workqueue, never in the atomic
+ * kprobe path (see main.c's architecture note, the same lesson from
+ * v0.1.0 applied again); the self-delete match (3) is the exception,
+ * decided in the kprobe by a lock-free dentry comparison, with only its
+ * report deferred:
  *   1. Rapid write-intent file opens in a short window (ransomware-like:
  *      touching many files fast)
  *   2. Write-intent opens or deletions targeting sensitive paths
@@ -15,11 +17,17 @@
  *      document.docx.crypt), plus renames touching a sensitive path
  *      on either end - see av_behavior_check_rename() below
  *
- * All per-PROCESS state lives in a single mutex-protected hashtable,
- * since (unlike sigtable.c, which is read/written from arbitrary
- * process contexts) every access here now happens from workqueue
- * context only - the atomic kprobe handlers in main.c do nothing but
- * copy a path string and schedule work.
+ * Per-PROCESS state is split across two locking domains:
+ *   - the behavior hashtable (write-open counters, rename windows, ...)
+ *     is protected by one mutex and is only touched from workqueue
+ *     (sleepable) context. Unlike sigtable.c, which is read/written
+ *     from arbitrary process contexts, nothing atomic reaches it: the
+ *     kprobe handlers in main.c copy a path string and schedule work.
+ *   - the exec identity table (self-delete detection, the
+ *     av_behavior_exec_ident_*() calls below) has its own raw spinlock
+ *     for writers and RCU for readers, because its stage, commit and
+ *     match operations run directly in kprobe (atomic) context. Only
+ *     av_behavior_report_self_delete() is sleepable.
  *
  * IMPORTANT: every `pid_t pid` below is a tgid (thread-group/process
  * ID, i.e. what `ps` calls PID), NOT the individual calling thread's
@@ -55,6 +63,9 @@
 #include <linux/types.h>
 #include <linux/pid.h>
 
+struct dentry;
+struct file;
+
 int av_behavior_init(void);
 void av_behavior_exit(void);
 
@@ -69,13 +80,12 @@ void av_behavior_exit(void);
  * pid-reuse-vs-re-exec note on this function's definition for why
  * it's needed.
  *
- * `path` is the executed file's d_path() (symlinks followed);
- * `lexical_path`, or NULL, is the name exec was asked to run, made
- * absolute without following symlinks. av_behavior_check_unlink()
- * counts an unlink of either as a self-delete - see
- * av_exec_lexical_path() in main.c for why both are needed. */
+ * `path` is the executed file's d_path(), kept only for the
+ * self-delete log line; `dentry` is that file's dentry, a cookie (never
+ * dereferenced) that av_behavior_report_self_delete() uses to tell
+ * whether `path` names the file a match was made on. */
 void av_behavior_record_exec(pid_t pid, const char *path,
-                              const char *lexical_path,
+                              const struct dentry *dentry,
                               const char *sha256_hex, u64 start_time);
 
 /* Called from the openat work handler. If the open is write-intent
@@ -90,14 +100,39 @@ void av_behavior_record_exec(pid_t pid, const char *path,
 void av_behavior_check_openat(pid_t pid, const char *path, int flags,
                                struct pid *target_pid);
 
-/* Called from the unlink/unlinkat work handler. Checks self-delete
- * (path matches either of this pid's recorded exec paths) and the sensitive-path
- * list, killing target_pid and logging on either match. Trust status
- * does NOT exempt this check - deleting your own binary or a sensitive
- * path is worth flagging regardless of how trusted the process is.
- * `pid` is the tgid - see the note above. */
-void av_behavior_check_unlink(pid_t pid, const char *path,
-                               struct pid *target_pid);
+/* Called from the unlink/unlinkat work handler. Kills target_pid if
+ * `path` (the normalized absolute target) is on the sensitive-path
+ * list. Trust status does NOT exempt this check. The self-delete
+ * heuristic is not here: it is decided on the resolved dentry, see
+ * av_behavior_exec_ident_match(). */
+void av_behavior_check_unlink(const char *path, struct pid *target_pid);
+
+/* Self-delete detection on exec identity (see the comment above
+ * struct av_exec_ident in behavior.c). The first three run in kprobe
+ * (atomic) context and act on `current`'s thread group.
+ *
+ * av_behavior_exec_ident_stage(): from the exec hook probe
+ * (bprm_execve() or security_bprm_check()), first binfmt level only -
+ * remembers `file` as the exec in flight.
+ * av_behavior_exec_ident_commit(): from setup_new_exec(), past exec's
+ * point of no return -
+ * makes the staged file the one the process is running.
+ * av_behavior_exec_ident_match(): from security_inode_unlink() /
+ * security_inode_rename() - true when `dentry` (positive) is the
+ * directory entry the running image was exec'd from.
+ *
+ * av_behavior_report_self_delete(): sleepable, from the work item a
+ * match queues. Logs and kills target_pid (subject to the protected
+ * list, as every behavioral kill). `path` is a writable buffer of
+ * `path_len` bytes holding a fallback rendering of the name; it is
+ * replaced by the exec-time d_path() when that was recorded for
+ * `cookie`. `overwrite` selects the rename-over-own-binary reason. */
+void av_behavior_exec_ident_stage(const struct file *file);
+void av_behavior_exec_ident_commit(void);
+bool av_behavior_exec_ident_match(const struct dentry *dentry);
+void av_behavior_report_self_delete(pid_t pid, const struct dentry *cookie,
+                                    char *path, size_t path_len,
+                                    bool overwrite, struct pid *target_pid);
 
 /* Called from the rename/renameat/renameat2 work handler. Flags a
  * burst of "extension-append" renames (oldpath's basename with a
